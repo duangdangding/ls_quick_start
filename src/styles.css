@@ -44,6 +44,22 @@ button.primary { background: var(--hl-color); border-color: var(--hl-color); col
 :root[data-bg="on"] .modal { background: color-mix(in srgb, #242436 88%, transparent); }
 :root[data-bg="on"] .menu { background: color-mix(in srgb, var(--surface) 85%, transparent); }
 :root[data-bg="on"] .locked { background: color-mix(in srgb, var(--surface) 55%, transparent); }
+/* 背景图开启时移除 html/body 自带渐变底色，避免与背景图叠加 */
+:root[data-bg="on"], :root[data-bg="on"] body { background-image: none; }
+
+/* ---------- 视图切换（卡片 / 列表） ---------- */
+.view-toggle { display: flex; gap: 4px; }
+.view-toggle button { padding: 4px 9px; line-height: 1; font-size: 15px; color: var(--muted); }
+.view-toggle button.active { color: var(--blue); border-color: var(--blue); background: rgba(137,180,250,.13); }
+
+/* 列表视图：单列、行式排布 */
+.grid.list { grid-template-columns: 1fr; grid-auto-rows: auto; gap: 6px; }
+.grid.list .card { padding: 8px 12px; border-radius: 9px; box-shadow: none; }
+.grid.list .card:hover, .grid.list .card.selected { transform: none; box-shadow: 0 4px 12px rgba(0,0,0,.14); }
+.grid.list .icon { flex: 0 0 30px; height: 30px; font-size: 17px; border-radius: 7px; }
+.grid.list .card-text { flex: 1; flex-direction: row; align-items: center; gap: 10px; }
+.grid.list .card-text span { flex: 1; max-width: none; text-align: right; }
+.grid.list .more { position: static; }
 
 /* ---------- 更新进度 ---------- */
 .update-progress { display: flex; align-items: center; gap: 10px; margin-top: 10px; }

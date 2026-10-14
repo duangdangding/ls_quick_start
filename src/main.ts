@@ -1,13 +1,14 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig } from "./config";
+import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig, saveConfig } from "./config";
 import "./styles.css";
 
 type Item = { id: string; name: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
 type Group = { id: string; name: string; sortOrder: number };
 type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null };
 type SortBy = "custom" | "name" | "created";
+type ViewMode = "card" | "list";
 type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number };
 type ItemIcon = { id: string; iconPath: string | null };
 
@@ -18,6 +19,8 @@ let passwordSet = false;
 let unlocked = false;
 let activeGroup = "all";
 let sortBy: SortBy = "custom";
+let viewMode: ViewMode = "card";
+let appConfig: AppConfig | null = null;
 let query = "";
 let selected = 0;
 let composingSearch = false;
@@ -105,13 +108,29 @@ function itemIcon(item: Item) {
   if (/\\[^\\]+$/.test(item.target)) return "▰";
   return "▤";
 }
+/** 方向键上下移动的“列数”：列表视图单列，卡片视图按容器宽度估算 */
+function arrowColumns() {
+  if (viewMode === "list") return 1;
+  return Math.max(1, Math.floor((document.querySelector("#grid")?.clientWidth ?? 250) / 220));
+}
+/** 切换全局显示方式（卡片/列表），并持久化到配置 */
+function setViewMode(mode: ViewMode) {
+  if (mode !== "card" && mode !== "list") return;
+  if (mode === viewMode) return;
+  viewMode = mode;
+  if (appConfig) {
+    appConfig.viewMode = mode;
+    void saveConfig(appConfig);
+  }
+  render();
+}
 function render() {
   const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
   app.innerHTML = `<section class="shell">
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索名称、拼音或首字母" value="${escape(query)}" /></label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描桌面</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
-    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="custom">自定义</option><option value="name">名称</option><option value="created">添加时间</option></select></label>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
-    <section id="grid" class="grid">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}" draggable="${sortBy === "custom"}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, query.trim().toLowerCase())}</b><span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或扫描桌面批量导入。</p></div>`}</section>
+    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="custom">自定义</option><option value="name">名称</option><option value="created">添加时间</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}" draggable="${sortBy === "custom"}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, query.trim().toLowerCase())}</b><span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或扫描桌面批量导入。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -124,7 +143,7 @@ function render() {
     if (event.key === "Enter" && shownItems[selected]) { event.preventDefault(); void openItem(shownItems[selected].id); }
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shownItems.length) {
       event.preventDefault();
-      const width = Math.max(1, Math.floor((document.querySelector("#grid")?.clientWidth ?? 250) / 220));
+      const width = arrowColumns();
       const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width;
       selected = (selected + delta + shownItems.length) % shownItems.length;
       render();
@@ -134,6 +153,7 @@ function render() {
   if (searchSelection) input.setSelectionRange(...searchSelection);
   document.querySelector<HTMLSelectElement>("#sort")!.value = sortBy;
   document.querySelector<HTMLSelectElement>("#sort")!.onchange = (event) => { sortBy = (event.target as HTMLSelectElement).value as SortBy; render(); };
+  document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.onclick = () => setViewMode(button.dataset.view as ViewMode));
   bindInteractions(shown);
 }
 function bindInteractions(shown: Item[]) {
@@ -219,10 +239,17 @@ async function openScan() {
 }
 async function reorderItems(event: DragEvent, targetId: string) { event.preventDefault(); if (sortBy !== "custom") return; const sourceId = event.dataTransfer?.getData("item"); if (!sourceId || sourceId === targetId) return; const visible = displayItems(); const from = visible.findIndex((item) => item.id === sourceId); const to = visible.findIndex((item) => item.id === targetId); if (from < 0 || to < 0) return; visible.splice(to, 0, visible.splice(from, 1)[0]); try { await invoke("save_item_order", { ids: visible.map((item) => item.id) }); await load(); } catch (error) { message(error); } }
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
-window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = Math.max(1, Math.floor((document.querySelector("#grid")?.clientWidth ?? 250) / 220)); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
+window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
+// 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
+document.addEventListener("click", (event) => {
+  if ((event.target as HTMLElement).closest(".menu")) return;
+  document.querySelector(".menu")?.remove();
+});
 // 应用外观配置（主题、高亮色、字号、窗口效果、面板背景）并监听设置页变更实时生效
 loadConfig().then(async (cfg) => {
+  appConfig = cfg;
+  viewMode = cfg.viewMode === "list" ? "list" : "card";
   applyAppearance(cfg);
   applyWindowEffect(cfg.windowEffect);
   await applyWindowBackground(cfg.background, true);
@@ -231,11 +258,15 @@ loadConfig().then(async (cfg) => {
 });
 listen<AppConfig>("config-changed", async (event) => {
   const cfg = event.payload;
+  appConfig = cfg;
   applyAppearance(cfg);
   applyWindowEffect(cfg.windowEffect);
   await applyWindowBackground(cfg.background, true);
-  // 钉住状态可能来自托盘菜单，需实时反映到面板按钮
-  if (cfg.alwaysOnTop !== pinned) {
+  const mode: ViewMode = cfg.viewMode === "list" ? "list" : "card";
+  const viewChanged = mode !== viewMode;
+  viewMode = mode;
+  // 钉住状态可能来自托盘菜单、显示方式可能来自设置页，需实时反映到面板
+  if (cfg.alwaysOnTop !== pinned || viewChanged) {
     pinned = cfg.alwaysOnTop;
     render();
   }

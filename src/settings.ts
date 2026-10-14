@@ -558,6 +558,18 @@ $("#btn-check-update").addEventListener("click", checkUpdate);
 // ---------- 保存 ----------
 $("#btn-save").addEventListener("click", async () => {
   try {
+    // 若选了背景图但没点「应用背景」，保存时一并烘焙落盘，避免“保存后主面板无效果”
+    if (bgDraft.hasImage && bgSrcImg) {
+      const c = bakeBackground(1600);
+      if (c) {
+        const b64 = c.toDataURL("image/png").split(",")[1];
+        await invoke("save_background_cache", { b64 });
+        const bg: BackgroundConfig = { ...bgDraft, hasImage: true };
+        await invoke("set_background_config", { bg });
+        config.background = bg;
+        bgDraft = { ...bg, region: bg.region ? { ...bg.region } : null };
+      }
+    }
     await saveConfig(config);
     $("#save-msg").textContent = "已保存";
     setTimeout(() => { $("#save-msg").textContent = ""; }, 2000);

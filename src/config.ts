@@ -29,6 +29,7 @@ export interface AppConfig {
   fontSize: number;
   highlightColor: string; // #rrggbb；空 = 跟随主题强调色
   windowEffect: string; // "default" | "acrylic" | "vibrancy" | "mica"
+  viewMode: string; // 主面板显示方式："card" 卡片 | "list" 列表
   configDir: string | null;
   dbDir: string | null;
   background: BackgroundConfig;

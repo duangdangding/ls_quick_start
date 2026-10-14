@@ -67,10 +67,15 @@ struct AppConfig {
     font_size: i32,
     highlight_color: String,
     window_effect: String,
+    #[serde(default = "default_view_mode")]
+    view_mode: String,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
 }
+
+/// 主面板显示方式默认值："card" 卡片 | "list" 列表
+fn default_view_mode() -> String { "card".into() }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -124,6 +129,7 @@ impl Default for AppConfig {
             font_size: 14,
             highlight_color: String::new(), // 空 = 跟随主题强调色
             window_effect: "default".into(),
+            view_mode: "card".into(),
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),
