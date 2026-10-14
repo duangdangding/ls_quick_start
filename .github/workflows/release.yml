@@ -17,6 +17,9 @@ jobs:
           - os: windows-latest
             target: ""
     runs-on: ${{ matrix.os }}
+    env:
+      # 用于条件判断：secrets 不能出现在 if: 里，先映射到 job 级 env
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +34,39 @@ jobs:
       - name: Install frontend dependencies
         run: bun install
 
+      # Windows 代码签名：仅在配置了 WINDOWS_CERT_PFX secret 时启用。
+      # 解出证书文件并向 tauri.conf.json 注入 bundle.windows.signCommand，
+      # Tauri 打包时会用它给 exe / NSIS 安装包逐个签名。
+      - name: Prepare Windows code signing
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $certPath = "$env:RUNNER_TEMP\suqi-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          "WINDOWS_CERT_PATH=$certPath" >> $env:GITHUB_ENV
+          "WINDOWS_CERT_PASSWORD=$env:WINDOWS_CERT_PASSWORD" >> $env:GITHUB_ENV
+
+          $confPath = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $confPath -Raw | ConvertFrom-Json
+          $sign = [pscustomobject]@{
+            cmd  = 'pwsh'
+            args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'sign-windows.ps1', '%1')
+          }
+          if ($json.bundle.PSObject.Properties['windows']) {
+            $json.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $sign -Force
+          } else {
+            $json.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{ signCommand = $sign })
+          }
+          $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
+
       - name: Build and upload release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "suqi ${{ github.ref_name }}"

@@ -11,6 +11,7 @@
         <button class="tab active" data-tab="general">常规</button>
         <button class="tab" data-tab="appearance">外观</button>
         <button class="tab" data-tab="data">数据库</button>
+        <button class="tab" data-tab="update">更新</button>
         <button class="tab" data-tab="about">关于</button>
       </nav>
 
@@ -37,7 +38,10 @@
           <label>配置文件目录</label>
           <div class="row">
             <code id="config-dir">加载中…</code>
+            <button id="btn-change-config-dir" type="button">更改…</button>
+            <button id="btn-reset-config-dir" type="button">恢复默认</button>
           </div>
+          <small>默认在程序目录下，可自定义到其他位置</small>
         </div>
       </section>
 
@@ -67,6 +71,20 @@
           </select>
           <small>切换后呼出主面板可实时预览</small>
         </div>
+        <div class="field">
+          <label>自定义背景</label>
+          <label class="check"><input type="checkbox" id="bg-enabled" /> 启用背景图片</label>
+          <div class="row">
+            <button id="btn-bg-import" type="button">选择图片…</button>
+            <button id="btn-bg-clear" type="button">清除背景</button>
+          </div>
+          <div class="row" id="bg-preview-row" style="display:none;">
+            <img id="bg-preview" style="max-width: 200px; max-height: 120px; border-radius: 6px; border: 1px solid var(--border);" />
+          </div>
+          <label>背景不透明度</label>
+          <input type="range" id="bg-opacity" min="0" max="1" step="0.05" style="max-width: 200px;" />
+          <small>支持 PNG / JPG / WebP / BMP / GIF，最大 30MB</small>
+        </div>
       </section>
 
       <section class="tab-page" id="tab-data">
@@ -79,6 +97,15 @@
           <small>导出为 JSON 文件；导入会覆盖当前全部数据</small>
         </div>
         <div class="field">
+          <label>数据库目录</label>
+          <div class="row">
+            <code id="db-dir">加载中…</code>
+            <button id="btn-change-db-dir" type="button">更改…</button>
+            <button id="btn-reset-db-dir" type="button">恢复默认</button>
+          </div>
+          <small>数据库文件默认在程序目录下，可自定义到其他位置</small>
+        </div>
+        <div class="field">
           <label>数据库信息</label>
           <div class="db-info">
             <div>路径：<code id="db-path">-</code></div>
@@ -88,6 +115,28 @@
             <div>密码已设置：<span id="db-password">-</span></div>
           </div>
           <button id="btn-refresh-db" type="button">刷新</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-update">
+        <div class="field">
+          <label>自动更新</label>
+          <div class="row">
+            <button id="btn-check-update" class="primary" type="button">检查更新</button>
+            <span id="update-version-info" style="color: var(--muted); font-size: 12px;"></span>
+          </div>
+          <div id="update-progress-wrap" style="display:none;">
+            <div class="update-progress">
+              <progress id="update-progress" value="0" max="100"></progress>
+              <span id="update-progress-text">0%</span>
+            </div>
+            <div class="update-status" id="update-status"></div>
+          </div>
+          <small>检查到更新后可选择下载并安装，支持便携版自动替换和安装版下载安装包</small>
+        </div>
+        <div class="field">
+          <label>当前版本</label>
+          <code id="about-version">-</code>
         </div>
       </section>
 

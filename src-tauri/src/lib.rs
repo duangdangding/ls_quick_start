@@ -1,15 +1,31 @@
 use pinyin::ToPinyin;
 use rand::RngCore;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fs, path::{Path, PathBuf}, process::Command, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tauri::{Emitter, Manager, State};
-use tauri::menu::{Menu, MenuItem, CheckMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 const ENCRYPTED_GROUP: &str = "__encrypted__";
+const DB_FILE: &str = "suqi.db";
+const POINTER_FILE: &str = "suqi-data-dir.txt";
+
+// ---------- 数据结构 ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,8 +54,6 @@ struct PasswordHash { salt: String, hash: String }
 #[serde(rename_all = "camelCase")]
 struct Store { items: Vec<LauncherItem>, groups: Vec<Group>, password: Option<PasswordHash> }
 
-struct AppData { store: Mutex<Store>, path: PathBuf }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppConfig {
@@ -55,7 +69,22 @@ struct AppConfig {
     font_size: i32,
     highlight_color: String,
     window_effect: String,
-    config_dir: String,
+    config_dir: Option<String>,
+    db_dir: Option<String>,
+    background: BackgroundConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundConfig {
+    enabled: bool,
+    opacity: f64,
+    #[serde(default)]
+    image_data: Option<String>,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self { Self { enabled: false, opacity: 0.5, image_data: None } }
 }
 
 impl Default for AppConfig {
@@ -73,71 +102,176 @@ impl Default for AppConfig {
             font_size: 14,
             highlight_color: "#7c3aed".into(),
             window_effect: "default".into(),
-            config_dir: String::new(),
+            config_dir: None,
+            db_dir: None,
+            background: BackgroundConfig::default(),
         }
     }
 }
 
-struct ConfigState { config: Mutex<AppConfig>, config_path: PathBuf, pinned: AtomicBool }
+// ---------- 目录解析 ----------
 
-fn config_path() -> PathBuf {
-    dirs::config_dir().or_else(dirs::data_local_dir).unwrap_or_else(|| PathBuf::from(".")).join("suqi").join("config.json")
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn default_data_dir() -> PathBuf { exe_dir() }
+
+fn default_config_path() -> PathBuf { default_data_dir().join("config.json") }
+
+fn pointer_path() -> PathBuf { default_data_dir().join(POINTER_FILE) }
+
+fn effective_config_path() -> PathBuf {
+    if let Ok(ptr) = fs::read_to_string(pointer_path()) {
+        let dir = ptr.trim();
+        if !dir.is_empty() { return PathBuf::from(dir).join("config.json"); }
+    }
+    default_config_path()
+}
+
+fn effective_db_dir() -> PathBuf {
+    let cfg = load_config();
+    cfg.db_dir.as_ref().map(PathBuf::from).unwrap_or_else(default_data_dir)
+}
+
+fn db_path() -> PathBuf { effective_db_dir().join(DB_FILE) }
+
 fn load_config() -> AppConfig {
-    let path = config_path();
+    let path = effective_config_path();
     fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn save_config_file(config: &AppConfig) -> Result<(), String> {
-    let path = config_path();
+    let path = effective_config_path();
     if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
     fs::write(&path, serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListResult { items: Vec<LauncherItem>, groups: Vec<Group>, password_set: bool }
+// ---------- 数据库 ----------
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchText { id: String, name: String, full_pinyin: String, initials: String }
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct DesktopEntry {
-    name: String,
-    source_path: String,
-    target: String,
-    is_shortcut: bool,
-    entry_type: String,
-    scan_icon_path: Option<String>,
+fn open_db() -> Result<Connection, String> {
+    let path = db_path();
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建数据库目录失败：{e}"))?; }
+    let conn = Connection::open(&path).map_err(|e| format!("打开数据库失败：{e}"))?;
+    init_db(&conn)?;
+    Ok(conn)
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize }
+fn init_db(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS items (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            target TEXT NOT NULL,
+            group_id TEXT,
+            is_encrypted INTEGER NOT NULL DEFAULT 0,
+            is_cmd INTEGER NOT NULL DEFAULT 0,
+            icon_path TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS groups (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS password (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            salt TEXT NOT NULL,
+            hash TEXT NOT NULL
+        );"
+    ).map_err(|e| format!("初始化数据库失败：{e}"))?;
+    Ok(())
+}
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemIcon { id: String, icon_path: Option<String> }
+fn load_store_from_db(conn: &Connection) -> Result<Store, String> {
+    let mut store = Store::default();
+
+    let mut stmt = conn.prepare("SELECT id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at FROM items ORDER BY sort_order").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LauncherItem {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            target: row.get(2)?,
+            group_id: row.get(3)?,
+            is_encrypted: row.get::<_, i64>(4)? != 0,
+            is_cmd: row.get::<_, i64>(5)? != 0,
+            icon_path: row.get(6)?,
+            sort_order: row.get(7)?,
+            created_at: row.get(8)?,
+        })
+    }).map_err(|e| e.to_string())?;
+    for row in rows { store.items.push(row.map_err(|e| e.to_string())?); }
+
+    let mut stmt = conn.prepare("SELECT id, name, sort_order FROM groups ORDER BY sort_order").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Group { id: row.get(0)?, name: row.get(1)?, sort_order: row.get(2)? })
+    }).map_err(|e| e.to_string())?;
+    for row in rows { store.groups.push(row.map_err(|e| e.to_string())?); }
+
+    let mut stmt = conn.prepare("SELECT salt, hash FROM password WHERE id = 1").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PasswordHash { salt: row.get(0)?, hash: row.get(1)? })
+    }).map_err(|e| e.to_string())?;
+    for row in rows { store.password = Some(row.map_err(|e| e.to_string())?); }
+
+    Ok(store)
+}
+
+fn save_store_to_db(conn: &Connection, store: &Store) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM items", []).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM groups", []).map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM password", []).map_err(|e| e.to_string())?;
+    for item in &store.items {
+        tx.execute(
+            "INSERT INTO items (id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![item.id, item.name, item.target, item.group_id, item.is_encrypted as i64, item.is_cmd as i64, item.icon_path, item.sort_order, item.created_at],
+        ).map_err(|e| e.to_string())?;
+    }
+    for group in &store.groups {
+        tx.execute(
+            "INSERT INTO groups (id, name, sort_order) VALUES (?1,?2,?3)",
+            params![group.id, group.name, group.sort_order],
+        ).map_err(|e| e.to_string())?;
+    }
+    if let Some(pw) = &store.password {
+        tx.execute(
+            "INSERT INTO password (id, salt, hash) VALUES (1, ?1, ?2)",
+            params![pw.salt, pw.hash],
+        ).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn migrate_json_if_needed() {
+    let json_path = default_data_dir().join("launchers.json");
+    if !json_path.exists() { return; }
+    let Ok(store) = serde_json::from_str::<Store>(&fs::read_to_string(&json_path).unwrap_or_default()) else { return };
+    if let Ok(conn) = open_db() {
+        let _ = save_store_to_db(&conn, &store);
+    }
+    let _ = fs::rename(&json_path, json_path.with_extension("json.bak"));
+}
+
+// ---------- 状态 ----------
+
+struct AppData { store: Mutex<Store>, conn: Mutex<Connection> }
+
+struct ConfigState {
+    config: Mutex<AppConfig>,
+    pinned: AtomicBool,
+    data_dir: PathBuf,
+}
+
+// ---------- 辅助函数 ----------
 
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64 }
 fn new_id() -> String { let mut bytes = [0u8; 12]; rand::thread_rng().fill_bytes(&mut bytes); hex::encode(bytes) }
-fn data_path() -> PathBuf {
-    dirs::data_local_dir().or_else(dirs::data_dir).unwrap_or_else(|| PathBuf::from(".")).join("suqi").join("launchers.json")
-}
-fn load_store(path: &Path) -> Store {
-    let mut store: Store = fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    for item in &mut store.items { item.target = display_path(&item.target); }
-    store
-}
-fn save(store: &Store, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败：{e}"))?; }
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(store).map_err(|e| e.to_string())?).map_err(|e| format!("保存数据失败：{e}"))?;
-    fs::rename(temp, path).map_err(|e| format!("保存数据失败：{e}"))
-}
 fn valid_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c) || matches!(c, ' ' | '-' | '_' | '－' | '—' | '(' | ')' | '（' | '）' | '.' | '·'))
@@ -201,17 +335,32 @@ fn pinyin_text(name: &str) -> (String, String) {
     (full, initials)
 }
 fn encrypted(item: &LauncherItem) -> bool { item.is_encrypted || item.group_id.as_deref() == Some(ENCRYPTED_GROUP) }
-fn persist(data: &AppData, store: &Store) -> Result<(), String> { save(store, &data.path) }
+
+fn persist(data: &AppData, store: &Store) -> Result<(), String> {
+    let conn = data.conn.lock().unwrap();
+    save_store_to_db(&conn, store)
+}
+
+// ---------- 启动项命令 ----------
 
 #[tauri::command]
 fn list_data(data: State<'_, AppData>, include_encrypted: bool) -> ListResult {
     let store = data.store.lock().unwrap();
-    ListResult { items: store.items.iter().filter(|item| include_encrypted || !encrypted(item)).cloned().collect(), groups: store.groups.clone(), password_set: store.password.is_some() }
+    ListResult {
+        items: store.items.iter().filter(|item| include_encrypted || !encrypted(item)).cloned().collect(),
+        groups: store.groups.clone(),
+        password_set: store.password.is_some(),
+    }
 }
+
 #[tauri::command]
 fn searchable_items(data: State<'_, AppData>, include_encrypted: bool) -> Vec<SearchText> {
-    data.store.lock().unwrap().items.iter().filter(|item| include_encrypted || !encrypted(item)).map(|item| { let (full_pinyin, initials) = pinyin_text(&item.name); SearchText { id: item.id.clone(), name: item.name.clone(), full_pinyin, initials } }).collect()
+    data.store.lock().unwrap().items.iter().filter(|item| include_encrypted || !encrypted(item)).map(|item| {
+        let (full_pinyin, initials) = pinyin_text(&item.name);
+        SearchText { id: item.id.clone(), name: item.name.clone(), full_pinyin, initials }
+    }).collect()
 }
+
 #[tauri::command]
 fn save_item(data: State<'_, AppData>, mut item: LauncherItem, is_cmd: bool) -> Result<LauncherItem, String> {
     check_name(&item.name)?;
@@ -222,21 +371,26 @@ fn save_item(data: State<'_, AppData>, mut item: LauncherItem, is_cmd: bool) -> 
     let mut store = data.store.lock().unwrap();
     if item.group_id.as_deref() != Some(ENCRYPTED_GROUP) && item.group_id.as_ref().is_some_and(|id| !store.groups.iter().any(|g| &g.id == id)) { return Err("所选分组不存在".into()); }
     if store.items.iter().any(|x| x.id != item.id && x.target.eq_ignore_ascii_case(&item.target)) { return Err("该真实目标已存在，不能重复添加".into()); }
-    if item.id.is_empty() { item.id = new_id(); item.created_at = now(); item.sort_order = store.items.iter().map(|x| x.sort_order).max().unwrap_or(-1) + 1; store.items.push(item.clone()); } else if let Some(existing) = store.items.iter_mut().find(|x| x.id == item.id) { item.created_at = existing.created_at; item.sort_order = existing.sort_order; *existing = item.clone(); } else { return Err("要编辑的启动项不存在".into()); }
+    if item.id.is_empty() {
+        item.id = new_id(); item.created_at = now(); item.sort_order = store.items.iter().map(|x| x.sort_order).max().unwrap_or(-1) + 1; store.items.push(item.clone());
+    } else if let Some(existing) = store.items.iter_mut().find(|x| x.id == item.id) {
+        item.created_at = existing.created_at; item.sort_order = existing.sort_order; *existing = item.clone();
+    } else { return Err("要编辑的启动项不存在".into()); }
     persist(&data, &store)?; Ok(item)
 }
+
 #[tauri::command]
-fn delete_item(data: State<'_, AppData>, id: String) -> Result<(), String> { let mut store = data.store.lock().unwrap(); store.items.retain(|x| x.id != id); persist(&data, &store) }
+fn delete_item(data: State<'_, AppData>, id: String) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap(); store.items.retain(|x| x.id != id); persist(&data, &store)
+}
+
 #[tauri::command]
 fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(), String> {
     let item = data.store.lock().unwrap().items.iter().find(|x| x.id == id).cloned().ok_or("启动项不存在")?;
     if encrypted(&item) && !unlocked { return Err("请先解锁加密分组".into()); }
     #[cfg(windows)] {
-        if item.is_cmd {
-            Command::new("cmd").args(["/C", &item.target]).spawn().map_err(|e| format!("无法打开目标：{e}"))?;
-        } else {
-            Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?;
-        }
+        if item.is_cmd { Command::new("cmd").args(["/C", &item.target]).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
+        else { Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
     }
     #[cfg(not(windows))] {
         let mut command = if item.is_cmd { let mut c = Command::new("sh"); c.args(["-c", &item.target]); c } else { let mut c = Command::new("open"); c.arg(&item.target); c };
@@ -244,26 +398,98 @@ fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(),
     }
     Ok(())
 }
+
 #[tauri::command]
-fn create_group(data: State<'_, AppData>, name: String) -> Result<Group, String> { check_name(&name)?; let mut store = data.store.lock().unwrap(); if store.groups.iter().any(|g| g.name == name.trim()) { return Err("已存在同名分组".into()); } let group = Group { id: new_id(), name: name.trim().into(), sort_order: store.groups.iter().map(|g| g.sort_order).max().unwrap_or(-1) + 1 }; store.groups.push(group.clone()); persist(&data, &store)?; Ok(group) }
+fn create_group(data: State<'_, AppData>, name: String) -> Result<Group, String> {
+    check_name(&name)?;
+    let mut store = data.store.lock().unwrap();
+    if store.groups.iter().any(|g| g.name == name.trim()) { return Err("已存在同名分组".into()); }
+    let group = Group { id: new_id(), name: name.trim().into(), sort_order: store.groups.iter().map(|g| g.sort_order).max().unwrap_or(-1) + 1 };
+    store.groups.push(group.clone()); persist(&data, &store)?; Ok(group)
+}
+
 #[tauri::command]
-fn rename_group(data: State<'_, AppData>, id: String, name: String) -> Result<(), String> { check_name(&name)?; let mut store = data.store.lock().unwrap(); if store.groups.iter().any(|g| g.id != id && g.name == name.trim()) { return Err("已存在同名分组".into()); } store.groups.iter_mut().find(|g| g.id == id).ok_or("分组不存在")?.name = name.trim().into(); persist(&data, &store) }
+fn rename_group(data: State<'_, AppData>, id: String, name: String) -> Result<(), String> {
+    check_name(&name)?;
+    let mut store = data.store.lock().unwrap();
+    if store.groups.iter().any(|g| g.id != id && g.name == name.trim()) { return Err("已存在同名分组".into()); }
+    store.groups.iter_mut().find(|g| g.id == id).ok_or("分组不存在")?.name = name.trim().into(); persist(&data, &store)
+}
+
 #[tauri::command]
-fn delete_group(data: State<'_, AppData>, id: String) -> Result<(), String> { let mut store = data.store.lock().unwrap(); if !store.groups.iter().any(|g| g.id == id) { return Err("分组不存在".into()); } store.groups.retain(|g| g.id != id); for item in &mut store.items { if item.group_id.as_deref() == Some(&id) { item.group_id = None; } } persist(&data, &store) }
+fn delete_group(data: State<'_, AppData>, id: String) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap();
+    if !store.groups.iter().any(|g| g.id == id) { return Err("分组不存在".into()); }
+    store.groups.retain(|g| g.id != id);
+    for item in &mut store.items { if item.group_id.as_deref() == Some(&id) { item.group_id = None; } }
+    persist(&data, &store)
+}
+
 #[tauri::command]
-fn save_group_order(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), String> { let mut store = data.store.lock().unwrap(); for (index, id) in ids.iter().enumerate() { if let Some(group) = store.groups.iter_mut().find(|g| &g.id == id) { group.sort_order = index as i64; } } persist(&data, &store) }
+fn save_group_order(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap();
+    for (index, id) in ids.iter().enumerate() { if let Some(group) = store.groups.iter_mut().find(|g| &g.id == id) { group.sort_order = index as i64; } }
+    persist(&data, &store)
+}
+
 #[tauri::command]
-fn save_item_order(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), String> { let mut store = data.store.lock().unwrap(); for (index, id) in ids.iter().enumerate() { if let Some(item) = store.items.iter_mut().find(|x| &x.id == id) { item.sort_order = index as i64; } } persist(&data, &store) }
-fn password_hash(password: &str, salt: &str) -> String { let mut hasher = Sha256::new(); hasher.update(salt.as_bytes()); hasher.update(password.as_bytes()); hex::encode(hasher.finalize()) }
+fn save_item_order(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap();
+    for (index, id) in ids.iter().enumerate() { if let Some(item) = store.items.iter_mut().find(|x| &x.id == id) { item.sort_order = index as i64; } }
+    persist(&data, &store)
+}
+
+fn password_hash(password: &str, salt: &str) -> String {
+    let mut hasher = Sha256::new(); hasher.update(salt.as_bytes()); hasher.update(password.as_bytes()); hex::encode(hasher.finalize())
+}
+
 #[tauri::command]
-fn unlock_encrypted(data: State<'_, AppData>, password: String) -> Result<bool, String> { let store = data.store.lock().unwrap(); let Some(saved) = &store.password else { return Err("请先设置密码".into()) }; Ok(password_hash(&password, &saved.salt) == saved.hash) }
+fn unlock_encrypted(data: State<'_, AppData>, password: String) -> Result<bool, String> {
+    let store = data.store.lock().unwrap();
+    let Some(saved) = &store.password else { return Err("请先设置密码".into()) };
+    Ok(password_hash(&password, &saved.salt) == saved.hash)
+}
+
 #[tauri::command]
-fn reset_password(data: State<'_, AppData>, current_password: Option<String>, new_password: String) -> Result<(), String> { if new_password.trim().len() < 4 { return Err("密码至少需要 4 个字符".into()); } let mut store = data.store.lock().unwrap(); if let Some(saved) = &store.password { let current = current_password.ok_or("请输入当前密码")?; if password_hash(&current, &saved.salt) != saved.hash { return Err("当前密码不正确".into()); } } let mut bytes = [0u8; 16]; rand::thread_rng().fill_bytes(&mut bytes); let salt = hex::encode(bytes); store.password = Some(PasswordHash { hash: password_hash(&new_password, &salt), salt }); persist(&data, &store) }
+fn reset_password(data: State<'_, AppData>, current_password: Option<String>, new_password: String) -> Result<(), String> {
+    if new_password.trim().len() < 4 { return Err("密码至少需要 4 个字符".into()); }
+    let mut store = data.store.lock().unwrap();
+    if let Some(saved) = &store.password {
+        let current = current_password.ok_or("请输入当前密码")?;
+        if password_hash(&current, &saved.salt) != saved.hash { return Err("当前密码不正确".into()); }
+    }
+    let mut bytes = [0u8; 16]; rand::thread_rng().fill_bytes(&mut bytes);
+    let salt = hex::encode(bytes);
+    store.password = Some(PasswordHash { hash: password_hash(&new_password, &salt), salt });
+    persist(&data, &store)
+}
+
+// ---------- 桌面扫描 ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DesktopEntry {
+    name: String,
+    source_path: String,
+    target: String,
+    is_shortcut: bool,
+    entry_type: String,
+    scan_icon_path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemIcon { id: String, icon_path: Option<String> }
+
 #[tauri::command]
 fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
     let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
     let mut entries = Vec::new();
-    let icon_dir = dirs::data_local_dir().or_else(dirs::data_dir).unwrap_or_else(|| PathBuf::from(".")).join("suqi").join("scan-icons");
+    let icon_dir = default_data_dir().join("scan-icons");
     let _ = fs::create_dir_all(&icon_dir);
     let mut icon_pairs = Vec::new();
     for entry in fs::read_dir(desktop).map_err(|e| format!("读取桌面失败：{e}"))? {
@@ -274,7 +500,6 @@ fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         let shortcut = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
         let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
-        // 扫描阶段只读取目录项元数据；快捷方式的真实目标在导入已选项时再解析，避免每个 .lnk 启动一次 PowerShell。
         let source_path = display_path(path.display().to_string());
         let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
         let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
@@ -294,12 +519,13 @@ fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
         let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
         entry.scan_icon_path = icon_file.exists().then(|| display_path(icon_file.display().to_string()));
     }
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|a| a.name.to_lowercase());
     Ok(entries)
 }
+
 #[tauri::command]
 fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id: Option<String>) -> Result<ImportResult, String> {
-    let shortcut_paths: Vec<PathBuf> = entries.iter().filter(|entry| entry.is_shortcut).map(|entry| PathBuf::from(&entry.source_path)).collect();
+    let shortcut_paths: Vec<PathBuf> = entries.iter().filter(|e| e.is_shortcut).map(|e| PathBuf::from(&e.source_path)).collect();
     let shortcut_targets = resolve_shortcuts(&shortcut_paths);
     let mut shortcut_index = 0;
     let mut prepared = Vec::new();
@@ -308,8 +534,7 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
         if entry.name.trim().is_empty() { skipped_invalid += 1; continue; }
         let candidate = if entry.is_shortcut {
             let target = shortcut_targets.get(shortcut_index).cloned().unwrap_or_default();
-            shortcut_index += 1;
-            target
+            shortcut_index += 1; target
         } else { entry.source_path };
         match normalize_target(&candidate, false) {
             Ok(target) => prepared.push((entry.name, target)),
@@ -324,17 +549,16 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     for (name, target) in prepared {
         if !known.insert(target.to_lowercase()) { skipped_duplicates += 1; continue; }
         store.items.push(LauncherItem { id: new_id(), name, target, group_id: group_id.clone(), is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now() });
-        order += 1;
-        added += 1;
+        order += 1; added += 1;
     }
     persist(&data, &store)?;
     Ok(ImportResult { added, skipped_duplicates, skipped_invalid })
 }
 
 #[tauri::command]
-fn item_icons(data: State<'_, AppData>) -> Vec<ItemIcon> {
+fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<ItemIcon> {
     let items = data.store.lock().unwrap().items.clone();
-    let cache_dir = data.path.parent().unwrap_or(Path::new(".")).join("icons");
+    let cache_dir = state.data_dir.join("icons");
     let _ = fs::create_dir_all(&cache_dir);
     #[cfg(windows)] {
         let pairs = items.iter().filter_map(|item| {
@@ -352,6 +576,14 @@ fn item_icons(data: State<'_, AppData>) -> Vec<ItemIcon> {
 
 // ---------- 设置页命令 ----------
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListResult { items: Vec<LauncherItem>, groups: Vec<Group>, password_set: bool }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchText { id: String, name: String, full_pinyin: String, initials: String }
+
 #[tauri::command]
 fn get_config(state: State<'_, ConfigState>) -> AppConfig { state.config.lock().unwrap().clone() }
 
@@ -361,20 +593,19 @@ fn save_config(state: State<'_, ConfigState>, app: tauri::AppHandle, config: App
     save_config_file(&config)?;
     register_hotkey(&app, &config.hotkey)?;
     apply_autostart(&app, config.autostart);
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.set_always_on_top(config.always_on_top);
-    }
+    if let Some(win) = app.get_webview_window("main") { let _ = win.set_always_on_top(config.always_on_top); }
     apply_window_effect_all(&app, &config.window_effect, config.theme != "light");
     let _ = app.emit("config-changed", config);
     Ok(())
 }
 
 #[tauri::command]
-fn get_db_info(data: State<'_, AppData>) -> serde_json::Value {
+fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serde_json::Value {
     let store = data.store.lock().unwrap();
-    let size = fs::metadata(&data.path).map(|m| m.len()).unwrap_or(0);
+    let path = db_path();
+    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     serde_json::json!({
-        "path": display_path(data.path.display().to_string()),
+        "path": display_path(path.display().to_string()),
         "size": size,
         "itemCount": store.items.len(),
         "groupCount": store.groups.len(),
@@ -400,18 +631,13 @@ fn import_data(data: State<'_, AppData>, json: String) -> Result<(), String> {
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if !win.is_visible().unwrap_or(false) {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
+        if !win.is_visible().unwrap_or(false) { let _ = win.show(); let _ = win.set_focus(); }
     }
 }
 
 #[tauri::command]
 fn hide_panel(app: tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.hide();
-    }
+    if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
 }
 
 #[tauri::command]
@@ -434,17 +660,184 @@ fn set_window_effect(app: tauri::AppHandle, state: State<'_, ConfigState>, effec
 }
 
 #[tauri::command]
-fn get_config_dir() -> String { display_path(config_path().parent().unwrap_or(Path::new(".")).display().to_string()) }
-
-#[tauri::command]
-fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
-    open_settings_window_internal(&app)
+fn get_config_dir(state: State<'_, ConfigState>) -> String {
+    display_path(state.data_dir.display().to_string())
 }
 
-fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("settings") {
-        let _ = w.show(); let _ = w.set_focus();
+#[tauri::command]
+fn get_db_dir(_state: State<'_, ConfigState>) -> String {
+    display_path(effective_db_dir().display().to_string())
+}
+
+#[tauri::command]
+fn set_data_dirs(state: State<'_, ConfigState>, config_dir: Option<String>, db_dir: Option<String>, action: String) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    let old_db_dir = effective_db_dir();
+
+    if let Some(ref dir) = config_dir {
+        if !dir.is_empty() {
+            let new_path = PathBuf::from(dir).join("config.json");
+            if let Some(parent) = new_path.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?; }
+            if action == "move" {
+                let old = effective_config_path();
+                if old != new_path { let _ = fs::rename(&old, &new_path); }
+            }
+            fs::write(pointer_path(), dir).map_err(|e| format!("写入指针文件失败：{e}"))?;
+            cfg.config_dir = Some(dir.clone());
+        }
     }
+
+    if let Some(ref dir) = db_dir {
+        if !dir.is_empty() {
+            let new_db_dir = PathBuf::from(dir);
+            fs::create_dir_all(&new_db_dir).map_err(|e| format!("创建数据库目录失败：{e}"))?;
+            if action == "move" && old_db_dir != new_db_dir {
+                let old_db = old_db_dir.join(DB_FILE);
+                let new_db = new_db_dir.join(DB_FILE);
+                if old_db.exists() { let _ = fs::rename(&old_db, &new_db); }
+            }
+            cfg.db_dir = Some(dir.clone());
+        }
+    }
+
+    if action == "reset" {
+        cfg.config_dir = None;
+        cfg.db_dir = None;
+        let _ = fs::remove_file(pointer_path());
+    }
+
+    save_config_file(&cfg)?;
+    Ok(())
+}
+
+// ---------- 背景 ----------
+
+#[tauri::command]
+fn set_background(state: State<'_, ConfigState>, app: tauri::AppHandle, enabled: bool, opacity: f64, image_data: Option<String>) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    cfg.background.enabled = enabled;
+    cfg.background.opacity = opacity;
+    if let Some(data) = image_data { cfg.background.image_data = Some(data); }
+    let snapshot = cfg.clone();
+    save_config_file(&snapshot)?;
+    let _ = app.emit("config-changed", snapshot);
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_background(state: State<'_, ConfigState>, app: tauri::AppHandle) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    cfg.background = BackgroundConfig::default();
+    let snapshot = cfg.clone();
+    save_config_file(&snapshot)?;
+    let _ = app.emit("config-changed", snapshot);
+    Ok(())
+}
+
+// ---------- 更新 ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct UpdateInfo { version: String, url: String, notes: Option<String> }
+
+#[tauri::command]
+fn http_get_text(url: String) -> Result<String, String> {
+    let resp = ureq::get(&url).call().map_err(|e| format!("请求失败：{e}"))?;
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+#[tauri::command]
+fn portable_update_download(url: String, dest: String, app: tauri::AppHandle) -> Result<(), String> {
+    let resp = ureq::get(&url).call().map_err(|e| format!("下载失败：{e}"))?;
+    let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut reader = resp.into_reader();
+    let mut file = fs::File::create(&dest).map_err(|e| format!("创建文件失败：{e}"))?;
+    let mut buf = [0u8; 8192];
+    let mut downloaded: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        downloaded += n as u64;
+        if total > 0 {
+            let _ = app.emit("update-download-progress", serde_json::json!({"downloaded": downloaded, "total": total}));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn portable_update_verify(file_path: String, expected_sha256: String) -> Result<bool, String> {
+    let data = fs::read(&file_path).map_err(|e| format!("读取文件失败：{e}"))?;
+    let hash = hex::encode(Sha256::digest(&data));
+    Ok(hash.eq_ignore_ascii_case(&expected_sha256.trim().to_lowercase()))
+}
+
+#[tauri::command]
+fn get_update_paths() -> Result<(String, String), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败：{e}"))?;
+    let temp = std::env::temp_dir();
+    Ok((exe.to_string_lossy().to_string(), temp.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn portable_update_apply(exe_path: String, new_file: String) -> Result<(), String> {
+    #[cfg(windows)] {
+        let temp_dir = std::env::temp_dir();
+        let helper = temp_dir.join("suqi-update-helper.exe");
+        fs::copy(&exe_path, &helper).map_err(|e| format!("复制更新助手失败：{e}"))?;
+        Command::new(&helper)
+            .args(["--apply-update", &exe_path, &new_file])
+            .spawn()
+            .map_err(|e| format!("启动更新助手失败：{e}"))?;
+        std::process::exit(0);
+    }
+    #[cfg(not(windows))] { Err("仅 Windows 支持".into()) }
+}
+
+fn apply_update_helper(exe_path: &str, new_file: &str) {
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let _ = fs::remove_file(exe_path);
+    let _ = fs::copy(new_file, exe_path);
+    let _ = fs::remove_file(new_file);
+    let _ = Command::new(exe_path).spawn();
+}
+
+fn is_update_mode() -> bool {
+    std::env::args().any(|a| a == "--apply-update")
+}
+
+fn handle_update_mode() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(idx) = args.iter().position(|a| a == "--apply-update") {
+        if args.len() > idx + 2 {
+            let exe_path = args[idx + 1].clone();
+            let new_file = args[idx + 2].clone();
+            apply_update_helper(&exe_path, &new_file);
+            std::process::exit(0);
+        }
+    }
+}
+
+#[tauri::command]
+fn installer_update_run(path: String) -> Result<(), String> {
+    #[cfg(windows)] {
+        Command::new("explorer.exe").arg(&path).spawn().map_err(|e| e.to_string())?;
+        std::process::exit(0);
+    }
+    #[cfg(not(windows))] { Err("仅 Windows 支持".into()) }
+}
+
+// ---------- 窗口控制 ----------
+
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> { open_settings_window_internal(&app) }
+
+fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("settings") { let _ = w.show(); let _ = w.set_focus(); }
     Ok(())
 }
 
@@ -558,12 +951,23 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
     }
 }
 
+// ---------- 入口 ----------
+
 pub fn run() {
-    let path = data_path();
-    let store = load_store(&path);
+    if is_update_mode() { handle_update_mode(); }
+
+    migrate_json_if_needed();
+
+    let conn = open_db().expect("无法打开数据库");
+    let store = load_store_from_db(&conn).expect("无法加载数据");
     let config = load_config();
-    let config_state = ConfigState { config: Mutex::new(config.clone()), config_path: config_path(), pinned: AtomicBool::new(false) };
-    // 提前拷贝所需配置字段，避免 setup 闭包借用外层局部变量
+    let data_dir = default_data_dir();
+    let config_state = ConfigState {
+        config: Mutex::new(config.clone()),
+        pinned: AtomicBool::new(false),
+        data_dir: data_dir.clone(),
+    };
+
     let hotkey = config.hotkey.clone();
     let autostart = config.autostart;
     let always_on_top = config.always_on_top;
@@ -573,28 +977,32 @@ pub fn run() {
     let silent_start = config.silent_start;
     let theme_dark = config.theme != "light";
     let window_effect_cfg = config.window_effect.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![])))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, _shortcut, event| {
                 if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed { toggle_window(app); }
             })
             .build())
-        .manage(AppData { store: Mutex::new(store), path })
+        .manage(AppData { store: Mutex::new(store), conn: Mutex::new(conn) })
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop,
             import_scanned, item_icons, get_config, save_config, get_db_info, export_data, import_data,
-            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect, get_config_dir,
+            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
+            get_config_dir, get_db_dir, set_data_dirs,
+            set_background, clear_background,
+            http_get_text, portable_update_download, portable_update_verify, portable_update_apply, installer_update_run, get_update_paths,
             open_settings_window, set_always_on_top
         ])
         .setup(move |app| {
-            // 托盘
             let show = MenuItem::with_id(app, "show", "显示/隐藏面板", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -616,11 +1024,8 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-            // 全局热键（默认 Win+`）
             register_hotkey(app.handle(), &hotkey)?;
-            // 开机自启
             apply_autostart(app.handle(), autostart);
-            // 主窗口配置
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_always_on_top(always_on_top);
                 if remember_size && window_width > 0 && window_height > 0 {

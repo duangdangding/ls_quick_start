@@ -16,15 +16,21 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 - 钉住面板（置顶）
 - 开机自启 / 静默启动
 - 记住窗口大小
-- 外观设置（主题 / 字号 / 高亮色 / 窗口效果）
+- 外观设置（主题 / 字号 / 高亮色 / 窗口效果 / 自定义背景图片）
+- 数据存储于 SQLite，旧版 JSON 数据自动迁移
+- 自定义配置文件目录（默认软件同目录）
+- 自定义数据库文件目录（默认软件同目录）
+- 自动更新（便携版自替换 / 安装版下载安装包）
+- 更新文件 SHA-256 校验
+- Windows 代码签名（GitHub Actions 注入）
 - 数据库导入 / 导出 / 信息查看
 
 ## 技术栈
 
 - **前端**: Vite + TypeScript
 - **后端**: Rust (Tauri 2)
-- **插件**: global-shortcut, autostart, process, fs, dialog, opener
-- **存储**: JSON 文件（`%APPDATA%/suqi/`）
+- **插件**: global-shortcut, autostart, process, fs, dialog, opener, updater
+- **存储**: SQLite（`suqi.db`，默认在软件同目录）
 
 ## 开发
 
@@ -36,7 +42,9 @@ bun run tauri dev
 ## 构建
 
 ```bash
-bun run tauri build
+bun run build        # tsc + vite
+cargo check          # Rust 检查（src-tauri/ 下）
+bun run tauri build  # 打包
 ```
 
 ## 发布
@@ -47,3 +55,15 @@ bun run tauri build
 git tag v1.0.0
 git push origin v1.0.0
 ```
+
+产物：NSIS 安装包 + 便携版 exe + SHA-256 校验文件 + latest.json（updater）。
+
+### 代码签名
+
+GitHub 仓库需配置以下 secrets：
+- `WINDOWS_CERT_PFX`：base64 编码的代码签名证书（.pfx）
+- `WINDOWS_CERT_PASSWORD`：证书密码
+- `TAURI_SIGNING_PRIVATE_KEY`：Tauri updater 签名私钥
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码
+
+生成 updater 密钥对：`npx @tauri-apps/cli signer generate -w ~/.tauri/suqi.key`。

@@ -32,3 +32,22 @@
 #settings a { color: var(--blue); }
 .card.selected { outline: 2px solid var(--hl-color); border-color: var(--hl-color); }
 button.primary { background: var(--hl-color); border-color: var(--hl-color); color: #fff; }
+
+/* ---------- 自定义背景层 ---------- */
+.bg-layer { position: fixed; inset: 0; z-index: 0; pointer-events: none; background-size: cover; background-position: center; background-repeat: no-repeat; }
+:root[data-bg="on"] .shell { position: relative; z-index: 1; }
+:root[data-bg="on"] header { background: color-mix(in srgb, var(--surface) 55%, transparent); }
+:root[data-bg="on"] .card { background: color-mix(in srgb, var(--surface) 72%, transparent); }
+:root[data-bg="on"] .toolbar { color: color-mix(in srgb, var(--text) 80%, transparent); }
+:root[data-bg="on"] footer { color: color-mix(in srgb, var(--muted) 85%, transparent); }
+:root[data-bg="on"] .search { background: color-mix(in srgb, var(--surface) 65%, transparent); }
+:root[data-bg="on"] .modal { background: color-mix(in srgb, #242436 88%, transparent); }
+:root[data-bg="on"] .menu { background: color-mix(in srgb, var(--surface) 85%, transparent); }
+:root[data-bg="on"] .locked { background: color-mix(in srgb, var(--surface) 55%, transparent); }
+
+/* ---------- 更新进度 ---------- */
+.update-progress { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.update-progress progress { flex: 1; height: 8px; border-radius: 4px; overflow: hidden; }
+.update-progress progress::-webkit-progress-bar { background: var(--surface); border-radius: 4px; }
+.update-progress progress::-webkit-progress-value { background: var(--blue); border-radius: 4px; transition: width .2s; }
+.update-status { color: var(--muted); font-size: 12px; margin-top: 6px; }
