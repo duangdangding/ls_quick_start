@@ -6,8 +6,9 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   clearScreen: false,
+  base: "./",
+  appType: "mpa",
   build: {
-    target: "es2022",
     rollupOptions: {
       input: {
         main: resolve(__dirname, "index.html"),

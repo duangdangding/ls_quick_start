@@ -444,11 +444,6 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
 fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show(); let _ = w.set_focus();
-    } else {
-        let w = tauri::WebviewWindowBuilder::new(app, "settings", tauri::WebviewUrl::App("settings.html".into()))
-            .title("速启设置").inner_size(720.0, 560.0).resizable(true).build()
-            .map_err(|e| e.to_string())?;
-        let _ = w.show(); let _ = w.set_focus();
     }
     Ok(())
 }
@@ -638,6 +633,15 @@ pub fn run() {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         hide_panel_internal(w.app_handle());
+                    }
+                });
+            }
+            if let Some(win) = app.get_webview_window("settings") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
                     }
                 });
             }

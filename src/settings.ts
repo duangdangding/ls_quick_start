@@ -4,7 +4,7 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AppConfig, DEFAULT_HOTKEY, formatHotkey, loadConfig, saveConfig } from "./config";
 import "./styles.css";
 
-let config: AppConfig = await loadConfig();
+let config: AppConfig;
 let recordingHotkey = false;
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
@@ -58,26 +58,16 @@ function bindCheck(id: string, key: keyof AppConfig) {
   el.checked = Boolean(config[key]);
   el.addEventListener("change", () => { (config as unknown as Record<string, unknown>)[key] = el.checked; markDirty(); });
 }
-bindCheck("autostart", "autostart");
-bindCheck("silent-start", "silentStart");
-bindCheck("always-on-top", "alwaysOnTop");
-bindCheck("remember-size", "rememberSize");
 
 // ---------- 外观 ----------
 const themeSel = $<HTMLSelectElement>("#theme");
-themeSel.value = config.theme;
-themeSel.addEventListener("change", () => { config.theme = themeSel.value; markDirty(); });
-
 const colorInput = $<HTMLInputElement>("#highlight-color");
-colorInput.value = config.highlightColor;
-colorInput.addEventListener("input", () => { config.highlightColor = colorInput.value; markDirty(); });
-
 const fontSizeInput = $<HTMLInputElement>("#font-size");
-fontSizeInput.value = String(config.fontSize);
-fontSizeInput.addEventListener("change", () => { config.fontSize = Number(fontSizeInput.value) || 14; markDirty(); });
-
 const effectSel = $<HTMLSelectElement>("#window-effect");
-effectSel.value = config.windowEffect;
+
+themeSel.addEventListener("change", () => { config.theme = themeSel.value; markDirty(); });
+colorInput.addEventListener("input", () => { config.highlightColor = colorInput.value; markDirty(); });
+fontSizeInput.addEventListener("change", () => { config.fontSize = Number(fontSizeInput.value) || 14; markDirty(); });
 effectSel.addEventListener("change", async () => {
   config.windowEffect = effectSel.value;
   // 实时预览
@@ -88,7 +78,6 @@ effectSel.addEventListener("change", async () => {
 
 // ---------- 配置文件目录 ----------
 async function refreshConfigDir() { $("#config-dir").textContent = await invoke<string>("get_config_dir"); }
-refreshConfigDir();
 
 // ---------- 数据库 ----------
 async function refreshDbInfo() {
@@ -99,8 +88,6 @@ async function refreshDbInfo() {
   $("#db-groups").textContent = String(info.groupCount);
   $("#db-password").textContent = info.passwordSet ? "是" : "否";
 }
-$("#btn-refresh-db").addEventListener("click", refreshDbInfo);
-refreshDbInfo();
 
 $("#btn-export").addEventListener("click", async () => {
   const json = await invoke<string>("export_data");
@@ -121,9 +108,6 @@ $("#btn-import").addEventListener("click", async () => {
   alert("导入成功，重启应用后生效");
 });
 
-// ---------- 关于 ----------
-getVersion().then((v) => { $("#cur-version").textContent = v; });
-
 // ---------- 保存 ----------
 $("#btn-save").addEventListener("click", async () => {
   try {
@@ -136,5 +120,24 @@ $("#btn-save").addEventListener("click", async () => {
   }
 });
 
-// 初始化
-renderHotkey();
+// ---------- 初始化 ----------
+(async () => {
+  config = await loadConfig();
+
+  bindCheck("autostart", "autostart");
+  bindCheck("silent-start", "silentStart");
+  bindCheck("always-on-top", "alwaysOnTop");
+  bindCheck("remember-size", "rememberSize");
+
+  themeSel.value = config.theme;
+  colorInput.value = config.highlightColor;
+  fontSizeInput.value = String(config.fontSize);
+  effectSel.value = config.windowEffect;
+
+  renderHotkey();
+  refreshConfigDir();
+  refreshDbInfo();
+
+  // ---------- 关于 ----------
+  getVersion().then((v) => { $("#cur-version").textContent = v; });
+})();

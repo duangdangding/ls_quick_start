@@ -18,6 +18,16 @@
       "minWidth": 700,
       "minHeight": 500,
       "resizable": true
+    }, {
+      "label": "settings",
+      "title": "速启设置",
+      "url": "settings.html",
+      "width": 720,
+      "height": 560,
+      "minWidth": 480,
+      "minHeight": 400,
+      "resizable": true,
+      "visible": false
     }],
     "security": {
       "csp": null,
