@@ -82,6 +82,40 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: bun run tauri build
 
+      # NSIS 产物名含中文（速启_0.2.3_x64-setup.exe），action-gh-release 上传时会剥掉非 ASCII 字符，
+      # 变成 _0.2.3_x64-setup.exe。先重命名为 ASCII，保证资产名与 latest.json 的 url 一致。
+      - name: Rename NSIS installer to ASCII
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | ForEach-Object {
+            if ($_.Name -notlike 'suqi_*') { Rename-Item $_.FullName "suqi_${ver}_x64-setup.exe" }
+          }
+          Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe.sig' | ForEach-Object {
+            if ($_.Name -notlike 'suqi_*') { Rename-Item $_.FullName "suqi_${ver}_x64-setup.exe.sig" }
+          }
+
+      # tauri build 生成的 latest.json 中 url 是相对文件名（含中文），直接上传会导致自动更新 404。
+      # 用重命名后的 ASCII 资产名重新生成，url 用绝对地址。
+      - name: Generate latest.json
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          $plainVer = $ver -replace '^v',''
+          $sig = (Get-Content "src-tauri/target/release/bundle/nsis/suqi_${plainVer}_x64-setup.exe.sig" -Raw).Trim()
+          $json = @{
+            version   = $ver
+            notes     = "https://github.com/${{ github.repository }}/releases/tag/$ver"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $sig
+                url       = "https://github.com/${{ github.repository }}/releases/download/$ver/suqi_${plainVer}_x64-setup.exe"
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+          $json | Set-Content 'src-tauri/target/release/bundle/nsis/latest.json' -Encoding utf8
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -92,6 +126,7 @@ jobs:
           files: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/*.exe.sig
+            src-tauri/target/release/bundle/nsis/latest.json
 
       # Windows 额外上传单文件绿色版 exe
       - name: Rename portable exe

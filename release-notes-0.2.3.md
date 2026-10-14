@@ -18,6 +18,6 @@
 
 | 文件 | 说明 |
 |---|---|
-| `_0.2.3_x64-setup.exe` | NSIS 安装包（推荐） |
+| `suqi_0.2.3_x64-setup.exe` | NSIS 安装包（推荐） |
 | `suqi_v0.2.3_x64_portable.exe` | 便携版，无需安装 |
 | `sha256sums.txt` | SHA-256 校验文件 |
