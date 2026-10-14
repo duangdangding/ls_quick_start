@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>速启设置</title>
+  </head>
+  <body>
+    <main id="settings">
+      <nav class="tabs">
+        <button class="tab active" data-tab="general">常规</button>
+        <button class="tab" data-tab="appearance">外观</button>
+        <button class="tab" data-tab="data">数据库</button>
+        <button class="tab" data-tab="about">关于</button>
+      </nav>
+
+      <section class="tab-page active" id="tab-general">
+        <div class="field">
+          <label>全局快捷键（呼出/隐藏面板）</label>
+          <div class="row">
+            <button id="hotkey" class="hotkey-btn" type="button">点击录制</button>
+            <button id="hotkey-reset" type="button">恢复默认</button>
+          </div>
+          <small>按下组合键后松开即完成录制（例如 Win+`）</small>
+        </div>
+        <div class="field">
+          <label>启动</label>
+          <label class="check"><input type="checkbox" id="autostart" /> 开机自启动</label>
+          <label class="check"><input type="checkbox" id="silent-start" /> 静默启动（不显示主面板）</label>
+        </div>
+        <div class="field">
+          <label>面板</label>
+          <label class="check"><input type="checkbox" id="always-on-top" /> 窗口置顶</label>
+          <label class="check"><input type="checkbox" id="remember-size" /> 记住窗口大小</label>
+        </div>
+        <div class="field">
+          <label>配置文件目录</label>
+          <div class="row">
+            <code id="config-dir">加载中…</code>
+          </div>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-appearance">
+        <div class="field">
+          <label>主题</label>
+          <select id="theme">
+            <option value="dark">深色</option>
+            <option value="light">浅色</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>高亮颜色</label>
+          <input type="color" id="highlight-color" />
+        </div>
+        <div class="field">
+          <label>字号</label>
+          <input type="number" id="font-size" min="10" max="24" step="1" />
+        </div>
+        <div class="field">
+          <label>窗口效果（透明材质）</label>
+          <select id="window-effect">
+            <option value="default">默认（不透明）</option>
+            <option value="acrylic">亚克力</option>
+            <option value="mica">云母</option>
+            <option value="vibrancy">毛玻璃</option>
+          </select>
+          <small>切换后呼出主面板可实时预览</small>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-data">
+        <div class="field">
+          <label>数据文件</label>
+          <div class="row">
+            <button id="btn-export" type="button">导出数据</button>
+            <button id="btn-import" type="button">导入数据</button>
+          </div>
+          <small>导出为 JSON 文件；导入会覆盖当前全部数据</small>
+        </div>
+        <div class="field">
+          <label>数据库信息</label>
+          <div class="db-info">
+            <div>路径：<code id="db-path">-</code></div>
+            <div>大小：<span id="db-size">-</span></div>
+            <div>项目数：<span id="db-items">-</span></div>
+            <div>分组数：<span id="db-groups">-</span></div>
+            <div>密码已设置：<span id="db-password">-</span></div>
+          </div>
+          <button id="btn-refresh-db" type="button">刷新</button>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-about">
+        <div class="field">
+          <h2>速启</h2>
+          <p>Windows 快捷启动器</p>
+          <p>当前版本：<strong id="cur-version">-</strong></p>
+          <p>
+            <a href="https://github.com/" target="_blank" rel="noreferrer">GitHub 仓库</a>
+          </p>
+        </div>
+      </section>
+
+      <footer>
+        <button id="btn-save" class="primary" type="button">保存</button>
+        <span id="save-msg"></span>
+      </footer>
+    </main>
+    <script type="module" src="/src/settings.ts"></script>
+  </body>
+</html>
