@@ -106,7 +106,7 @@ cargo clippy           # lint
 1. 验证：`bun run build` + `cargo check` / `cargo clippy` 全绿；版本号三处已同步。
 2. 提交并推送：`git add -A && git commit` → `git push origin main` → `git tag vX.Y.Z && git push origin vX.Y.Z`。
    推 `v*` tag 触发 `.github/workflows/release.yml`，Windows 构建并上传 Release 产物（约 5–10 分钟）。
-   - 产物：NSIS 安装包 + MSI + 便携版 exe + SHA-256 校验文件。
-3. **构建结果由用户自行查看确认**（GitHub Actions 页面），助手不要自动轮询构建状态；用户确认构建成功后才继续下一步。
+   - 产物：NSIS 安装包（suqi_X.Y.Z_x64-setup.exe）+ 对应 .sig + 便携版 exe + latest.json + SHA-256 校验文件。
+3. **构建结果由用户自行查看确认**（GitHub Actions 页面）。助手**不要用任何方式查询构建状态**——包括 GitHub API、gh CLI、轮询、下载日志等；推完 tag 即停下，等用户主动告知结果后再继续下一步。（用户明确要求，2026-10-14）
 4. 写 release notes（用户确认构建成功后执行）：先在工作区写 `release-notes-X.Y.Z.md`（新功能 / 升级提醒 / 其他），`GET /releases/tags/vX.Y.Z` 拿 release id → `PATCH /releases/{id}` 写入 `body`。
-   核对：重新 GET，确认 body 首尾完整、assets 数量正确（通常 4 个：setup + msi + portable exe + sha256sums）。
+   核对：重新 GET，确认 body 首尾完整、assets 数量正确（通常 5 个：setup + .sig + portable exe + latest.json + sha256sums）。
