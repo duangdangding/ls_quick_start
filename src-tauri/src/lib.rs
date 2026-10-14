@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{atomic::{AtomicBool, Ordering}, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
@@ -69,6 +69,8 @@ struct AppConfig {
     window_effect: String,
     #[serde(default = "default_view_mode")]
     view_mode: String,
+    #[serde(default = "default_encrypt_unlock_mode")]
+    encrypt_unlock_mode: String,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
@@ -76,6 +78,9 @@ struct AppConfig {
 
 /// 主面板显示方式默认值："card" 卡片 | "list" 列表
 fn default_view_mode() -> String { "card".into() }
+
+/// 加密分组解锁策略默认值："always" 每次打开面板都需输入密码 | "session" 仅重启应用才需输入密码
+fn default_encrypt_unlock_mode() -> String { "session".into() }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -130,6 +135,7 @@ impl Default for AppConfig {
             highlight_color: String::new(), // 空 = 跟随主题强调色
             window_effect: "default".into(),
             view_mode: "card".into(),
+            encrypt_unlock_mode: "session".into(),
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),
@@ -288,7 +294,8 @@ fn migrate_json_if_needed() {
 
 // ---------- 状态 ----------
 
-struct AppData { store: Mutex<Store>, conn: Mutex<Connection> }
+// 会话级解锁状态：进程存活期间保持解锁，避免面板隐藏/重开后重复输入密码
+struct AppData { store: Mutex<Store>, conn: Mutex<Connection>, unlocked: AtomicBool }
 
 struct ConfigState {
     config: Mutex<AppConfig>,
@@ -375,16 +382,19 @@ fn persist(data: &AppData, store: &Store) -> Result<(), String> {
 #[tauri::command]
 fn list_data(data: State<'_, AppData>, include_encrypted: bool) -> ListResult {
     let store = data.store.lock().unwrap();
+    let unlocked = data.unlocked.load(Ordering::SeqCst);
     ListResult {
-        items: store.items.iter().filter(|item| include_encrypted || !encrypted(item)).cloned().collect(),
+        items: store.items.iter().filter(|item| include_encrypted || unlocked || !encrypted(item)).cloned().collect(),
         groups: store.groups.clone(),
         password_set: store.password.is_some(),
+        unlocked,
     }
 }
 
 #[tauri::command]
 fn searchable_items(data: State<'_, AppData>, include_encrypted: bool) -> Vec<SearchText> {
-    data.store.lock().unwrap().items.iter().filter(|item| include_encrypted || !encrypted(item)).map(|item| {
+    let unlocked = data.unlocked.load(Ordering::SeqCst);
+    data.store.lock().unwrap().items.iter().filter(|item| include_encrypted || unlocked || !encrypted(item)).map(|item| {
         let (full_pinyin, initials) = pinyin_text(&item.name);
         SearchText { id: item.id.clone(), name: item.name.clone(), full_pinyin, initials }
     }).collect()
@@ -416,7 +426,7 @@ fn delete_item(data: State<'_, AppData>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(), String> {
     let item = data.store.lock().unwrap().items.iter().find(|x| x.id == id).cloned().ok_or("启动项不存在")?;
-    if encrypted(&item) && !unlocked { return Err("请先解锁加密分组".into()); }
+    if encrypted(&item) && !unlocked && !data.unlocked.load(Ordering::SeqCst) { return Err("请先解锁加密分组".into()); }
     #[cfg(windows)] {
         if item.is_cmd { Command::new("cmd").args(["/C", &item.target]).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
         else { Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
@@ -476,7 +486,9 @@ fn password_hash(password: &str, salt: &str) -> String {
 fn unlock_encrypted(data: State<'_, AppData>, password: String) -> Result<bool, String> {
     let store = data.store.lock().unwrap();
     let Some(saved) = &store.password else { return Err("请先设置密码".into()) };
-    Ok(password_hash(&password, &saved.salt) == saved.hash)
+    let ok = password_hash(&password, &saved.salt) == saved.hash;
+    if ok { data.unlocked.store(true, Ordering::SeqCst); }
+    Ok(ok)
 }
 
 #[tauri::command]
@@ -490,6 +502,7 @@ fn reset_password(data: State<'_, AppData>, current_password: Option<String>, ne
     let mut bytes = [0u8; 16]; rand::thread_rng().fill_bytes(&mut bytes);
     let salt = hex::encode(bytes);
     store.password = Some(PasswordHash { hash: password_hash(&new_password, &salt), salt });
+    data.unlocked.store(true, Ordering::SeqCst);
     persist(&data, &store)
 }
 
@@ -607,7 +620,7 @@ fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<It
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ListResult { items: Vec<LauncherItem>, groups: Vec<Group>, password_set: bool }
+struct ListResult { items: Vec<LauncherItem>, groups: Vec<Group>, password_set: bool, unlocked: bool }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -648,10 +661,12 @@ fn show_panel(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if !win.is_visible().unwrap_or(false) { let _ = win.show(); let _ = win.set_focus(); }
     }
+    let _ = app.emit("panel-shown", ());
 }
 
 #[tauri::command]
 fn hide_panel(app: tauri::AppHandle) {
+    lock_encrypted_if_needed(&app);
     if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
 }
 
@@ -1047,7 +1062,18 @@ fn apply_autostart(app: &tauri::AppHandle, enable: bool) {
     if enable && !enabled { let _ = mgr.enable(); } else if !enable && enabled { let _ = mgr.disable(); }
 }
 
+/// 面板隐藏时按配置上锁：encrypt_unlock_mode == "always" 时每次隐藏面板都要求重新输入密码
+fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
+    let mode = app.state::<ConfigState>().config.lock().unwrap().encrypt_unlock_mode.clone();
+    if mode == "always" {
+        if let Some(data) = app.try_state::<AppData>() {
+            data.unlocked.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 fn hide_panel_internal(app: &tauri::AppHandle) {
+    lock_encrypted_if_needed(app);
     if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
 }
 
@@ -1130,7 +1156,7 @@ pub fn run() {
                 if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed { toggle_window(app); }
             })
             .build())
-        .manage(AppData { store: Mutex::new(store), conn: Mutex::new(conn) })
+        .manage(AppData { store: Mutex::new(store), conn: Mutex::new(conn), unlocked: AtomicBool::new(false) })
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,

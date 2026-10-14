@@ -34,6 +34,14 @@
           <label class="check"><input type="checkbox" id="remember-size" /> 记住窗口大小</label>
         </div>
         <div class="field">
+          <label>加密分组解锁</label>
+          <select id="encrypt-unlock-mode">
+            <option value="session">只有重启应用才需输入密码</option>
+            <option value="always">每次打开面板都需输入密码</option>
+          </select>
+          <small>选择访问加密分组时要求输入密码的时机</small>
+        </div>
+        <div class="field">
           <label>配置文件目录</label>
           <div class="row">
             <code id="config-dir">加载中…</code>

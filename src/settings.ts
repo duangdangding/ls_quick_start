@@ -61,6 +61,10 @@ function bindCheck(id: string, key: keyof AppConfig) {
   el.addEventListener("change", () => { (config as unknown as Record<string, unknown>)[key] = el.checked; markDirty(); });
 }
 
+// ---------- 加密分组解锁 ----------
+const encryptUnlockSel = $<HTMLSelectElement>("#encrypt-unlock-mode");
+encryptUnlockSel.addEventListener("change", () => { config.encryptUnlockMode = encryptUnlockSel.value; markDirty(); });
+
 // ---------- 外观 ----------
 const themeSel = $<HTMLSelectElement>("#theme");
 const colorInput = $<HTMLInputElement>("#highlight-color");
@@ -587,6 +591,8 @@ $("#btn-save").addEventListener("click", async () => {
   bindCheck("silent-start", "silentStart");
   bindCheck("always-on-top", "alwaysOnTop");
   bindCheck("remember-size", "rememberSize");
+
+  encryptUnlockSel.value = config.encryptUnlockMode === "always" ? "always" : "session";
 
   themeSel.value = config.theme;
   // 搜索高亮颜色：空 = 跟随主题强调色（勾选框勾上、取色器禁用但保留上次颜色）

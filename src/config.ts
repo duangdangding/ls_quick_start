@@ -30,6 +30,7 @@ export interface AppConfig {
   highlightColor: string; // #rrggbb；空 = 跟随主题强调色
   windowEffect: string; // "default" | "acrylic" | "vibrancy" | "mica"
   viewMode: string; // 主面板显示方式："card" 卡片 | "list" 列表
+  encryptUnlockMode: string; // 加密解锁策略："always" 每次打开面板都需密码 | "session" 仅重启应用才需密码
   configDir: string | null;
   dbDir: string | null;
   background: BackgroundConfig;
