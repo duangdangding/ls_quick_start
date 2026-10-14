@@ -91,6 +91,15 @@ cargo clippy           # lint
 - 版本号需同步修改 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 三处（`Cargo.lock` 随构建自动更新）。
 - `dist/`、`target/`、`node_modules/` 为构建产物，不要提交或编辑。
 
+## 环境排障备忘（2026-10-14 记录）
+
+- **bun 必须解析到 `C:\Users\Administrator\.bun\bin\bun.exe`**。用户 PATH 中 `...\daimon-share\daimon\npm-global` 目录下有一组 npm 安装的 bun shim（`bun` / `bun.cmd` / `bun.ps1`），其指向的 bun.exe 不在 PATH 内，`bun run` 会报 `bun is not installed in %PATH%`（exit 255），与项目代码无关。
+- 已将用户 PATH 调整为 `C:\Users\Administrator\.bun\bin` 在最前（真实 bun 1.4.2）。**新开的终端生效；已打开的终端 / 已启动的进程需重启**才能拿到新 PATH。
+- 若所在 shell 仍是旧 PATH（如 Kimi 会话），临时绕过：`export PATH="/c/Users/Administrator/.bun/bin:$PATH"` 再执行 `bun run build`。
+- 验证 PATH 修复是否生效：新开 cmd 执行 `where bun`，第一条应为 `.bun\bin\bun.exe`。
+- 参考 `F:\workspace\my\vscode\copy-pc\tauri-dev.log`：其中 `script "dev" exited with code 1` / `beforeDevCommand terminated` 也是前端进程问题导致 dev 中断，排查时先看 beforeDevCommand（vite）是否存活，别急着怀疑 Rust 代码。
+- 已知无害警告：`src/settings.ts` 对 `@tauri-apps/plugin-fs` 同时静态 + 动态 import，vite 提示不拆 chunk，可忽略或后续统一为静态 import。
+
 ## 发布流程
 
 1. 验证：`bun run build` + `cargo check` / `cargo clippy` 全绿；版本号三处已同步。
