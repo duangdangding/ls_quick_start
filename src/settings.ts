@@ -1,10 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { AppConfig, applyAppearance, DEFAULT_HOTKEY, formatHotkey, loadConfig, saveConfig } from "./config";
+import { AppConfig, BackgroundConfig, applyAppearance, applyWindowBackground, applyWindowEffect, defaultBackground, formatHotkey, loadConfig, saveConfig, styleBgLayer, DEFAULT_HOTKEY } from "./config";
 import { check } from "@tauri-apps/plugin-updater";
-import { readFile } from "@tauri-apps/plugin-fs";
 import "./styles.css";
 
 let config: AppConfig;
@@ -65,11 +64,19 @@ function bindCheck(id: string, key: keyof AppConfig) {
 // ---------- 外观 ----------
 const themeSel = $<HTMLSelectElement>("#theme");
 const colorInput = $<HTMLInputElement>("#highlight-color");
+const followThemeInput = $<HTMLInputElement>("#highlight-follow");
 const fontSizeInput = $<HTMLInputElement>("#font-size");
 const effectSel = $<HTMLSelectElement>("#window-effect");
 
 themeSel.addEventListener("change", () => { config.theme = themeSel.value; markDirty(); });
-colorInput.addEventListener("input", () => { config.highlightColor = colorInput.value; markDirty(); });
+// 高亮颜色：空 = 跟随主题强调色（勾选框勾上、取色器禁用但保留上次颜色）
+function syncHighlightUI() {
+  const follow = followThemeInput.checked;
+  colorInput.disabled = follow;
+  config.highlightColor = follow ? "" : colorInput.value;
+}
+followThemeInput.addEventListener("change", () => { syncHighlightUI(); markDirty(); });
+colorInput.addEventListener("input", () => { followThemeInput.checked = false; syncHighlightUI(); markDirty(); });
 fontSizeInput.addEventListener("change", () => { config.fontSize = Number(fontSizeInput.value) || 14; markDirty(); });
 effectSel.addEventListener("change", async () => {
   config.windowEffect = effectSel.value;
@@ -128,63 +135,323 @@ async function refreshDbInfo() {
   $("#db-password").textContent = info.passwordSet ? "是" : "否";
 }
 
-$("#btn-export").addEventListener("click", async () => {
-  const json = await invoke<string>("export_data");
-  const path = await saveDialog({ defaultPath: "suqi-backup.json", filters: [{ name: "JSON", extensions: ["json"] }] });
-  if (!path) return;
-  const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-  await writeTextFile(path, json);
-});
+// ---------- 面板背景 ----------
+const bgEnabledEl = $<HTMLInputElement>("#bg-enabled");
+const bgPickBtn = $<HTMLButtonElement>("#bg-pick");
+const bgClearBtn = $<HTMLButtonElement>("#bg-clear");
+const bgApplySettingsEl = $<HTMLInputElement>("#bg-apply-settings");
+const bgEditorEl = $<HTMLDivElement>("#bg-editor");
+const bgPreviewLayerEl = $<HTMLDivElement>("#bg-preview-layer");
+const bgModeEl = $<HTMLSelectElement>("#bg-mode");
+const bgOpacityEl = $<HTMLInputElement>("#bg-opacity");
+const bgOpacityValEl = $<HTMLSpanElement>("#bg-opacity-val");
+const bgScaleWEl = $<HTMLInputElement>("#bg-scale-w");
+const bgScaleWValEl = $<HTMLSpanElement>("#bg-scale-w-val");
+const bgScaleHEl = $<HTMLInputElement>("#bg-scale-h");
+const bgScaleHValEl = $<HTMLSpanElement>("#bg-scale-h-val");
+const bgRegionToggleBtn = $<HTMLButtonElement>("#bg-region-toggle");
+const bgRegionResetBtn = $<HTMLButtonElement>("#bg-region-reset");
+const bgRegionWrapEl = $<HTMLDivElement>("#bg-region-wrap");
+const bgRegionBoxEl = $<HTMLDivElement>("#bg-region-box");
+const bgRegionImgEl = $<HTMLImageElement>("#bg-region-img");
+const bgRegionRectEl = $<HTMLDivElement>("#bg-region-rect");
+const bgApplyBtn = $<HTMLButtonElement>("#bg-apply");
 
-$("#btn-import").addEventListener("click", async () => {
-  const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
-  const path = await openDialog({ filters: [{ name: "JSON", extensions: ["json"] }] });
-  if (!path || typeof path !== "string") return;
-  const { readTextFile } = await import("@tauri-apps/plugin-fs");
-  const json = await readTextFile(path);
-  if (!confirm("导入将覆盖当前全部数据，确定继续？")) return;
-  await invoke("import_data", { json });
-  alert("导入成功，重启应用后生效");
-});
+let bgDraft: BackgroundConfig = defaultBackground(); // 编辑中的选项（点「应用背景」才落盘）
+let bgSrcImg: HTMLImageElement | null = null; // 源图（原始方向）
+let bgPreviewB64: string | null = null; // 预览烘焙缓存（旋转/选区/换图才重烘）
 
-// ---------- 自定义背景 ----------
-const bgEnabled = $<HTMLInputElement>("#bg-enabled");
-const bgOpacity = $<HTMLInputElement>("#bg-opacity");
-const bgPreviewRow = $<HTMLDivElement>("#bg-preview-row");
-const bgPreview = $<HTMLImageElement>("#bg-preview");
-
-function syncBgUI() {
-  bgEnabled.checked = config.background?.enabled ?? false;
-  bgOpacity.value = String(config.background?.opacity ?? 0.5);
-  const hasImg = Boolean(config.background?.imageData);
-  bgPreviewRow.style.display = hasImg ? "flex" : "none";
-  if (hasImg) bgPreview.src = `data:image/png;base64,${config.background!.imageData!}`;
+/** 烘焙背景图：旋转 → 按选区裁剪 → 限制最大边长，输出 canvas */
+function bakeBackground(maxDim: number): HTMLCanvasElement | null {
+  const img = bgSrcImg;
+  if (!img) return null;
+  const rot = ((bgDraft.rotation % 360) + 360) % 360;
+  const swap = rot === 90 || rot === 270;
+  const rw = swap ? img.naturalHeight : img.naturalWidth;
+  const rh = swap ? img.naturalWidth : img.naturalHeight;
+  // 先旋转到正向画布
+  const rotC = document.createElement("canvas");
+  rotC.width = rw;
+  rotC.height = rh;
+  const rctx = rotC.getContext("2d")!;
+  rctx.translate(rw / 2, rh / 2);
+  rctx.rotate((rot * Math.PI) / 180);
+  rctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+  // 选区是归一化坐标，基于旋转后的图
+  const rg = bgDraft.region;
+  const sx = rg ? rg.x * rw : 0;
+  const sy = rg ? rg.y * rh : 0;
+  const sw = rg ? rg.w * rw : rw;
+  const sh = rg ? rg.h * rh : rh;
+  const scale = Math.min(1, maxDim / Math.max(sw, sh));
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.round(sw * scale));
+  out.height = Math.max(1, Math.round(sh * scale));
+  out.getContext("2d")!.drawImage(rotC, sx, sy, sw, sh, 0, 0, out.width, out.height);
+  return out;
 }
 
-bgEnabled.addEventListener("change", () => { config.background.enabled = bgEnabled.checked; markDirty(); });
-bgOpacity.addEventListener("input", () => { config.background.opacity = Number(bgOpacity.value); markDirty(); });
+function rebakeBgPreview() {
+  const c = bakeBackground(1600);
+  bgPreviewB64 = c ? c.toDataURL("image/png").split(",")[1] : null;
+  applyBgPreviewStyle();
+}
 
-$("#btn-bg-import").addEventListener("click", async () => {
-  const path = await openDialog({ filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] }] });
-  if (!path || typeof path !== "string") return;
-  const data = await readFile(path);
-  if (data.length > 30 * 1024 * 1024) { alert("图片不能超过 30MB"); return; }
-  let base64 = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < data.length; i += CHUNK) {
-    base64 += String.fromCharCode(...data.subarray(i, i + CHUNK));
+function applyBgPreviewStyle() {
+  if (bgPreviewB64) styleBgLayer(bgPreviewLayerEl, bgDraft, bgPreviewB64);
+  applyBgDraftToSelfWindow();
+}
+
+/** 草稿实时应用到设置窗口自身（勾选「同时应用到设置窗口」时整窗可见） */
+function applyBgDraftToSelfWindow() {
+  applyWindowBackground(bgDraft, bgDraft.applySettings, bgPreviewB64 ?? undefined);
+}
+
+/** 选区编辑器里的图片：旋转后的整图（不含选区裁剪） */
+function refreshRotatedSource() {
+  if (!bgSrcImg) return;
+  const keep = bgDraft.region;
+  bgDraft.region = null;
+  const c = bakeBackground(800);
+  bgDraft.region = keep;
+  if (c) bgRegionImgEl.src = c.toDataURL("image/png");
+}
+
+/** 把 draft.region 画成选区框（百分比定位，随图片缩放自适应） */
+function renderRegionRect() {
+  const rg = bgDraft.region;
+  if (!rg || rg.w <= 0 || rg.h <= 0) {
+    bgRegionRectEl.style.display = "none";
+    return;
   }
-  config.background.imageData = btoa(base64);
-  config.background.enabled = true;
-  syncBgUI();
-  markDirty();
+  bgRegionRectEl.style.display = "block";
+  bgRegionRectEl.style.left = `${rg.x * 100}%`;
+  bgRegionRectEl.style.top = `${rg.y * 100}%`;
+  bgRegionRectEl.style.width = `${rg.w * 100}%`;
+  bgRegionRectEl.style.height = `${rg.h * 100}%`;
+}
+
+/** 控件 ↔ bgDraft 同步（控件侧） */
+function syncBgControls() {
+  bgEnabledEl.checked = bgDraft.enabled;
+  bgApplySettingsEl.checked = bgDraft.applySettings;
+  bgModeEl.value = bgDraft.mode === "tile" ? "tile" : "stretch";
+  const pct = Math.round(Math.max(0.05, Math.min(1, bgDraft.opacity)) * 100);
+  bgOpacityEl.value = String(pct);
+  bgOpacityValEl.textContent = `${pct}%`;
+  const clampScale = (v: number) => Math.round(Math.max(5, Math.min(300, v || 100)));
+  bgScaleWEl.value = String(clampScale(bgDraft.scaleW));
+  bgScaleWValEl.textContent = `${bgScaleWEl.value}%`;
+  bgScaleHEl.value = String(clampScale(bgDraft.scaleH));
+  bgScaleHValEl.textContent = `${bgScaleHEl.value}%`;
+  document.querySelectorAll<HTMLButtonElement>(".bg-rot").forEach((b) =>
+    b.classList.toggle("active", Number(b.dataset.rot) === bgDraft.rotation)
+  );
+  bgClearBtn.disabled = !bgDraft.hasImage;
+  bgEditorEl.hidden = !bgDraft.hasImage;
+  bgRegionResetBtn.disabled = !bgDraft.region;
+  renderRegionRect();
+}
+
+async function loadBgSource(): Promise<boolean> {
+  const data = await invoke<{ b64: string; mime: string } | null>("read_background_source");
+  if (!data) {
+    bgSrcImg = null;
+    return false;
+  }
+  const img = new Image();
+  img.src = `data:${data.mime};base64,${data.b64}`;
+  await img.decode();
+  bgSrcImg = img;
+  return true;
+}
+
+bgEnabledEl.addEventListener("change", async () => {
+  bgDraft.enabled = bgEnabledEl.checked;
+  applyBgDraftToSelfWindow();
+  // 启用/关闭即时落盘并广播 config-changed：主面板实时跟随，无需点「应用背景」
+  try {
+    const bg: BackgroundConfig = { ...(config.background || defaultBackground()), enabled: bgEnabledEl.checked };
+    await invoke("set_background_config", { bg });
+    config.background = bg;
+    await invoke("show_panel");
+  } catch (e) {
+    alert(`切换背景开关失败: ${e}`);
+  }
 });
 
-$("#btn-bg-clear").addEventListener("click", () => {
-  config.background = { enabled: false, opacity: 0.5, imageData: undefined };
-  syncBgUI();
-  markDirty();
+// 应用范围开关：设置窗口立即整窗预览
+bgApplySettingsEl.addEventListener("change", () => {
+  bgDraft.applySettings = bgApplySettingsEl.checked;
+  applyBgDraftToSelfWindow();
 });
+
+bgPickBtn.addEventListener("click", async () => {
+  const path = await openDialog({
+    title: "选择背景图片",
+    filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] }],
+  });
+  if (typeof path !== "string") return;
+  try {
+    await invoke("import_background_source", { path });
+    await loadBgSource();
+    // 换图后回到正向整图，保留填充方式/透明度偏好
+    bgDraft = { ...bgDraft, enabled: true, hasImage: true, rotation: 0, region: null };
+    refreshRotatedSource();
+    syncBgControls();
+    rebakeBgPreview();
+  } catch (e) {
+    alert(`选择背景图失败: ${e}`);
+  }
+});
+
+bgClearBtn.addEventListener("click", async () => {
+  if (!confirm("确定清除面板背景图？")) return;
+  try {
+    await invoke("clear_background_image");
+    bgDraft = defaultBackground();
+    bgSrcImg = null;
+    bgPreviewB64 = null;
+    bgPreviewLayerEl.style.backgroundImage = "none";
+    bgRegionWrapEl.hidden = true;
+    config.background = bgDraft;
+    syncBgControls();
+    applyBgDraftToSelfWindow();
+  } catch (e) {
+    alert(`清除背景失败: ${e}`);
+  }
+});
+
+bgModeEl.addEventListener("change", () => {
+  bgDraft.mode = bgModeEl.value;
+  applyBgPreviewStyle();
+});
+
+bgOpacityEl.addEventListener("input", () => {
+  bgDraft.opacity = Number(bgOpacityEl.value) / 100;
+  bgOpacityValEl.textContent = `${bgOpacityEl.value}%`;
+  applyBgPreviewStyle();
+});
+
+// 宽高百分比：纯 CSS background-size 调整，无需重烘焙
+bgScaleWEl.addEventListener("input", () => {
+  bgDraft.scaleW = Number(bgScaleWEl.value);
+  bgScaleWValEl.textContent = `${bgScaleWEl.value}%`;
+  applyBgPreviewStyle();
+});
+bgScaleHEl.addEventListener("input", () => {
+  bgDraft.scaleH = Number(bgScaleHEl.value);
+  bgScaleHValEl.textContent = `${bgScaleHEl.value}%`;
+  applyBgPreviewStyle();
+});
+
+// 旋转：选区是相对旋转后图的，旋转变化后旧选区失效，重置为整图
+document.querySelectorAll<HTMLButtonElement>(".bg-rot").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const rot = Number(btn.dataset.rot) || 0;
+    if (rot === bgDraft.rotation) return;
+    bgDraft.rotation = rot;
+    bgDraft.region = null;
+    refreshRotatedSource();
+    syncBgControls();
+    rebakeBgPreview();
+  });
+});
+
+bgRegionToggleBtn.addEventListener("click", () => {
+  bgRegionWrapEl.hidden = !bgRegionWrapEl.hidden;
+  if (!bgRegionWrapEl.hidden) refreshRotatedSource();
+});
+
+bgRegionResetBtn.addEventListener("click", () => {
+  bgDraft.region = null;
+  syncBgControls();
+  rebakeBgPreview();
+});
+
+// 选区框选：在（旋转后的）源图上按住拖动出矩形，归一化存储
+let bgDragging = false;
+let bgDragStart = { x: 0, y: 0 };
+
+function bgRelPos(e: MouseEvent) {
+  const r = bgRegionImgEl.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+    y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+  };
+}
+
+bgRegionBoxEl.addEventListener("mousedown", (e) => {
+  if (e.button !== 0 || !bgSrcImg) return;
+  e.preventDefault();
+  bgDragging = true;
+  bgDragStart = bgRelPos(e);
+  bgDraft.region = { x: bgDragStart.x, y: bgDragStart.y, w: 0, h: 0 };
+  renderRegionRect();
+});
+window.addEventListener("mousemove", (e) => {
+  if (!bgDragging) return;
+  const p = bgRelPos(e);
+  bgDraft.region = {
+    x: Math.min(bgDragStart.x, p.x),
+    y: Math.min(bgDragStart.y, p.y),
+    w: Math.abs(p.x - bgDragStart.x),
+    h: Math.abs(p.y - bgDragStart.y),
+  };
+  renderRegionRect();
+});
+window.addEventListener("mouseup", () => {
+  if (!bgDragging) return;
+  bgDragging = false;
+  // 太小的框按误触处理：恢复整图
+  if (bgDraft.region && (bgDraft.region.w < 0.03 || bgDraft.region.h < 0.03)) {
+    bgDraft.region = null;
+  }
+  syncBgControls();
+  rebakeBgPreview();
+});
+
+// 应用：烘焙成品图（≤1600px）存到配置目录，设置落盘并弹出主面板看实际效果
+bgApplyBtn.addEventListener("click", async () => {
+  const c = bakeBackground(1600);
+  if (!c) {
+    alert("请先选择图片");
+    return;
+  }
+  bgApplyBtn.disabled = true;
+  try {
+    const b64 = c.toDataURL("image/png").split(",")[1];
+    await invoke("save_background_cache", { b64 });
+    const bg: BackgroundConfig = { ...bgDraft, hasImage: true };
+    await invoke("set_background_config", { bg });
+    config.background = bg;
+    bgDraft = { ...bg, region: bg.region ? { ...bg.region } : null };
+    syncBgControls();
+    await invoke("show_panel");
+  } catch (e) {
+    alert(`应用背景失败: ${e}`);
+  } finally {
+    bgApplyBtn.disabled = false;
+  }
+});
+
+// 初始化：回填已保存的背景设置；源图还在则重建预览
+async function initBackground() {
+  const saved = config.background || defaultBackground();
+  bgDraft = { ...defaultBackground(), ...saved, region: saved.region ? { ...saved.region } : null };
+  if (bgDraft.hasImage) {
+    if (await loadBgSource()) {
+      refreshRotatedSource();
+      rebakeBgPreview();
+    } else {
+      // 源图丢失（如配置目录被换过）：按无图处理，等用户重新选择
+      bgDraft.hasImage = false;
+    }
+  }
+  syncBgControls();
+  // 设置窗口自身的背景（按已保存设置的 applySettings 决定）
+  applyBgDraftToSelfWindow();
+}
 
 // ---------- 更新 ----------
 async function checkUpdate() {
@@ -310,7 +577,11 @@ $("#btn-save").addEventListener("click", async () => {
   bindCheck("remember-size", "rememberSize");
 
   themeSel.value = config.theme;
-  colorInput.value = config.highlightColor;
+  // 搜索高亮颜色：空 = 跟随主题强调色（勾选框勾上、取色器禁用但保留上次颜色）
+  const hl = (config.highlightColor || "").trim();
+  followThemeInput.checked = !hl;
+  colorInput.value = /^#[0-9a-fA-F]{6}$/.test(hl) ? hl : "#7c3aed";
+  colorInput.disabled = !hl;
   fontSizeInput.value = String(config.fontSize);
   effectSel.value = config.windowEffect;
 
@@ -318,9 +589,10 @@ $("#btn-save").addEventListener("click", async () => {
   refreshConfigDir();
   refreshDbDir();
   refreshDbInfo();
-  syncBgUI();
   applyAppearance(config);
+  applyWindowEffect(config.windowEffect);
+  initBackground().catch(() => { /* 背景源图读取失败不影响设置页其余功能 */ });
 
   // ---------- 关于 ----------
-  getVersion().then((v) => { $("#cur-version").textContent = v; $("#about-version").textContent = v; });
+  getVersion().then((v) => { $("#cur-version").textContent = v; });
 })();

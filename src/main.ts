@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
-import { applyAppearance, loadConfig } from "./config";
+import { listen } from "@tauri-apps/api/event";
+import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig } from "./config";
 import "./styles.css";
 
 type Item = { id: string; name: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
@@ -52,6 +53,38 @@ function subsequenceScore(value: string, needle: string) {
   for (const char of needle) { const next = value.indexOf(char, last + 1); if (next < 0) return -1; score += next === last + 1 ? 5 : 1; last = next; }
   return score;
 }
+/** 名称中的命中区间：优先连续子串，其次逐字符子序列（连续命中合并为一段） */
+function nameMatchRanges(name: string, needle: string): [number, number][] | null {
+  if (!needle) return null;
+  const lower = name.toLowerCase();
+  const exact = lower.indexOf(needle);
+  if (exact >= 0) return [[exact, exact + needle.length]];
+  const ranges: [number, number][] = [];
+  let cursor = 0;
+  for (const char of needle) {
+    const next = lower.indexOf(char, cursor);
+    if (next < 0) return null;
+    const last = ranges[ranges.length - 1];
+    if (last && last[1] === next) last[1] = next + 1;
+    else ranges.push([next, next + 1]);
+    cursor = next + 1;
+  }
+  return ranges;
+}
+/** 渲染名称：把命中片段包进 <mark> 高亮；未命中（如拼音匹配）返回原文 */
+function renderName(name: string, needle: string): string {
+  const ranges = nameMatchRanges(name, needle);
+  if (!ranges) return escape(name);
+  let html = "";
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start > cursor) html += escape(name.slice(cursor, start));
+    html += `<mark>${escape(name.slice(start, end))}</mark>`;
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < name.length) html += escape(name.slice(cursor));
+  return html;
+}
 async function load() {
   const data = await invoke<{ items: Item[]; groups: Group[]; passwordSet: boolean }>("list_data", { includeEncrypted: unlocked });
   const index = await invoke<{ id: string; fullPinyin: string; initials: string }[]>("searchable_items", { includeEncrypted: unlocked });
@@ -78,7 +111,7 @@ function render() {
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索名称、拼音或首字母" value="${escape(query)}" /></label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描桌面</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="custom">自定义</option><option value="name">名称</option><option value="created">添加时间</option></select></label>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
-    <section id="grid" class="grid">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}" draggable="${sortBy === "custom"}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${escape(item.name)}</b><span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或扫描桌面批量导入。</p></div>`}</section>
+    <section id="grid" class="grid">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}" draggable="${sortBy === "custom"}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, query.trim().toLowerCase())}</b><span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或扫描桌面批量导入。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -122,7 +155,6 @@ async function action(type: string) {
   if (type === "pin") {
     pinned = !pinned;
     await invoke("set_panel_pinned", { pinned });
-    await invoke("set_always_on_top", { enable: pinned });
     render();
   }
 }
@@ -189,9 +221,22 @@ async function reorderItems(event: DragEvent, targetId: string) { event.preventD
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
 window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = Math.max(1, Math.floor((document.querySelector("#grid")?.clientWidth ?? 250) / 220)); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
-// 应用外观配置（主题、高亮色、字号、字体）并监听设置页变更
-loadConfig().then((cfg) => {
+// 应用外观配置（主题、高亮色、字号、窗口效果、面板背景）并监听设置页变更实时生效
+loadConfig().then(async (cfg) => {
   applyAppearance(cfg);
+  applyWindowEffect(cfg.windowEffect);
+  await applyWindowBackground(cfg.background, true);
   pinned = cfg.alwaysOnTop;
   render();
+});
+listen<AppConfig>("config-changed", async (event) => {
+  const cfg = event.payload;
+  applyAppearance(cfg);
+  applyWindowEffect(cfg.windowEffect);
+  await applyWindowBackground(cfg.background, true);
+  // 钉住状态可能来自托盘菜单，需实时反映到面板按钮
+  if (cfg.alwaysOnTop !== pinned) {
+    pinned = cfg.alwaysOnTop;
+    render();
+  }
 });

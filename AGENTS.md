@@ -99,6 +99,7 @@ cargo clippy           # lint
 - 验证 PATH 修复是否生效：新开 cmd 执行 `where bun`，第一条应为 `.bun\bin\bun.exe`。
 - 参考 `F:\workspace\my\vscode\copy-pc\tauri-dev.log`：其中 `script "dev" exited with code 1` / `beforeDevCommand terminated` 也是前端进程问题导致 dev 中断，排查时先看 beforeDevCommand（vite）是否存活，别急着怀疑 Rust 代码。
 - 已知无害警告：`src/settings.ts` 对 `@tauri-apps/plugin-fs` 同时静态 + 动态 import，vite 提示不拆 chunk，可忽略或后续统一为静态 import。
+- **updater 签名密钥**：密钥对位于 `C:\Users\Administrator\.tauri\suqi.key` / `suqi.key.pub`，密码保存在同目录 `suqi.key.password`。CI secrets 中的 `TAURI_SIGNING_PRIVATE_KEY` 必须等于私钥文件的完整内容（单行 base64，可整文件复制粘贴），`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 等于密码文件内容；粘贴时不能带换行或多余空白，否则报 `failed to decode base64 key: Invalid padding`。tauri.conf.json 的 pubkey 必须等于 `base64(suqi.key.pub 文件内容)`。修改任何一处后，用 `bun run tauri signer sign <文件>` 本地验证通过再发版。
 
 ## 发布流程
 

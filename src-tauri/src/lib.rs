@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use pinyin::ToPinyin;
 use rand::RngCore;
 use rusqlite::{Connection, params};
@@ -9,10 +10,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
@@ -74,17 +72,41 @@ struct AppConfig {
     background: BackgroundConfig,
 }
 
+/// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
+/// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct BackgroundConfig {
-    enabled: bool,
-    opacity: f64,
-    #[serde(default)]
-    image_data: Option<String>,
+    enabled: bool,        // 是否启用面板背景图
+    mode: String,         // "stretch" 拉伸铺满 | "tile" 原尺寸平铺
+    opacity: f64,         // 背景图不透明度 0.05 - 1.0
+    scale_w: f64,         // 图片宽度占面板百分比 5 - 300
+    scale_h: f64,         // 图片高度占面板百分比 5 - 300
+    apply_settings: bool, // 背景同时应用到设置窗口
+    rotation: i32,        // 旋转角度（0/90/180/270，烘焙进缓存图）
+    region: Option<BgRegion>, // 归一化选区（基于旋转后的源图），None = 整图
+    has_image: bool,      // 是否已选择图片
 }
 
+/// 背景图选区：归一化坐标（0-1），相对于旋转后的源图
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct BgRegion { x: f64, y: f64, w: f64, h: f64 }
+
 impl Default for BackgroundConfig {
-    fn default() -> Self { Self { enabled: false, opacity: 0.5, image_data: None } }
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: "stretch".into(),
+            opacity: 0.6,
+            scale_w: 100.0,
+            scale_h: 100.0,
+            apply_settings: false,
+            rotation: 0,
+            region: None,
+            has_image: false,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -100,7 +122,7 @@ impl Default for AppConfig {
             theme: "dark".into(),
             font_family: "system-ui".into(),
             font_size: 14,
-            highlight_color: "#7c3aed".into(),
+            highlight_color: String::new(), // 空 = 跟随主题强调色
             window_effect: "default".into(),
             config_dir: None,
             db_dir: None,
@@ -264,8 +286,9 @@ struct AppData { store: Mutex<Store>, conn: Mutex<Connection> }
 
 struct ConfigState {
     config: Mutex<AppConfig>,
-    pinned: AtomicBool,
     data_dir: PathBuf,
+    // 托盘「钉住面板」菜单项句柄，用于同步勾选态
+    tray_toggle: Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
 // ---------- 辅助函数 ----------
@@ -594,6 +617,7 @@ fn save_config(state: State<'_, ConfigState>, app: tauri::AppHandle, config: App
     register_hotkey(&app, &config.hotkey)?;
     apply_autostart(&app, config.autostart);
     if let Some(win) = app.get_webview_window("main") { let _ = win.set_always_on_top(config.always_on_top); }
+    sync_tray_pinned(&app, config.always_on_top);
     apply_window_effect_all(&app, &config.window_effect, config.theme != "light");
     let _ = app.emit("config-changed", config);
     Ok(())
@@ -614,21 +638,6 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
 }
 
 #[tauri::command]
-fn export_data(data: State<'_, AppData>) -> Result<String, String> {
-    let store = data.store.lock().unwrap();
-    serde_json::to_string_pretty(&*store).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn import_data(data: State<'_, AppData>, json: String) -> Result<(), String> {
-    let store: Store = serde_json::from_str(&json).map_err(|e| format!("导入数据格式错误: {e}"))?;
-    *data.store.lock().unwrap() = store;
-    let snapshot = data.store.lock().unwrap();
-    persist(&data, &snapshot)?;
-    Ok(())
-}
-
-#[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if !win.is_visible().unwrap_or(false) { let _ = win.show(); let _ = win.set_focus(); }
@@ -641,10 +650,31 @@ fn hide_panel(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-fn set_panel_pinned(state: State<'_, ConfigState>, pinned: bool) { state.pinned.store(pinned, Ordering::SeqCst); }
+fn set_panel_pinned(state: State<'_, ConfigState>, app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    cfg.always_on_top = pinned;
+    let snapshot = cfg.clone();
+    drop(cfg);
+    save_config_file(&snapshot)?;
+    if let Some(win) = app.get_webview_window("main") { let _ = win.set_always_on_top(pinned); }
+    sync_tray_pinned(&app, pinned);
+    let _ = app.emit("config-changed", snapshot);
+    Ok(())
+}
 
 #[tauri::command]
-fn get_panel_pinned(state: State<'_, ConfigState>) -> bool { state.pinned.load(Ordering::SeqCst) }
+fn get_panel_pinned(state: State<'_, ConfigState>) -> bool {
+    state.config.lock().unwrap().always_on_top
+}
+
+// 同步托盘菜单「钉住面板」勾选态
+fn sync_tray_pinned(app: &tauri::AppHandle, pinned: bool) {
+    let state = app.state::<ConfigState>();
+    let guard = state.tray_toggle.lock().unwrap();
+    if let Some(item) = guard.as_ref() {
+        let _ = item.set_checked(pinned);
+    }
+}
 
 #[tauri::command]
 fn set_window_effect(app: tauri::AppHandle, state: State<'_, ConfigState>, effect: String) -> Result<(), String> {
@@ -710,25 +740,134 @@ fn set_data_dirs(state: State<'_, ConfigState>, config_dir: Option<String>, db_d
     Ok(())
 }
 
-// ---------- 背景 ----------
+// ---------- 面板背景图 ----------
+// 源图复制为配置目录下的 suqi-bg-src.<ext>；设置页烘焙（旋转+选区）后的成品
+// 存为 suqi-bg.png，主面板直接按 base64 读取应用。换目录时随配置文件一起迁移。
 
+const BG_SRC_STEM: &str = "suqi-bg-src";
+const BG_CACHE_NAME: &str = "suqi-bg.png";
+const BG_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
+/// 背景图存放目录：跟随当前生效的配置文件所在目录
+fn bg_dir() -> PathBuf {
+    effective_config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_data_dir)
+}
+
+/// 目录下已存在的背景源图（按支持的扩展名枚举）
+fn bg_src_files(dir: &Path) -> Vec<PathBuf> {
+    BG_EXTS
+        .iter()
+        .map(|e| dir.join(format!("{BG_SRC_STEM}.{e}")))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+#[derive(Serialize)]
+struct BgImageData { b64: String, mime: String }
+
+/// 选择背景图：把源图复制进配置目录（换图后旧的烘焙缓存作废）
 #[tauri::command]
-fn set_background(state: State<'_, ConfigState>, app: tauri::AppHandle, enabled: bool, opacity: f64, image_data: Option<String>) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.background.enabled = enabled;
-    cfg.background.opacity = opacity;
-    if let Some(data) = image_data { cfg.background.image_data = Some(data); }
-    let snapshot = cfg.clone();
+fn import_background_source(path: String) -> Result<(), String> {
+    let src = PathBuf::from(&path);
+    if !src.exists() {
+        return Err(format!("文件不存在: {path}"));
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    if !BG_EXTS.contains(&ext.as_str()) {
+        return Err("仅支持 png / jpg / webp / bmp / gif 图片".into());
+    }
+    let size = fs::metadata(&src).map_err(|e| e.to_string())?.len();
+    if size > 30 * 1024 * 1024 {
+        return Err("图片过大（超过 30MB），请换一张".into());
+    }
+    let dir = bg_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for f in bg_src_files(&dir) {
+        let _ = fs::remove_file(f);
+    }
+    let _ = fs::remove_file(dir.join(BG_CACHE_NAME));
+    fs::copy(&src, dir.join(format!("{BG_SRC_STEM}.{ext}")))
+        .map_err(|e| format!("复制图片失败: {e}"))?;
+    Ok(())
+}
+
+/// 读取背景源图（设置页重新编辑选区/旋转时回显用）
+#[tauri::command]
+fn read_background_source() -> Option<BgImageData> {
+    let f = bg_src_files(&bg_dir()).into_iter().next()?;
+    let bytes = fs::read(&f).ok()?;
+    let mime = match f
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "gif" => "image/gif",
+        _ => return None, // bg_src_files 只枚举已知扩展名，兜底防御
+    };
+    Some(BgImageData { b64: B64.encode(bytes), mime: mime.to_string() })
+}
+
+/// 保存设置页烘焙后的成品背景图（base64 PNG）
+#[tauri::command]
+fn save_background_cache(b64: String) -> Result<(), String> {
+    let bytes = B64.decode(b64).map_err(|e| format!("图片数据解码失败: {e}"))?;
+    if bytes.len() > 30 * 1024 * 1024 {
+        return Err("处理后的图片过大".into());
+    }
+    let dir = bg_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(dir.join(BG_CACHE_NAME), bytes).map_err(|e| format!("写入背景图失败: {e}"))
+}
+
+/// 主面板读取烘焙后的背景图
+#[tauri::command]
+fn get_background_cache() -> Option<String> {
+    fs::read(bg_dir().join(BG_CACHE_NAME)).ok().map(|b| B64.encode(b))
+}
+
+/// 保存背景图设置（即时落盘 + 广播，与 set_window_effect 同一模式）
+#[tauri::command]
+fn set_background_config(
+    state: State<'_, ConfigState>,
+    app: tauri::AppHandle,
+    bg: BackgroundConfig,
+) -> Result<(), String> {
+    let snapshot = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.background = bg;
+        cfg.clone()
+    };
     save_config_file(&snapshot)?;
     let _ = app.emit("config-changed", snapshot);
     Ok(())
 }
 
+/// 清除背景图：删除源图与缓存，并重置背景设置为默认
 #[tauri::command]
-fn clear_background(state: State<'_, ConfigState>, app: tauri::AppHandle) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.background = BackgroundConfig::default();
-    let snapshot = cfg.clone();
+fn clear_background_image(state: State<'_, ConfigState>, app: tauri::AppHandle) -> Result<(), String> {
+    let dir = bg_dir();
+    for f in bg_src_files(&dir) {
+        let _ = fs::remove_file(f);
+    }
+    let _ = fs::remove_file(dir.join(BG_CACHE_NAME));
+    let snapshot = {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.background = BackgroundConfig::default();
+        cfg.clone()
+    };
     save_config_file(&snapshot)?;
     let _ = app.emit("config-changed", snapshot);
     Ok(())
@@ -843,12 +982,7 @@ fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn set_always_on_top(state: State<'_, ConfigState>, app: tauri::AppHandle, enable: bool) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.always_on_top = enable;
-    let snapshot = cfg.clone();
-    save_config_file(&snapshot)?;
-    if let Some(win) = app.get_webview_window("main") { let _ = win.set_always_on_top(enable); }
-    Ok(())
+    set_panel_pinned(state, app, enable)
 }
 
 // ---------- 托盘 / 快捷键 / 自启 ----------
@@ -964,8 +1098,8 @@ pub fn run() {
     let data_dir = default_data_dir();
     let config_state = ConfigState {
         config: Mutex::new(config.clone()),
-        pinned: AtomicBool::new(false),
         data_dir: data_dir.clone(),
+        tray_toggle: Mutex::new(None),
     };
 
     let hotkey = config.hotkey.clone();
@@ -995,10 +1129,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop,
-            import_scanned, item_icons, get_config, save_config, get_db_info, export_data, import_data,
+            import_scanned, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
-            set_background, clear_background,
+            import_background_source, read_background_source, save_background_cache,
+            get_background_cache, set_background_config, clear_background_image,
             http_get_text, portable_update_download, portable_update_verify, portable_update_apply, installer_update_run, get_update_paths,
             open_settings_window, set_always_on_top
         ])
@@ -1006,9 +1141,13 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "显示/隐藏面板", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let _toggle = CheckMenuItem::with_id(app, "toggle", "钉住面板", true, false, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &settings, &_toggle, &quit])?;
-            TrayIconBuilder::new()
+            let toggle = CheckMenuItem::with_id(app, "toggle", "钉住面板", true, always_on_top, None::<&str>)?;
+            {
+                let state = app.state::<ConfigState>();
+                *state.tray_toggle.lock().unwrap() = Some(toggle.clone());
+            }
+            let menu = Menu::with_items(app, &[&show, &settings, &toggle, &quit])?;
+            TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .tooltip(format!("速启 ({hotkey})"))
@@ -1016,6 +1155,11 @@ pub fn run() {
                     "show" => toggle_window(app),
                     "settings" => { let _ = open_settings_window_internal(app); }
                     "quit" => app.exit(0),
+                    "toggle" => {
+                        let state = app.state::<ConfigState>();
+                        let new_state = { let cfg = state.config.lock().unwrap(); !cfg.always_on_top };
+                        let _ = set_panel_pinned(state, app.clone(), new_state);
+                    }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {

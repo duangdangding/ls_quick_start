@@ -1,9 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/** 背景图选区：归一化坐标（0-1），相对于旋转后的源图 */
+export interface BgRegion { x: number; y: number; w: number; h: number }
+
+/** 面板背景图设置（与后端 BackgroundConfig 对应） */
 export interface BackgroundConfig {
-  enabled: boolean;
-  opacity: number;
-  imageData?: string;
+  enabled: boolean; // 是否启用面板背景图
+  mode: string; // "stretch" 拉伸铺满 | "tile" 原尺寸平铺
+  opacity: number; // 背景图不透明度 0.05 - 1.0
+  scaleW: number; // 图片宽度占面板百分比 5 - 300
+  scaleH: number; // 图片高度占面板百分比 5 - 300
+  applySettings: boolean; // 背景同时应用到设置窗口
+  rotation: number; // 旋转角度（0/90/180/270，已烘焙进缓存图）
+  region: BgRegion | null; // 归一化选区（已烘焙进缓存图），null = 整图
+  hasImage: boolean; // 是否已选择图片
 }
 
 export interface AppConfig {
@@ -14,21 +24,46 @@ export interface AppConfig {
   rememberSize: boolean;
   windowWidth: number;
   windowHeight: number;
-  theme: string;
+  theme: string; // "dark" | "light"
   fontFamily: string;
   fontSize: number;
-  highlightColor: string;
-  windowEffect: string;
-  configDir?: string;
-  dbDir?: string;
+  highlightColor: string; // #rrggbb；空 = 跟随主题强调色
+  windowEffect: string; // "default" | "acrylic" | "vibrancy" | "mica"
+  configDir: string | null;
+  dbDir: string | null;
   background: BackgroundConfig;
 }
 
 export const DEFAULT_HOTKEY = "Win+`";
 export const isMac = navigator.platform.toUpperCase().includes("MAC");
 
+/** 背景设置的默认值（与后端 BackgroundConfig::default 一致） */
+export function defaultBackground(): BackgroundConfig {
+  return {
+    enabled: false,
+    mode: "stretch",
+    opacity: 0.6,
+    scaleW: 100,
+    scaleH: 100,
+    applySettings: false,
+    rotation: 0,
+    region: null,
+    hasImage: false,
+  };
+}
+
 export async function loadConfig(): Promise<AppConfig> {
-  return invoke<AppConfig>("get_config");
+  // 页面加载可能早于 Rust 端 .manage() 完成，短间隔重试等后端就绪
+  let lastErr: unknown;
+  for (let i = 0; i < 20; i++) {
+    try {
+      return await invoke<AppConfig>("get_config");
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  throw lastErr;
 }
 
 export async function saveConfig(config: AppConfig): Promise<void> {
@@ -46,32 +81,69 @@ export function formatHotkey(hotkey: string): string {
 }
 
 /** 应用外观（主题、高亮色、字号、字体）到文档根 */
-export function applyAppearance(config: AppConfig): void {
+export function applyAppearance(cfg: AppConfig): void {
   const root = document.documentElement;
-  root.dataset.theme = config.theme;
-  root.dataset.effect = config.windowEffect;
-  root.style.setProperty("--hl-color", config.highlightColor);
-  root.style.fontFamily = config.fontFamily || "system-ui";
-  root.style.fontSize = `${config.fontSize || 14}px`;
-  applyBackground(config.background);
+  root.dataset.theme = cfg.theme === "light" ? "light" : "dark";
+  root.style.setProperty("--app-font-size", `${cfg.fontSize || 14}px`);
+  root.style.fontFamily = cfg.fontFamily || "system-ui";
+  // 搜索命中高亮颜色：仅接受 #rrggbb；空/非法 = 跟随主题强调色
+  const hl = (cfg.highlightColor || "").trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(hl)) {
+    root.style.setProperty("--hl-color", hl);
+  } else {
+    root.style.setProperty("--hl-color", "var(--blue)");
+  }
 }
 
-/** 应用自定义背景层 */
-export function applyBackground(bg: BackgroundConfig): void {
-  const root = document.documentElement;
-  let layer = document.querySelector<HTMLDivElement>(".bg-layer");
-  if (!layer) {
-    layer = document.createElement("div");
-    layer.className = "bg-layer";
-    document.body.prepend(layer);
+/**
+ * 窗口材质效果（亚克力/云母/毛玻璃）：把效果名写到 <html data-effect>，
+ * 面板背景由 styles.css 里对应的半透明规则接管，透出系统材质。
+ */
+export function applyWindowEffect(effect: string) {
+  document.documentElement.dataset.effect = effect || "default";
+}
+
+/**
+ * 把背景图按设置应用到一个背景层元素上（主面板与设置页预览共用）。
+ * b64 为烘焙后的 PNG base64；mode 决定拉伸（不重复）还是平铺（重复）。
+ */
+export function styleBgLayer(el: HTMLElement, bg: BackgroundConfig, b64: string) {
+  el.style.backgroundImage = `url("data:image/png;base64,${b64}")`;
+  el.style.opacity = String(Math.max(0.05, Math.min(1, bg.opacity)));
+  const w = Math.max(5, Math.min(300, bg.scaleW || 100));
+  const h = Math.max(5, Math.min(300, bg.scaleH || 100));
+  el.style.backgroundSize = `${w}% ${h}%`;
+  el.style.backgroundPosition = "center";
+  el.style.backgroundRepeat = bg.mode === "tile" ? "repeat" : "no-repeat";
+}
+
+let bgLayerEl: HTMLElement | null = null;
+
+/**
+ * 应用面板背景：按需创建 .bg-layer 固定层，读取后端烘焙缓存并设置样式。
+ * include=false 表示当前窗口不应用背景（如设置页未勾选“应用到设置窗口”）。
+ */
+export async function applyWindowBackground(
+  bg: BackgroundConfig | undefined,
+  include: boolean,
+  b64Override?: string
+) {
+  const on = !!bg && bg.enabled && bg.hasImage && include;
+  document.documentElement.dataset.bg = on ? "on" : "off";
+  if (!bgLayerEl) {
+    bgLayerEl = document.createElement("div");
+    bgLayerEl.className = "bg-layer";
+    document.body.prepend(bgLayerEl);
   }
-  if (bg.enabled && bg.imageData) {
-    layer.style.backgroundImage = `url(data:image/png;base64,${bg.imageData})`;
-    layer.style.opacity = String(bg.opacity ?? 0.5);
-    layer.style.display = "block";
-    root.dataset.bg = "on";
-  } else {
-    layer.style.display = "none";
-    root.dataset.bg = "off";
+  if (!on) {
+    bgLayerEl.style.backgroundImage = "none";
+    return;
   }
+  const b64 = b64Override ?? (await invoke<string | null>("get_background_cache"));
+  if (!b64) {
+    document.documentElement.dataset.bg = "off";
+    bgLayerEl.style.backgroundImage = "none";
+    return;
+  }
+  styleBgLayer(bgLayerEl, bg!, b64);
 }
