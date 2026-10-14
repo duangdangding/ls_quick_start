@@ -35,7 +35,7 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": ["nsis", "dmg", "app"]
+    "active": true,
+    "targets": ["nsis", "msi"]
   }
 }
