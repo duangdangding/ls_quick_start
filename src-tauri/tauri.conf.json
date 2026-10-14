@@ -44,7 +44,7 @@
     "updater": {
       "active": true,
       "endpoints": ["https://github.com/duangdangding/ls_quick_start/releases/latest/download/latest.json"],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzNTgzREZENTUwNkM1NDUKUldSRnhRWlYvVDFZODFXWGtZOUxWeWhxQUNRa2EvMmhNeHpLRkN6azcrYi9FdXBWbVY0UU1DZUwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg0MzA0NUZDMEQ2MTA1MDMKUldRREJXRU4vRVV3aE5FMUM2RlNWSm5FUmFJZS9RZU5jcmpZV2pKSS82Vk9Ca3JZbVlJbjg4QTYK",
       "windows": { "installMode": "passive" }
     }
   }
