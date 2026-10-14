@@ -20,6 +20,7 @@ jobs:
     env:
       # 用于条件判断：secrets 不能出现在 if: 里，先映射到 job 级 env
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +38,7 @@ jobs:
       # Windows 代码签名：仅在配置了 WINDOWS_CERT_PFX secret 时启用。
       # 解出证书文件并向 tauri.conf.json 注入 bundle.windows.signCommand，
       # Tauri 打包时会用它给 exe / NSIS 安装包逐个签名。
+      # 同时：若未配置 TAURI_SIGNING_PRIVATE_KEY，移除 updater pubkey 避免构建失败。
       - name: Prepare Windows code signing
         if: matrix.os == 'windows-latest' && env.WINDOWS_CERT_PFX != ''
         shell: pwsh
@@ -58,6 +60,18 @@ jobs:
             $json.bundle.windows | Add-Member -NotePropertyName signCommand -NotePropertyValue $sign -Force
           } else {
             $json.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{ signCommand = $sign })
+          }
+          $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
+
+      # 未配置 updater 签名私钥时，移除 pubkey 避免 Tauri 构建报错
+      - name: Remove updater pubkey if no signing key
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        shell: pwsh
+        run: |
+          $confPath = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $confPath -Raw | ConvertFrom-Json
+          if ($json.plugins.updater.PSObject.Properties['pubkey']) {
+            $json.plugins.updater.PSObject.Properties.Remove('pubkey')
           }
           $json | ConvertTo-Json -Depth 20 | Set-Content $confPath -Encoding utf8
 
