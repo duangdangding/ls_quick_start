@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig, saveConfig } from "./config";
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
@@ -30,10 +31,12 @@ let scanning: DesktopEntry[] = [];
 let opening = false;
 let searchSelection: [number, number] | null = null;
 let pinned = false;
+let maximized = false;
 let selectMode = false;
 const selectedIds = new Set<string>();
 
 const app = document.querySelector<HTMLElement>("#app")!;
+const mainWindow = getCurrentWindow();
 const escape = (text: string) => text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const message = (value: unknown) => alert(typeof value === "string" ? value : "操作失败，请稍后重试");
 const fixedGroups = () => [{ id: "all", name: "全部" }, { id: "none", name: "未分组" }, ...groups.sort((a, b) => a.sortOrder - b.sortOrder), { id: encryptedId, name: "加密" }];
@@ -141,7 +144,7 @@ function setViewMode(mode: ViewMode) {
 function render() {
   const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
   app.innerHTML = `<section class="shell">
-    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
+    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button><button data-action="maximize" title="${maximized ? "还原窗口大小" : "最大化窗口，展示更多搜索结果"}">${maximized ? "还原" : "最大化"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
@@ -199,7 +202,7 @@ async function action(type: string) {
   if (type === "select-invert") { displayItems().forEach((item) => selectedIds.has(item.id) ? selectedIds.delete(item.id) : selectedIds.add(item.id)); render(); }
   if (type === "select-none") { selectedIds.clear(); render(); }
   if (type === "delete-items") await deleteSelectedItems();
-  if (type === "move-items") openMoveDialog();
+  if (type === "move-items") openMoveDialog([...selectedIds]);
   if (type === "settings") {
     await invoke("open_settings_window");
   }
@@ -207,6 +210,10 @@ async function action(type: string) {
     pinned = !pinned;
     await invoke("set_panel_pinned", { pinned });
     render();
+  }
+  if (type === "maximize") {
+    if (maximized) await mainWindow.unmaximize(); else await mainWindow.maximize();
+    await syncMaximized();
   }
 }
 async function openItem(id: string) {
@@ -224,7 +231,7 @@ function openItemDialog(item?: Item) {
   node.querySelector<HTMLButtonElement>("#pick-icon")!.onclick = async () => { const path = await chooseFile({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "ico", "svg"] }] }); if (typeof path === "string") (form.elements.namedItem("icon") as HTMLInputElement).value = path; };
   form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
 }
-function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); menu.style.left = `${box.left - 100}px`; menu.style.top = `${box.bottom + 4}px`; menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { if (!confirm("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); menu.remove(); await load(); } catch (error) { message(error); } }); }
+function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button data-move>移动到分组</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); menu.style.left = `${box.left - 100}px`; menu.style.top = `${box.bottom + 4}px`; menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-move]")!.addEventListener("click", () => { menu.remove(); const item = items.find((target) => target.id === id); if (item) openMoveDialog([id], item.groupId); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { if (!confirm("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); menu.remove(); await load(); } catch (error) { message(error); } }); }
 /** 批量删除多选模式下勾选的启动项 */
 async function deleteSelectedItems() {
   const ids = [...selectedIds];
@@ -233,12 +240,13 @@ async function deleteSelectedItems() {
   try { await invoke("delete_items", { ids }); selectedIds.clear(); await load(); }
   catch (error) { message(error); }
 }
-/** 批量移动到其他分组（可选「未分组」或已有普通分组） */
-function openMoveDialog() {
-  const ids = [...selectedIds];
+/** 移动到其他分组（可选「未分组」或已有普通分组）：支持批量多选或单个条目，currentGroupId 用于预选当前分组 */
+function openMoveDialog(ids: string[], currentGroupId: string | null = null) {
   if (!ids.length) return;
   const options = [{ id: "", name: "未分组" }, ...groups.sort((a, b) => a.sortOrder - b.sortOrder)];
   const node = modal(`<h2>移动到分组</h2><form id="move-form"><label>目标分组<select name="group">${options.map((option) => `<option value="${option.id}">${escape(option.name)}</option>`).join("")}</select></label><p class="hint">共 ${ids.length} 项将移动到所选分组。</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">移动</button></div></form>`);
+  // 预选当前分组；加密分组等不在选项中的值回落到「未分组」
+  node.querySelector<HTMLSelectElement>("#move-form select[name='group']")!.value = options.some((option) => option.id === currentGroupId) ? currentGroupId! : "";
   node.querySelector<HTMLFormElement>("#move-form")!.onsubmit = async (event) => {
     event.preventDefault();
     const groupId = String(new FormData(event.currentTarget as HTMLFormElement).get("group") ?? "");
@@ -339,7 +347,15 @@ async function reorderGroups(event: DragEvent, targetId: string) { event.prevent
 window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
-listen("panel-shown", () => { void load(); });
+listen("panel-shown", () => { void load(); void syncMaximized(); });
+// ---------- 面板最大化 / 还原：头部按钮切换，并跟随原生标题栏的最大化状态 ----------
+async function syncMaximized() {
+  try {
+    const value = await mainWindow.isMaximized();
+    if (value !== maximized) { maximized = value; render(); }
+  } catch { /* 窗口尚未就绪时忽略 */ }
+}
+void mainWindow.onResized(() => void syncMaximized());
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
 document.addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest(".menu")) return;
