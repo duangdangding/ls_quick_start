@@ -551,32 +551,42 @@ struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: 
 #[serde(rename_all = "camelCase")]
 struct ItemIcon { id: String, icon_path: Option<String> }
 
-/// 扫描一个目录（顶层，不递归）下的文件 / 文件夹 / 快捷方式，生成可导入条目
-fn scan_dir(dir: &Path) -> Result<Vec<DesktopEntry>, String> {
+/// 扫描一个目录下的文件 / 文件夹 / 快捷方式，生成可导入条目；recursive 为真时同时扫描子文件夹
+fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
     let mut entries = Vec::new();
     let icon_dir = default_data_dir().join("scan-icons");
     let _ = fs::create_dir_all(&icon_dir);
     let mut icon_pairs = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败：{e}"))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        if file_name.eq_ignore_ascii_case("desktop.ini") { continue; }
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        let shortcut = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
-        let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
-        let source_path = display_path(path.display().to_string());
-        let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
-        let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
-        if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
-        entries.push(DesktopEntry {
-            name: path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().into(),
-            target: source_path.clone(),
-            source_path,
-            is_shortcut: shortcut,
-            entry_type: entry_type.into(),
-            scan_icon_path: None,
-        });
+    // 待扫描目录栈：(目录, 是否为根目录)，根目录读取失败直接报错，子目录失败则跳过
+    let mut pending = vec![(dir.to_path_buf(), true)];
+    while let Some((current, is_root)) = pending.pop() {
+        let reader = match fs::read_dir(&current) {
+            Ok(reader) => reader,
+            Err(e) if is_root => return Err(format!("读取目录失败：{e}")),
+            Err(_) => continue,
+        };
+        for entry in reader {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.eq_ignore_ascii_case("desktop.ini") { continue; }
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            let shortcut = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
+            if recursive && kind.is_dir() { pending.push((path.clone(), false)); }
+            let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
+            let source_path = display_path(path.display().to_string());
+            let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
+            let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
+            if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
+            entries.push(DesktopEntry {
+                name: path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().into(),
+                target: source_path.clone(),
+                source_path,
+                is_shortcut: shortcut,
+                entry_type: entry_type.into(),
+                scan_icon_path: None,
+            });
+        }
     }
     extract_icons(&icon_pairs);
     for entry in &mut entries {
@@ -590,17 +600,17 @@ fn scan_dir(dir: &Path) -> Result<Vec<DesktopEntry>, String> {
 
 /// 扫描桌面（默认入口）
 #[tauri::command]
-fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
+fn scan_desktop(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
-    scan_dir(&desktop)
+    scan_dir(&desktop, recursive.unwrap_or(false))
 }
 
 /// 扫描用户手动选择的文件夹（与桌面扫描同规则）
 #[tauri::command]
-fn scan_folder(dir: String) -> Result<Vec<DesktopEntry>, String> {
+fn scan_folder(dir: String, recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let path = PathBuf::from(dir.trim());
     if !path.is_dir() { return Err("请选择一个有效的文件夹".into()); }
-    scan_dir(&path)
+    scan_dir(&path, recursive.unwrap_or(false))
 }
 
 #[tauri::command]
