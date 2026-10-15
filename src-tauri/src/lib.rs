@@ -325,7 +325,10 @@ fn normalize_url(value: &str) -> Result<String, String> {
 fn resolve_lnk(path: &Path) -> String {
     #[cfg(windows)] {
         let escaped = path.display().to_string().replace('\'', "''");
-        if let Ok(output) = Command::new("powershell").args(["-NoProfile", "-Command", &format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath", escaped)]).output() {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", &format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath", escaped)]);
+        hide_console(&mut command);
+        if let Ok(output) = command.output() {
             let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !value.is_empty() { return value; }
         }
@@ -335,13 +338,25 @@ fn resolve_lnk(path: &Path) -> String {
 fn display_path(value: impl AsRef<str>) -> String {
     value.as_ref().strip_prefix(r"\\?\").unwrap_or(value.as_ref()).to_string()
 }
+/// Windows 下以「无窗口」方式启动子进程，避免 powershell / cmd 等控制台程序闪现黑窗
+#[cfg(windows)]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = command.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn hide_console(_command: &mut Command) {}
 fn ps_quote(value: impl AsRef<str>) -> String { format!("'{}'", value.as_ref().replace('\'', "''")) }
 fn resolve_shortcuts(paths: &[PathBuf]) -> Vec<String> {
     #[cfg(windows)] {
         if paths.is_empty() { return Vec::new(); }
         let values = paths.iter().map(|path| ps_quote(path.display().to_string())).collect::<Vec<_>>().join(",");
         let script = format!("$w=New-Object -ComObject WScript.Shell; @({values}) | ForEach-Object {{ try {{ $w.CreateShortcut($_).TargetPath }} catch {{ '' }} }}");
-        if let Ok(output) = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output() {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", &script]);
+        hide_console(&mut command);
+        if let Ok(output) = command.output() {
             return String::from_utf8_lossy(&output.stdout).lines().map(|value| display_path(value.trim())).collect();
         }
     }
@@ -352,7 +367,10 @@ fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
         if pairs.is_empty() { return; }
         let values = pairs.iter().flat_map(|(input, output)| [ps_quote(input.display().to_string()), ps_quote(output.display().to_string())]).collect::<Vec<_>>().join(",");
         let script = format!("Add-Type -AssemblyName System.Drawing; $p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ try {{ $icon=[System.Drawing.Icon]::ExtractAssociatedIcon($p[$i]); if($icon){{ $bitmap=$icon.ToBitmap(); $bitmap.Save($p[$i+1],[System.Drawing.Imaging.ImageFormat]::Png); $bitmap.Dispose(); $icon.Dispose() }} }} catch {{}} }}");
-        let _ = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output();
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", &script]);
+        hide_console(&mut command);
+        let _ = command.output();
     }
 }
 fn normalize_target(value: &str, is_cmd: bool) -> Result<String, String> {
@@ -429,8 +447,13 @@ fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(),
     let item = data.store.lock().unwrap().items.iter().find(|x| x.id == id).cloned().ok_or("启动项不存在")?;
     if encrypted(&item) && !unlocked && !data.unlocked.load(Ordering::SeqCst) { return Err("请先解锁加密分组".into()); }
     #[cfg(windows)] {
-        if item.is_cmd { Command::new("cmd").args(["/C", &item.target]).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
-        else { Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
+        if item.is_cmd {
+            // CMD 命令以无窗口方式运行，避免弹出控制台黑窗
+            let mut command = Command::new("cmd");
+            command.args(["/C", &item.target]);
+            hide_console(&mut command);
+            command.spawn().map_err(|e| format!("无法打开目标：{e}"))?;
+        } else { Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
     }
     #[cfg(not(windows))] {
         let mut command = if item.is_cmd { let mut c = Command::new("sh"); c.args(["-c", &item.target]); c } else { let mut c = Command::new("open"); c.arg(&item.target); c };
@@ -528,14 +551,13 @@ struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: 
 #[serde(rename_all = "camelCase")]
 struct ItemIcon { id: String, icon_path: Option<String> }
 
-#[tauri::command]
-fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
-    let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
+/// 扫描一个目录（顶层，不递归）下的文件 / 文件夹 / 快捷方式，生成可导入条目
+fn scan_dir(dir: &Path) -> Result<Vec<DesktopEntry>, String> {
     let mut entries = Vec::new();
     let icon_dir = default_data_dir().join("scan-icons");
     let _ = fs::create_dir_all(&icon_dir);
     let mut icon_pairs = Vec::new();
-    for entry in fs::read_dir(desktop).map_err(|e| format!("读取桌面失败：{e}"))? {
+    for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败：{e}"))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
@@ -564,6 +586,21 @@ fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
     }
     entries.sort_by_key(|a| a.name.to_lowercase());
     Ok(entries)
+}
+
+/// 扫描桌面（默认入口）
+#[tauri::command]
+fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
+    let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
+    scan_dir(&desktop)
+}
+
+/// 扫描用户手动选择的文件夹（与桌面扫描同规则）
+#[tauri::command]
+fn scan_folder(dir: String) -> Result<Vec<DesktopEntry>, String> {
+    let path = PathBuf::from(dir.trim());
+    if !path.is_dir() { return Err("请选择一个有效的文件夹".into()); }
+    scan_dir(&path)
 }
 
 #[tauri::command]
@@ -1011,6 +1048,7 @@ fn portable_update_apply(app: tauri::AppHandle, new_path: String) -> Result<(), 
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
     }
+    hide_console(&mut cmd);
     cmd.spawn().map_err(|e| format!("启动更新辅助程序失败：{e}"))?;
     app.exit(0);
     Ok(())
@@ -1036,6 +1074,7 @@ fn apply_update_helper(new_path: &str, old_path: &str) {
     if let Some(dir) = Path::new(old_path).parent() {
         cmd.current_dir(dir);
     }
+    hide_console(&mut cmd);
     let _ = cmd.spawn();
 }
 
@@ -1053,7 +1092,10 @@ fn installer_update_path(filename: String) -> Result<String, String> {
 /// 运行下载好的 NSIS 安装包并退出本程序（安装程序装回原目录后会重启新版）
 #[tauri::command]
 fn installer_update_run(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    Command::new(&path).spawn().map_err(|e| format!("启动安装程序失败：{e}"))?;
+    // 无窗口启动安装程序，避免安装过程闪现控制台黑窗
+    let mut cmd = Command::new(&path);
+    hide_console(&mut cmd);
+    cmd.spawn().map_err(|e| format!("启动安装程序失败：{e}"))?;
     app.exit(0);
     Ok(())
 }
@@ -1277,7 +1319,7 @@ pub fn run() {
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,
-            delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop,
+            delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop, scan_folder,
             import_scanned, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
