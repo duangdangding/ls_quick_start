@@ -31,6 +31,9 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 struct LauncherItem {
     id: String,
     name: String,
+    /// 搜索关键字：用户自定义，留空时保存为 name
+    #[serde(default)]
+    keyword: String,
     target: String,
     group_id: Option<String>,
     is_encrypted: bool,
@@ -200,6 +203,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
         "CREATE TABLE IF NOT EXISTS items (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            keyword TEXT NOT NULL DEFAULT '',
             target TEXT NOT NULL,
             group_id TEXT,
             is_encrypted INTEGER NOT NULL DEFAULT 0,
@@ -219,13 +223,24 @@ fn init_db(conn: &Connection) -> Result<(), String> {
             hash TEXT NOT NULL
         );"
     ).map_err(|e| format!("初始化数据库失败：{e}"))?;
+    // 兼容旧库：items 表缺少 keyword 列时补上（旧数据关键字默认回填 name）
+    let has_keyword = conn.prepare("PRAGMA table_info(items)").and_then(|mut stmt| {
+        let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for name in names { if name?.eq_ignore_ascii_case("keyword") { found = true; } }
+        Ok(found)
+    }).map_err(|e| format!("读取数据表结构失败：{e}"))?;
+    if !has_keyword {
+        conn.execute("ALTER TABLE items ADD COLUMN keyword TEXT NOT NULL DEFAULT ''", []).map_err(|e| format!("升级数据库失败：{e}"))?;
+        conn.execute("UPDATE items SET keyword = name WHERE keyword = ''", []).map_err(|e| format!("升级数据库失败：{e}"))?;
+    }
     Ok(())
 }
 
 fn load_store_from_db(conn: &Connection) -> Result<Store, String> {
     let mut store = Store::default();
 
-    let mut stmt = conn.prepare("SELECT id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at FROM items ORDER BY sort_order").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword FROM items ORDER BY sort_order").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| {
         Ok(LauncherItem {
             id: row.get(0)?,
@@ -237,6 +252,7 @@ fn load_store_from_db(conn: &Connection) -> Result<Store, String> {
             icon_path: row.get(6)?,
             sort_order: row.get(7)?,
             created_at: row.get(8)?,
+            keyword: row.get(9)?,
         })
     }).map_err(|e| e.to_string())?;
     for row in rows { store.items.push(row.map_err(|e| e.to_string())?); }
@@ -263,8 +279,8 @@ fn save_store_to_db(conn: &Connection, store: &Store) -> Result<(), String> {
     tx.execute("DELETE FROM password", []).map_err(|e| e.to_string())?;
     for item in &store.items {
         tx.execute(
-            "INSERT INTO items (id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![item.id, item.name, item.target, item.group_id, item.is_encrypted as i64, item.is_cmd as i64, item.icon_path, item.sort_order, item.created_at],
+            "INSERT INTO items (id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![item.id, item.name, item.target, item.group_id, item.is_encrypted as i64, item.is_cmd as i64, item.icon_path, item.sort_order, item.created_at, item.keyword],
         ).map_err(|e| e.to_string())?;
     }
     for group in &store.groups {
@@ -415,7 +431,8 @@ fn searchable_items(data: State<'_, AppData>, include_encrypted: bool) -> Vec<Se
     let unlocked = data.unlocked.load(Ordering::SeqCst);
     data.store.lock().unwrap().items.iter().filter(|item| include_encrypted || unlocked || !encrypted(item)).map(|item| {
         let (full_pinyin, initials) = pinyin_text(&item.name);
-        SearchText { id: item.id.clone(), name: item.name.clone(), full_pinyin, initials }
+        let (keyword_full_pinyin, keyword_initials) = pinyin_text(&item.keyword);
+        SearchText { id: item.id.clone(), name: item.name.clone(), full_pinyin, initials, keyword: item.keyword.clone(), keyword_full_pinyin, keyword_initials }
     }).collect()
 }
 
@@ -423,6 +440,9 @@ fn searchable_items(data: State<'_, AppData>, include_encrypted: bool) -> Vec<Se
 fn save_item(data: State<'_, AppData>, mut item: LauncherItem, is_cmd: bool) -> Result<LauncherItem, String> {
     check_name(&item.name)?;
     item.name = item.name.trim().to_string();
+    // 关键字留空时回退为名称，保证每项都有可搜索关键字
+    item.keyword = item.keyword.trim().to_string();
+    if item.keyword.is_empty() { item.keyword = item.name.clone(); }
     item.target = normalize_target(&item.target, is_cmd)?;
     item.is_encrypted = item.group_id.as_deref() == Some(ENCRYPTED_GROUP);
     item.is_cmd = is_cmd;
@@ -638,7 +658,7 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut order = store.items.iter().map(|item| item.sort_order).max().unwrap_or(-1) + 1;
     for (name, target) in prepared {
         if !known.insert(target.to_lowercase()) { skipped_duplicates += 1; continue; }
-        store.items.push(LauncherItem { id: new_id(), name, target, group_id: group_id.clone(), is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now() });
+        store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, group_id: group_id.clone(), is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now() });
         order += 1; added += 1;
     }
     persist(&data, &store)?;
@@ -672,7 +692,7 @@ struct ListResult { items: Vec<LauncherItem>, groups: Vec<Group>, password_set: 
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchText { id: String, name: String, full_pinyin: String, initials: String }
+struct SearchText { id: String, name: String, full_pinyin: String, initials: String, keyword: String, keyword_full_pinyin: String, keyword_initials: String }
 
 #[tauri::command]
 fn get_config(state: State<'_, ConfigState>) -> AppConfig { state.config.lock().unwrap().clone() }
