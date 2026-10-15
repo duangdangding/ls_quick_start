@@ -462,6 +462,31 @@ fn delete_item(data: State<'_, AppData>, id: String) -> Result<(), String> {
     let mut store = data.store.lock().unwrap(); store.items.retain(|x| x.id != id); persist(&data, &store)
 }
 
+/// 批量删除启动项（面板多选后一次性删除）
+#[tauri::command]
+fn delete_items(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap();
+    store.items.retain(|item| !ids.contains(&item.id));
+    persist(&data, &store)
+}
+
+/// 批量移动启动项到指定分组（group_id 为 None 表示「未分组」）
+#[tauri::command]
+fn move_items(data: State<'_, AppData>, ids: Vec<String>, group_id: Option<String>) -> Result<(), String> {
+    let mut store = data.store.lock().unwrap();
+    if group_id.as_deref() != Some(ENCRYPTED_GROUP) && group_id.as_ref().is_some_and(|id| !store.groups.iter().any(|g| &g.id == id)) {
+        return Err("所选分组不存在".into());
+    }
+    let encrypted = group_id.as_deref() == Some(ENCRYPTED_GROUP);
+    for item in store.items.iter_mut() {
+        if ids.contains(&item.id) {
+            item.group_id = group_id.clone();
+            item.is_encrypted = encrypted;
+        }
+    }
+    persist(&data, &store)
+}
+
 #[tauri::command]
 fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(), String> {
     let item = data.store.lock().unwrap().items.iter().find(|x| x.id == id).cloned().ok_or("启动项不存在")?;
@@ -500,11 +525,16 @@ fn rename_group(data: State<'_, AppData>, id: String, name: String) -> Result<()
 }
 
 #[tauri::command]
-fn delete_group(data: State<'_, AppData>, id: String) -> Result<(), String> {
+fn delete_group(data: State<'_, AppData>, id: String, delete_items: bool) -> Result<(), String> {
     let mut store = data.store.lock().unwrap();
     if !store.groups.iter().any(|g| g.id == id) { return Err("分组不存在".into()); }
     store.groups.retain(|g| g.id != id);
-    for item in &mut store.items { if item.group_id.as_deref() == Some(&id) { item.group_id = None; } }
+    // delete_items 为真时连同组内项目一起删除，否则仅清空项目上的分组归属
+    if delete_items {
+        store.items.retain(|item| item.group_id.as_deref() != Some(&id));
+    } else {
+        for item in &mut store.items { if item.group_id.as_deref() == Some(&id) { item.group_id = None; } }
+    }
     persist(&data, &store)
 }
 
@@ -1394,7 +1424,7 @@ pub fn run() {
         .manage(AppData { store: Mutex::new(store), conn: Mutex::new(conn), unlocked: AtomicBool::new(false) })
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
-            list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,
+            list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,

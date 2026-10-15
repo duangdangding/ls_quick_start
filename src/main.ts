@@ -30,6 +30,8 @@ let scanning: DesktopEntry[] = [];
 let opening = false;
 let searchSelection: [number, number] | null = null;
 let pinned = false;
+let selectMode = false;
+const selectedIds = new Set<string>();
 
 const app = document.querySelector<HTMLElement>("#app")!;
 const escape = (text: string) => text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
@@ -141,8 +143,9 @@ function render() {
   app.innerHTML = `<section class="shell">
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
-    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
-    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); return `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
+    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
+    ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -152,7 +155,8 @@ function render() {
   input.addEventListener("keydown", (event) => {
     if (composingSearch) return;
     const shownItems = displayItems();
-    if (event.key === "Enter" && shownItems[selected]) { event.preventDefault(); void openItem(shownItems[selected].id); }
+    // 多选模式下 Enter 不启动条目，避免与勾选操作冲突
+    if (!selectMode && event.key === "Enter" && shownItems[selected]) { event.preventDefault(); void openItem(shownItems[selected].id); }
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shownItems.length) {
       event.preventDefault();
       const width = arrowColumns();
@@ -170,8 +174,16 @@ function render() {
 }
 function bindInteractions(shown: Item[]) {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((button) => button.onclick = () => void action(button.dataset.action!));
-  document.querySelectorAll<HTMLElement>("[data-group]").forEach((tab) => { tab.onclick = () => { activeGroup = tab.dataset.group!; selected = 0; render(); }; tab.ondragstart = (event) => event.dataTransfer?.setData("group", tab.dataset.group!); tab.ondragover = (event) => event.preventDefault(); tab.ondrop = (event) => void reorderGroups(event, tab.dataset.group!); });
-  document.querySelectorAll<HTMLElement>(".card").forEach((card) => { card.onclick = (event) => { if ((event.target as HTMLElement).closest(".more")) return; selected = shown.findIndex((item) => item.id === card.dataset.id); render(); }; card.ondblclick = () => void openItem(card.dataset.id!); });
+  document.querySelectorAll<HTMLElement>("[data-group]").forEach((tab) => { tab.onclick = () => { activeGroup = tab.dataset.group!; selected = 0; selectedIds.clear(); render(); }; tab.ondragstart = (event) => event.dataTransfer?.setData("group", tab.dataset.group!); tab.ondragover = (event) => event.preventDefault(); tab.ondrop = (event) => void reorderGroups(event, tab.dataset.group!); });
+  document.querySelectorAll<HTMLElement>(".card").forEach((card) => {
+    card.onclick = (event) => {
+      if ((event.target as HTMLElement).closest(".more")) return;
+      // 多选模式下点击卡片切换勾选，不移动键盘光标
+      if (selectMode) { const id = card.dataset.id!; if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id); render(); return; }
+      selected = shown.findIndex((item) => item.id === card.dataset.id); render();
+    };
+    card.ondblclick = () => { if (!selectMode) void openItem(card.dataset.id!); };
+  });
   document.querySelectorAll<HTMLElement>("[data-menu]").forEach((button) => button.onclick = (event) => { event.stopPropagation(); showItemMenu(button.dataset.menu!, button); });
   document.querySelector("#grid")?.addEventListener("contextmenu", (event) => { if ((event.target as HTMLElement).closest(".card")) return; event.preventDefault(); openItemDialog(); });
 }
@@ -182,6 +194,12 @@ async function action(type: string) {
   if (type === "groups") openGroupManager();
   if (type === "new-group") openGroupDialog();
   if (type === "password") openPasswordDialog();
+  if (type === "select-mode") { selectMode = !selectMode; selectedIds.clear(); render(); }
+  if (type === "select-all") { displayItems().forEach((item) => selectedIds.add(item.id)); render(); }
+  if (type === "select-invert") { displayItems().forEach((item) => selectedIds.has(item.id) ? selectedIds.delete(item.id) : selectedIds.add(item.id)); render(); }
+  if (type === "select-none") { selectedIds.clear(); render(); }
+  if (type === "delete-items") await deleteSelectedItems();
+  if (type === "move-items") openMoveDialog();
   if (type === "settings") {
     await invoke("open_settings_window");
   }
@@ -207,8 +225,42 @@ function openItemDialog(item?: Item) {
   form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
 }
 function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); menu.style.left = `${box.left - 100}px`; menu.style.top = `${box.bottom + 4}px`; menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { if (!confirm("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); menu.remove(); await load(); } catch (error) { message(error); } }); }
+/** 批量删除多选模式下勾选的启动项 */
+async function deleteSelectedItems() {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  if (!confirm(`确认删除选中的 ${ids.length} 个启动项？`)) return;
+  try { await invoke("delete_items", { ids }); selectedIds.clear(); await load(); }
+  catch (error) { message(error); }
+}
+/** 批量移动到其他分组（可选「未分组」或已有普通分组） */
+function openMoveDialog() {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  const options = [{ id: "", name: "未分组" }, ...groups.sort((a, b) => a.sortOrder - b.sortOrder)];
+  const node = modal(`<h2>移动到分组</h2><form id="move-form"><label>目标分组<select name="group">${options.map((option) => `<option value="${option.id}">${escape(option.name)}</option>`).join("")}</select></label><p class="hint">共 ${ids.length} 项将移动到所选分组。</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">移动</button></div></form>`);
+  node.querySelector<HTMLFormElement>("#move-form")!.onsubmit = async (event) => {
+    event.preventDefault();
+    const groupId = String(new FormData(event.currentTarget as HTMLFormElement).get("group") ?? "");
+    try { await invoke("move_items", { ids, groupId: groupId || null }); node.remove(); selectedIds.clear(); await load(); }
+    catch (error) { message(error); }
+  };
+}
+/** 删除分组：由用户选择仅删除分组，还是连同组内项目一起删除 */
+function openDeleteGroupDialog(groupId: string, manager: HTMLElement) {
+  const group = groups.find((item) => item.id === groupId);
+  const count = items.filter((item) => item.groupId === groupId).length;
+  const node = modal(`<h2>删除分组「${escape(group?.name ?? "")}」</h2><form id="delete-group-form"><p class="hint">该分组下有 ${count} 个启动项，请选择处理方式：</p><div class="del-options"><label><input type="radio" name="mode" value="keep" checked />仅删除分组，组内项目转为未分组</label><label><input type="radio" name="mode" value="delete" />删除分组及组内全部项目</label></div><div class="modal-actions"><button type="button" data-close>取消</button><button class="danger">确认删除</button></div></form>`);
+  node.querySelector<HTMLFormElement>("#delete-group-form")!.onsubmit = async (event) => {
+    event.preventDefault();
+    const mode = String(new FormData(event.currentTarget as HTMLFormElement).get("mode"));
+    if (mode === "delete" && !confirm(`将同时删除「${group?.name ?? ""}」中的 ${count} 个启动项，确认继续？`)) return;
+    try { await invoke("delete_group", { id: groupId, deleteItems: mode === "delete" }); node.remove(); manager.remove(); await load(); }
+    catch (error) { message(error); }
+  };
+}
 function openGroupDialog(group?: Group) { const node = modal(`<h2>${group ? "重命名分组" : "新建分组"}</h2><form id="group-form"><label>分组名称<input name="name" required value="${escape(group?.name ?? "")}" /></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); node.querySelector<HTMLFormElement>("#group-form")!.onsubmit = async (event) => { event.preventDefault(); const name = new FormData(event.currentTarget as HTMLFormElement).get("name"); try { if (group) await invoke("rename_group", { id: group.id, name }); else await invoke("create_group", { name }); node.remove(); await load(); } catch (error) { message(error); } }; }
-function openGroupManager() { const node = modal(`<h2>分组管理</h2><div class="group-list">${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<div><span>${escape(group.name)}</span><button data-rename="${group.id}">重命名</button><button class="danger" data-delete-group="${group.id}">删除</button></div>`).join("") || "<p class=muted>尚未创建普通分组</p>"}</div><p class="hint">“全部”“未分组”“加密”为固定逻辑标签，不能删除。</p><div class="modal-actions"><button data-close>关闭</button><button class="primary" id="manager-add">新建分组</button></div>`); node.querySelector("#manager-add")!.addEventListener("click", () => { node.remove(); openGroupDialog(); }); node.querySelectorAll<HTMLElement>("[data-rename]").forEach((button) => button.onclick = () => { node.remove(); openGroupDialog(groups.find((group) => group.id === button.dataset.rename)); }); node.querySelectorAll<HTMLElement>("[data-delete-group]").forEach((button) => button.onclick = async () => { if (!confirm("删除分组后，组内项目会转为未分组。继续吗？")) return; try { await invoke("delete_group", { id: button.dataset.deleteGroup }); node.remove(); await load(); } catch (error) { message(error); } }); }
+function openGroupManager() { const node = modal(`<h2>分组管理</h2><div class="group-list">${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<div><span>${escape(group.name)}</span><button data-rename="${group.id}">重命名</button><button class="danger" data-delete-group="${group.id}">删除</button></div>`).join("") || "<p class=muted>尚未创建普通分组</p>"}</div><p class="hint">“全部”“未分组”“加密”为固定逻辑标签，不能删除。</p><div class="modal-actions"><button data-close>关闭</button><button class="primary" id="manager-add">新建分组</button></div>`); node.querySelector("#manager-add")!.addEventListener("click", () => { node.remove(); openGroupDialog(); }); node.querySelectorAll<HTMLElement>("[data-rename]").forEach((button) => button.onclick = () => { node.remove(); openGroupDialog(groups.find((group) => group.id === button.dataset.rename)); }); node.querySelectorAll<HTMLElement>("[data-delete-group]").forEach((button) => button.onclick = () => openDeleteGroupDialog(button.dataset.deleteGroup!, node)); }
 function openPasswordDialog() { const resetting = passwordSet && unlocked; const node = modal(`<h2>${resetting ? "重置加密密码" : passwordSet ? "解锁加密分组" : "设置加密密码"}</h2><form id="password-form">${resetting ? `<label>当前密码<input name="current" type="password" required /></label>` : ""}<label>${passwordSet && !resetting ? "密码" : "新密码"}<input name="password" type="password" minlength="4" required /></label><p class="hint">密码仅以随机 salt 的 SHA-256 哈希保存，无法找回。</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">确认</button></div></form>`); node.querySelector<HTMLFormElement>("#password-form")!.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(event.currentTarget as HTMLFormElement); const password = String(values.get("password")); try { if (passwordSet && !resetting) { if (!await invoke<boolean>("unlock_encrypted", { password })) throw "密码不正确"; unlocked = true; } else { await invoke("reset_password", { currentPassword: values.get("current") || null, newPassword: password }); unlocked = true; } node.remove(); activeGroup = encryptedId; await load(); } catch (error) { message(error); } }; }
 const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: "快捷方式", icon: "↗" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
 function scanIcon(entry: DesktopEntry) { return entry.scanIconPath ? `<img src="${escape(convertFileSrc(entry.scanIconPath))}" alt="" />` : scanMeta(entry).icon; }
@@ -242,10 +294,15 @@ async function openScan() {
     catch (error) { body.innerHTML = ""; importButton.disabled = false; message(error); return; }
     sourceText.textContent = `来源：${describe(source)}${recursive ? "（含子文件夹）" : ""}`;
     const countByType = (type: DesktopEntry["entryType"]) => scanning.filter((entry) => entry.entryType === type).length;
-    body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">清空</button></div></div>
+    body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="invert">反选</button><button type="button" data-select="none">清空</button></div></div>
       <div class="scan-list">${scanning.map((entry, index) => { const meta = scanMeta(entry); return `<label><input type="checkbox" value="${index}" data-type="${entry.entryType}" ${entry.isShortcut ? "checked" : ""}/><span><i class="scan-icon ${entry.entryType}">${scanIcon(entry)}</i>${escape(entry.name)}<em>${meta.label}</em></span><small>${escape(entry.target)}</small></label>`; }).join("") || "<p class=muted>该目录没有可导入的文件或目录</p>"}</div>`;
     const toggle = (type: string) => {
-      body.querySelectorAll<HTMLInputElement>(".scan-list input").forEach((input) => { input.checked = type === "all" ? true : type === "none" ? false : input.dataset.type === type; });
+      body.querySelectorAll<HTMLInputElement>(".scan-list input").forEach((input) => {
+        if (type === "all") input.checked = true;
+        else if (type === "none") input.checked = false;
+        else if (type === "invert") input.checked = !input.checked;
+        else input.checked = input.dataset.type === type;
+      });
       updateScanSelection(node);
     };
     body.querySelectorAll<HTMLButtonElement>("[data-select]").forEach((button) => button.onclick = () => toggle(button.dataset.select!));
