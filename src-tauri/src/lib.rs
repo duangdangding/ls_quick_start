@@ -17,6 +17,7 @@ use tauri::{Emitter, Manager, State};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
 const ENCRYPTED_GROUP: &str = "__encrypted__";
@@ -1253,6 +1254,14 @@ pub fn run() {
     let window_effect_cfg = config.window_effect.clone();
 
     tauri::Builder::default()
+        // 单实例插件必须最先注册：重复启动时新进程直接退出，并在已运行的实例里提示
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            app.dialog()
+                .message("速启已在运行，请从系统托盘或快捷键 Win + ` 呼出面板。")
+                .title("速启")
+                .kind(MessageDialogKind::Info)
+                .show(|_| {});
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())

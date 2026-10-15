@@ -12,6 +12,7 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 - 图标缓存
 - 右键添加 / 编辑 / 删除
 - 全局快捷键呼出 / 隐藏（默认 `Win + \``）
+- 单实例运行（重复启动时提示"速启已在运行"，不再开启第二个进程）
 - 系统托盘图标
 - 钉住面板（置顶，按钮与托盘菜单实时同步）
 - 开机自启 / 静默启动
@@ -32,7 +33,7 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 
 - **前端**: Vite + TypeScript
 - **后端**: Rust (Tauri 2)
-- **插件**: global-shortcut, autostart, process, fs, dialog, opener, updater
+- **插件**: global-shortcut, autostart, process, fs, dialog, opener, updater, single-instance
 - **存储**: SQLite（`suqi.db`，默认在软件同目录）
 
 ## 开发
