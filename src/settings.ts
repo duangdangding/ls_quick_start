@@ -2,8 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { AppConfig, BackgroundConfig, applyAppearance, applyWindowBackground, applyWindowEffect, defaultBackground, formatHotkey, loadConfig, saveConfig, styleBgLayer, DEFAULT_HOTKEY } from "./config";
-import { check } from "@tauri-apps/plugin-updater";
+import { AppConfig, BackgroundConfig, applyAppearance, applyWindowBackground, applyWindowEffect, defaultBackground, formatHotkey, isMac, loadConfig, saveConfig, styleBgLayer, DEFAULT_HOTKEY } from "./config";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { autoCheckEnabled, checkUpdate, resetUpdateCache, setAutoCheckEnabled, UpdateInfo } from "./updater";
 import "./styles.css";
 
 let config: AppConfig;
@@ -457,55 +458,79 @@ async function initBackground() {
   applyBgDraftToSelfWindow();
 }
 
-// ---------- 更新 ----------
-async function checkUpdate() {
-  const btn = $<HTMLButtonElement>("#btn-check-update");
-  const infoEl = $("#update-version-info");
-  const wrap = $("#update-progress-wrap");
-  btn.disabled = true;
-  infoEl.textContent = "正在检查…";
-  wrap.style.display = "none";
-  try {
-    const update = await check();
-    if (!update) { infoEl.textContent = "已是最新版本"; return; }
-    infoEl.textContent = `发现新版本 v${update.version}`;
-    if (!confirm(`发现新版本 v${update.version}，是否下载并安装？`)) { infoEl.textContent = ""; return; }
+// ---------- 应用内更新 ----------
+const curVersionEl = $<HTMLElement>("#cur-version");
+const latestVersionEl = $<HTMLElement>("#latest-version");
+const updateStatusEl = $<HTMLElement>("#update-status");
+const updateNotesEl = $<HTMLElement>("#update-notes");
+const checkBtn = $<HTMLButtonElement>("#btn-check-update");
+const doUpdateBtn = $<HTMLButtonElement>("#btn-do-update");
+const doUpdateDirBtn = $<HTMLButtonElement>("#btn-do-update-dir");
+const relaunchBtn = $<HTMLButtonElement>("#btn-relaunch");
+const progressWrapEl = $<HTMLElement>("#update-progress");
+const progressBarEl = $<HTMLElement>("#update-progress-bar");
+const autoCheckEl = $<HTMLInputElement>("#auto-check-update");
+const installKindEl = $<HTMLElement>("#install-kind");
 
-    const isPortable = !window.location.href.includes("nsis");
-    const release = (update as unknown as { rawJson?: { assets?: { name: string; browser_download_url: string }[] } }).rawJson;
-    const assets = release?.assets ?? [];
-    const portableAsset = assets.find((a) => a.name.includes("portable") && a.name.endsWith(".exe"));
-    const nsisAsset = assets.find((a) => a.name.endsWith(".exe") && !a.name.includes("portable"));
+let pendingUpdate: UpdateInfo | null = null;
+// "installed" | "portable"，由 update_install_kind 探测（注册表卸载项）
+let installKind = "installed";
 
-    if (isPortable && portableAsset) {
-      await doPortableUpdate(portableAsset.browser_download_url, portableAsset.name, infoEl, wrap);
-    } else if (!isPortable && nsisAsset) {
-      await doInstallerUpdate(nsisAsset.browser_download_url, nsisAsset.name, infoEl, wrap);
-    } else {
-      infoEl.textContent = "未找到合适的更新文件";
+function showUpdateResult(info: UpdateInfo | null) {
+  doUpdateBtn.hidden = true;
+  doUpdateDirBtn.hidden = true;
+  relaunchBtn.hidden = true;
+  updateNotesEl.hidden = true;
+  if (info) {
+    latestVersionEl.textContent = `v${info.version}`;
+    pendingUpdate = info;
+    doUpdateBtn.hidden = false;
+    // 便携版额外提供「下载到其他目录」（得到另一个 exe，配置独立）
+    doUpdateDirBtn.hidden = installKind !== "portable";
+    if (info.notes.trim()) {
+      updateNotesEl.hidden = false;
+      updateNotesEl.textContent = info.notes;
     }
-  } catch (e) {
-    infoEl.textContent = `检查更新失败：${e}`;
-  } finally {
-    btn.disabled = false;
+  } else {
+    latestVersionEl.textContent = "已是最新";
+    pendingUpdate = null;
   }
 }
 
-async function downloadWithProgress(url: string, dest: string): Promise<void> {
-  const progressEl = $<HTMLProgressElement>("#update-progress");
-  const textEl = $("#update-progress-text");
-  const unlisten = await listen<{ downloaded: number; total: number }>("update-download-progress", (e) => {
-    const pct = e.payload.total > 0 ? Math.round((e.payload.downloaded / e.payload.total) * 100) : 0;
-    progressEl.value = pct;
-    textEl.textContent = `${pct}%`;
-  });
+async function runCheck(manual: boolean) {
+  checkBtn.disabled = true;
+  updateStatusEl.textContent = "正在检查…";
+  if (manual) resetUpdateCache();
   try {
-    await invoke("portable_update_download", { url, dest });
+    const info = await checkUpdate();
+    showUpdateResult(info);
+    updateStatusEl.textContent = info ? "发现新版本" : "已是最新版本";
+  } catch (e) {
+    updateStatusEl.textContent = `检查更新失败：${e}`;
   } finally {
-    unlisten();
+    checkBtn.disabled = false;
   }
 }
 
+checkBtn.addEventListener("click", () => runCheck(true));
+
+// 更新下载进度条：0-100%，未知总大小时显示不确定状态
+function setProgress(sent: number, total: number) {
+  progressWrapEl.hidden = false;
+  if (total > 0) {
+    progressBarEl.style.width = `${Math.round((sent / total) * 100)}%`;
+  } else {
+    progressBarEl.style.width = "30%";
+  }
+}
+
+function setBusy(on: boolean) {
+  checkBtn.disabled = on;
+  doUpdateBtn.disabled = on;
+  doUpdateDirBtn.disabled = on;
+}
+
+// 从 Release 的 sha256sums.txt 中取指定文件的哈希
 async function fetchSha256(url: string, fileName: string): Promise<string | null> {
   try {
     const text = await invoke<string>("http_get_text", { url });
@@ -517,47 +542,154 @@ async function fetchSha256(url: string, fileName: string): Promise<string | null
   return null;
 }
 
-async function doPortableUpdate(url: string, fileName: string, infoEl: HTMLElement, wrap: HTMLElement) {
-  wrap.style.display = "block";
-  infoEl.textContent = "正在下载更新…";
-  const [exePath, tempDir] = await invoke<[string, string]>("get_update_paths");
-  const dest = `${tempDir}\\${fileName}`;
-  await downloadWithProgress(url, dest);
+// 便携版：下载便携 exe → 校验 → （就地）替换重启 /（其他目录）下载完在资源管理器中显示
+async function portableUpdate(toOtherDir: boolean) {
+  if (!pendingUpdate) return;
+  setBusy(true);
+  try {
+    const dir = toOtherDir
+      ? await openDialog({ directory: true, title: "选择存放新版 速启.exe 的目录" })
+      : null;
+    if (toOtherDir && !dir) return;
+    const path = await invoke<string>("portable_update_begin", {
+      targetDir: (dir as string) ?? null,
+    });
+    const url = `https://github.com/duangdangding/ls_quick_start/releases/download/v${pendingUpdate.version}/suqi_v${pendingUpdate.version}_x64_portable.exe`;
+    updateStatusEl.textContent = "正在下载更新…";
+    const unlisten = await listen<{ sent: number; total: number }>(
+      "portable-update-progress",
+      (e) => setProgress(e.payload.sent, e.payload.total),
+    );
+    try {
+      await invoke("portable_update_download", { url, path });
+    } finally {
+      unlisten();
+    }
 
-  infoEl.textContent = "正在校验文件…";
-  const sha256Url = url.substring(0, url.lastIndexOf("/") + 1) + "sha256sums.txt";
-  const expected = await fetchSha256(sha256Url, fileName);
-  if (expected) {
-    const ok = await invoke<boolean>("portable_update_verify", { filePath: dest, expectedSha256: expected });
-    if (!ok) { infoEl.textContent = "校验失败，已中止更新"; return; }
+    // SHA-256 校验：防止下载损坏或被篡改
+    updateStatusEl.textContent = "正在校验文件…";
+    const sha256Url = url.substring(0, url.lastIndexOf("/") + 1) + "sha256sums.txt";
+    const fileName = url.substring(url.lastIndexOf("/") + 1);
+    const expected = await fetchSha256(sha256Url, fileName);
+    if (expected) {
+      const ok = await invoke<boolean>("portable_update_verify", { path, expectedSha256: expected });
+      if (!ok) { updateStatusEl.textContent = "SHA-256 校验不一致，文件可能损坏，请重试"; return; }
+    }
+
+    if (toOtherDir) {
+      progressWrapEl.hidden = true;
+      updateStatusEl.textContent = `已下载到所选目录，数据与原目录相互独立`;
+      await invoke("reveal_path", { path });
+      return;
+    }
+
+    // 就地更新：退出本程序，由辅助进程等待退出后替换 exe 并重启新版
+    updateStatusEl.textContent = "下载完成，正在替换并重启…";
+    await invoke("portable_update_apply", { newPath: path });
+  } catch (e) {
+    updateStatusEl.textContent = `更新失败：${e}`;
+  } finally {
+    setBusy(false);
   }
-
-  infoEl.textContent = "正在安装更新…";
-  await invoke("portable_update_apply", { exePath, newFile: dest });
 }
 
-async function doInstallerUpdate(url: string, fileName: string, infoEl: HTMLElement, wrap: HTMLElement) {
-  wrap.style.display = "block";
-  infoEl.textContent = "正在下载安装包…";
-  const [, tempDir] = await invoke<[string, string]>("get_update_paths");
-  const dest = `${tempDir}\\${fileName}`;
-  await downloadWithProgress(url, dest);
+// Windows 安装版：下载 NSIS 安装包到系统「下载」目录 → 校验 → 用户确认后运行安装程序
+async function installedUpdate() {
+  if (!pendingUpdate) return;
+  setBusy(true);
+  try {
+    const fileName = `suqi_${pendingUpdate.version}_x64-setup.exe`;
+    const path = await invoke<string>("installer_update_path", { filename: fileName });
+    const url = `https://github.com/duangdangding/ls_quick_start/releases/download/v${pendingUpdate.version}/${fileName}`;
+    updateStatusEl.textContent = "正在下载安装包…";
+    const unlisten = await listen<{ sent: number; total: number }>(
+      "portable-update-progress",
+      (e) => setProgress(e.payload.sent, e.payload.total),
+    );
+    try {
+      await invoke("portable_update_download", { url, path });
+    } finally {
+      unlisten();
+    }
 
-  infoEl.textContent = "正在校验文件…";
-  const sha256Url = url.substring(0, url.lastIndexOf("/") + 1) + "sha256sums.txt";
-  const expected = await fetchSha256(sha256Url, fileName);
-  if (expected) {
-    const ok = await invoke<boolean>("portable_update_verify", { filePath: dest, expectedSha256: expected });
-    if (!ok) { infoEl.textContent = "SHA-256 校验不一致，文件可能损坏，请重试"; return; }
-  }
+    updateStatusEl.textContent = "正在校验文件…";
+    const sha256Url = url.substring(0, url.lastIndexOf("/") + 1) + "sha256sums.txt";
+    const expected = await fetchSha256(sha256Url, fileName);
+    if (expected) {
+      const ok = await invoke<boolean>("portable_update_verify", { path, expectedSha256: expected });
+      if (!ok) { updateStatusEl.textContent = "SHA-256 校验不一致，文件可能损坏，请重试"; return; }
+    }
 
-  infoEl.textContent = "即将启动安装程序…";
-  if (confirm("下载完成，是否立即运行安装程序？")) {
-    await invoke("installer_update_run", { path: dest });
+    if (await confirm(`安装包已下载完成。\n\n点击「确定」将退出速启并运行安装程序；\n点击「取消」稍后可到下载文件夹手动运行。`)) {
+      await invoke("installer_update_run", { path });
+    } else {
+      updateStatusEl.textContent = `安装包已下载到「下载」文件夹：${fileName}，可稍后手动运行`;
+      await invoke("reveal_path", { path });
+    }
+  } catch (e) {
+    updateStatusEl.textContent = `更新失败：${e}`;
+  } finally {
+    setBusy(false);
   }
 }
 
-$("#btn-check-update").addEventListener("click", checkUpdate);
+doUpdateBtn.addEventListener("click", async () => {
+  if (!pendingUpdate) return;
+  if (installKind === "portable") return portableUpdate(false);
+  if (isMac) {
+    // macOS 走官方更新通道：updater 插件下载 signed bundle 并就地替换
+    setBusy(true);
+    try {
+      updateStatusEl.textContent = "正在下载更新…";
+      await pendingUpdate.update.downloadAndInstall((event) => {
+        if (event.event === "Started" && event.data.contentLength) {
+          progressWrapEl.hidden = false;
+        } else if (event.event === "Progress") {
+          progressBarEl.style.width = "50%";
+        } else if (event.event === "Finished") {
+          progressBarEl.style.width = "100%";
+        }
+      });
+      updateStatusEl.textContent = "更新已就绪，重启应用完成更新";
+      relaunchBtn.hidden = false;
+    } catch (e) {
+      updateStatusEl.textContent = `更新失败：${e}`;
+    } finally {
+      setBusy(false);
+    }
+    return;
+  }
+  await installedUpdate();
+});
+
+doUpdateDirBtn.addEventListener("click", () => portableUpdate(true));
+
+relaunchBtn.addEventListener("click", () => relaunch());
+
+autoCheckEl.checked = autoCheckEnabled();
+autoCheckEl.addEventListener("change", () => setAutoCheckEnabled(autoCheckEl.checked));
+
+async function initAboutTab() {
+  curVersionEl.textContent = `v${await getVersion()}`;
+  // 安装方式提示：便携版说明就地替换逻辑（配置/记录保留在同目录）
+  try {
+    installKind = await invoke<string>("update_install_kind");
+    if (installKind === "portable") {
+      installKindEl.hidden = false;
+      installKindEl.textContent =
+        "当前为绿色便携版：更新会下载到本程序所在目录，替换旧文件后自动重启，配置和启动项都保留在原目录。";
+    } else if (!isMac) {
+      installKindEl.hidden = false;
+      installKindEl.textContent =
+        "当前为安装版：更新会下载安装包并运行安装程序，装回原目录，桌面快捷方式不变。";
+    }
+  } catch { /* 非 Windows 平台忽略 */ }
+  // 自动检查（若主面板已查过会直接命中缓存，不重复请求）
+  if (latestVersionEl.textContent === "尚未检查") runCheck(false);
+}
+listen("open-update-tab", () => {
+  document.querySelector<HTMLButtonElement>('.tab[data-tab="about"]')?.click();
+});
 
 // ---------- 保存 ----------
 $("#btn-save").addEventListener("click", async () => {
@@ -612,5 +744,5 @@ $("#btn-save").addEventListener("click", async () => {
   initBackground().catch(() => { /* 背景源图读取失败不影响设置页其余功能 */ });
 
   // ---------- 关于 ----------
-  getVersion().then((v) => { $("#cur-version").textContent = v; });
+  initAboutTab();
 })();

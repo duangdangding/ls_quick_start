@@ -1,6 +1,6 @@
 [package]
 name = "suqi"
-version = "0.2.5"
+version = "0.2.6"
 description = "速启 - Windows 快捷启动器"
 authors = ["you"]
 edition = "2021"
@@ -32,3 +32,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tauri-plugin-updater = "2"
 ureq = "2"
 base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

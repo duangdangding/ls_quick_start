@@ -894,101 +894,199 @@ fn clear_background_image(state: State<'_, ConfigState>, app: tauri::AppHandle) 
     Ok(())
 }
 
-// ---------- 更新 ----------
+// ---------- 应用内更新 ----------
+// NSIS 安装版：把安装包流式下载到系统「下载」目录，校验 SHA-256 后由用户确认运行安装程序
+// （NSIS 会装回注册表记录的原目录）。
+// 绿色便携版：单文件 exe，配置/数据库都在 exe 同目录，不能装到别处——下载便携版 exe 到
+// 本目录 → 校验 SHA-256 → 退出后由辅助进程替换旧 exe 并重启。
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-struct UpdateInfo { version: String, url: String, notes: Option<String> }
-
+/// 判断当前是安装版还是便携版：注册表存在 NSIS 卸载项即为安装版
 #[tauri::command]
-fn http_get_text(url: String) -> Result<String, String> {
-    let resp = ureq::get(&url).call().map_err(|e| format!("请求失败：{e}"))?;
-    let mut body = String::new();
-    resp.into_reader().read_to_string(&mut body).map_err(|e| e.to_string())?;
-    Ok(body)
+fn update_install_kind() -> String {
+    #[cfg(target_family = "windows")]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        // NSIS 卸载项以产品名 / 应用标识符命名，逐个探测
+        for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            for key in ["速启", "suqi", "com.suqi.launcher"] {
+                let path =
+                    format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{key}");
+                if RegKey::predef(hive).open_subkey(&path).is_ok() {
+                    return "installed".to_string();
+                }
+            }
+        }
+        "portable".to_string()
+    }
+    #[cfg(not(target_family = "windows"))]
+    "installed".to_string()
 }
 
+/// 计算便携版 exe 的下载目标路径：默认 exe 同目录的 suqi_new.exe（等待替换）；
+/// 指定目录时为该目录下的 suqi.exe（用户选择「下载到其他目录」）
 #[tauri::command]
-fn portable_update_download(url: String, dest: String, app: tauri::AppHandle) -> Result<(), String> {
-    let resp = ureq::get(&url).call().map_err(|e| format!("下载失败：{e}"))?;
-    let total: u64 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mut reader = resp.into_reader();
-    let mut file = fs::File::create(&dest).map_err(|e| format!("创建文件失败：{e}"))?;
-    let mut buf = [0u8; 8192];
-    let mut downloaded: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 { break; }
-        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        downloaded += n as u64;
-        if total > 0 {
-            let _ = app.emit("update-download-progress", serde_json::json!({"downloaded": downloaded, "total": total}));
-        }
+fn portable_update_begin(target_dir: Option<String>) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_dir = exe.parent().ok_or("无法确定程序目录")?.to_path_buf();
+    let (dir, name) = match target_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => (PathBuf::from(d), "suqi.exe"),
+        None => (exe_dir, "suqi_new.exe"),
+    };
+    fs::create_dir_all(&dir).map_err(|e| format!("无法写入目录 {}：{e}", dir.display()))?;
+    let path = dir.join(name);
+    if path.exists() {
+        let _ = fs::remove_file(&path);
     }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 流式下载更新包到指定路径，进度通过 portable-update-progress 事件回传
+#[tauri::command]
+async fn portable_update_download(
+    app: tauri::AppHandle,
+    url: String,
+    path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resp = ureq::get(&url).call().map_err(|e| format!("下载失败：{e}"))?;
+        let total: u64 = resp
+            .header("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut reader = resp.into_reader();
+        let mut file = fs::File::create(&path).map_err(|e| format!("无法创建文件 {path}：{e}"))?;
+        let mut buf = [0u8; 65536];
+        let mut sent: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            sent += n as u64;
+            let _ = app.emit(
+                "portable-update-progress",
+                serde_json::json!({ "sent": sent, "total": total }),
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 拉取文本资源（用于读取 Release 的 sha256sums 校验文件）
+#[tauri::command]
+async fn http_get_text(url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ureq::get(&url)
+            .call()
+            .map_err(|e| format!("请求失败：{e}"))?
+            .into_string()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 校验下载文件的 SHA-256（与 Release 的 sha256sums 比对，防止下载损坏/被篡改）
+#[tauri::command]
+fn portable_update_verify(path: String, expected_sha256: String) -> Result<bool, String> {
+    let data = fs::read(&path).map_err(|e| format!("读取文件失败：{e}"))?;
+    let hash = hex::encode(Sha256::digest(&data));
+    Ok(hash.eq_ignore_ascii_case(expected_sha256.trim()))
+}
+
+/// 退出本进程，由辅助进程等待退出后替换 exe 并重启新版。
+/// 辅助进程 = 自身 exe 拷到 %TEMP% 的副本：GUI 子系统天然无控制台窗口。
+#[tauri::command]
+fn portable_update_apply(app: tauri::AppHandle, new_path: String) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let helper = std::env::temp_dir().join("suqi-updater.exe");
+    fs::copy(&exe, &helper).map_err(|e| format!("创建更新辅助程序失败：{e}"))?;
+    let mut cmd = Command::new(&helper);
+    cmd.arg("--apply-update").arg(&new_path).arg(&exe);
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
+    cmd.spawn().map_err(|e| format!("启动更新辅助程序失败：{e}"))?;
+    app.exit(0);
     Ok(())
 }
 
-#[tauri::command]
-fn portable_update_verify(file_path: String, expected_sha256: String) -> Result<bool, String> {
-    let data = fs::read(&file_path).map_err(|e| format!("读取文件失败：{e}"))?;
-    let hash = hex::encode(Sha256::digest(&data));
-    Ok(hash.eq_ignore_ascii_case(&expected_sha256.trim().to_lowercase()))
-}
-
-#[tauri::command]
-fn get_update_paths() -> Result<(String, String), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败：{e}"))?;
-    let temp = std::env::temp_dir();
-    Ok((exe.to_string_lossy().to_string(), temp.to_string_lossy().to_string()))
-}
-
-#[tauri::command]
-fn portable_update_apply(exe_path: String, new_file: String) -> Result<(), String> {
-    #[cfg(windows)] {
-        let temp_dir = std::env::temp_dir();
-        let helper = temp_dir.join("suqi-update-helper.exe");
-        fs::copy(&exe_path, &helper).map_err(|e| format!("复制更新助手失败：{e}"))?;
-        Command::new(&helper)
-            .args(["--apply-update", &exe_path, &new_file])
-            .spawn()
-            .map_err(|e| format!("启动更新助手失败：{e}"))?;
-        std::process::exit(0);
-    }
-    #[cfg(not(windows))] { Err("仅 Windows 支持".into()) }
-}
-
-fn apply_update_helper(exe_path: &str, new_file: &str) {
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let _ = fs::remove_file(exe_path);
-    let _ = fs::copy(new_file, exe_path);
-    let _ = fs::remove_file(new_file);
-    let _ = Command::new(exe_path).spawn();
-}
-
-fn is_update_mode() -> bool {
-    std::env::args().any(|a| a == "--apply-update")
-}
-
-fn handle_update_mode() {
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(idx) = args.iter().position(|a| a == "--apply-update") {
-        if args.len() > idx + 2 {
-            let exe_path = args[idx + 1].clone();
-            let new_file = args[idx + 2].clone();
-            apply_update_helper(&exe_path, &new_file);
-            std::process::exit(0);
+/// 便携版更新辅助进程入口：等旧进程退出（exe 文件锁释放）后用新 exe 覆盖旧 exe，再启动新版。
+/// 运行在 %TEMP% 的副本上，与替换的源/目标路径都不冲突。
+#[cfg(windows)]
+fn apply_update_helper(new_path: &str, old_path: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match fs::rename(new_path, old_path) {
+            Ok(_) => break,
+            // 旧进程尚未退出时目标 exe 被占用，rename 失败，稍候重试
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(400))
+            }
+            // 超时放弃：新 exe 保留在原位，用户可手动替换
+            Err(_) => return,
         }
     }
+    let mut cmd = Command::new(old_path);
+    if let Some(dir) = Path::new(old_path).parent() {
+        cmd.current_dir(dir);
+    }
+    let _ = cmd.spawn();
 }
 
+/// 安装包的下载目标路径：系统「下载」目录下的安装包文件
 #[tauri::command]
-fn installer_update_run(path: String) -> Result<(), String> {
-    #[cfg(windows)] {
-        Command::new("explorer.exe").arg(&path).spawn().map_err(|e| e.to_string())?;
-        std::process::exit(0);
+fn installer_update_path(filename: String) -> Result<String, String> {
+    let dir = dirs::download_dir().ok_or("找不到系统下载目录")?;
+    let path = dir.join(filename);
+    if path.exists() {
+        let _ = fs::remove_file(&path);
     }
-    #[cfg(not(windows))] { Err("仅 Windows 支持".into()) }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 运行下载好的 NSIS 安装包并退出本程序（安装程序装回原目录后会重启新版）
+#[tauri::command]
+fn installer_update_run(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    Command::new(&path).spawn().map_err(|e| format!("启动安装程序失败：{e}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+/// 在系统文件管理器中定位文件（Windows 选中文件；macOS 访达中显示）；传入目录时直接打开该目录
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err("文件不存在（可能已被移动或删除）".to_string());
+    }
+    let is_dir = p.is_dir();
+    #[cfg(target_family = "windows")]
+    {
+        let mut cmd = Command::new("explorer");
+        if is_dir {
+            cmd.arg(&path);
+        } else {
+            cmd.arg(format!("/select,{path}"));
+        }
+        cmd.spawn().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("open");
+        if !is_dir {
+            cmd.arg("-R");
+        }
+        cmd.arg(&path).spawn().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("当前平台不支持".to_string())
 }
 
 // ---------- 窗口控制 ----------
@@ -1120,7 +1218,17 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
 // ---------- 入口 ----------
 
 pub fn run() {
-    if is_update_mode() { handle_update_mode(); }
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        // 便携版更新辅助进程：--apply-update <新exe> <旧exe>，替换完即退，不进入 Tauri 初始化
+        if args.len() >= 4 && args[1] == "--apply-update" {
+            apply_update_helper(&args[2], &args[3]);
+            return;
+        }
+        // 正常启动时清理上次更新遗留的临时辅助程序副本（可能仍被占用，失败无碍）
+        let _ = std::fs::remove_file(std::env::temp_dir().join("suqi-updater.exe"));
+    }
 
     migrate_json_if_needed();
 
@@ -1166,7 +1274,8 @@ pub fn run() {
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
-            http_get_text, portable_update_download, portable_update_verify, portable_update_apply, installer_update_run, get_update_paths,
+            update_install_kind, portable_update_begin, portable_update_download, http_get_text,
+            portable_update_verify, portable_update_apply, installer_update_path, installer_update_run, reveal_path,
             open_settings_window, set_always_on_top
         ])
         .setup(move |app| {

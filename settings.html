@@ -196,25 +196,30 @@
         <div class="field">
           <h2>速启</h2>
           <p>Windows 快捷启动器</p>
-          <p>当前版本：<strong id="cur-version">-</strong></p>
+          <div class="db-info">
+            <div>当前版本：<code id="cur-version">-</code></div>
+            <div>最新版本：<code id="latest-version">尚未检查</code></div>
+          </div>
           <p>
-            <a href="https://github.com/" target="_blank" rel="noreferrer">GitHub 仓库</a>
+            <a href="https://github.com/duangdangding/ls_quick_start" target="_blank" rel="noreferrer">GitHub 仓库</a>
           </p>
         </div>
         <div class="field">
           <label>自动更新</label>
           <div class="row">
             <button id="btn-check-update" class="primary" type="button">检查更新</button>
-            <span id="update-version-info" style="color: var(--muted); font-size: 12px;"></span>
+            <button id="btn-do-update" class="primary" type="button" hidden>下载并安装</button>
+            <button id="btn-do-update-dir" type="button" hidden>下载到其他目录…</button>
+            <button id="btn-relaunch" class="primary" type="button" hidden>重启完成更新</button>
           </div>
-          <div id="update-progress-wrap" style="display:none;">
-            <div class="update-progress">
-              <progress id="update-progress" value="0" max="100"></progress>
-              <span id="update-progress-text">0%</span>
-            </div>
-            <div class="update-status" id="update-status"></div>
+          <p id="install-kind" hidden></p>
+          <div id="update-progress" class="update-progress" hidden>
+            <div id="update-progress-bar" class="update-progress-bar"></div>
           </div>
-          <small>检查到更新后可选择下载并安装，支持便携版自动替换和安装版下载安装包</small>
+          <p id="update-status"></p>
+          <p id="update-notes" hidden></p>
+          <label class="check"><input id="auto-check-update" type="checkbox" /> 启动时自动检查更新</label>
+          <small>更新包来自 GitHub Releases，下载后自动安装，无需再手动打开网页下载</small>
         </div>
       </section>
 

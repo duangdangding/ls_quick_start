@@ -1,7 +1,8 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig, saveConfig } from "./config";
+import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
 
 type Item = { id: string; name: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
@@ -275,3 +276,23 @@ listen<AppConfig>("config-changed", async (event) => {
     render();
   }
 });
+
+// ---------- 应用内更新：启动自动检查，发现新版在面板顶部显示横幅 ----------
+const updateBannerEl = document.createElement("div");
+updateBannerEl.id = "update-banner";
+updateBannerEl.className = "update-banner";
+updateBannerEl.hidden = true;
+updateBannerEl.innerHTML = `<span id="update-banner-text">发现新版本</span><button id="update-banner-btn" class="small" type="button">去更新</button>`;
+document.body.prepend(updateBannerEl);
+updateBannerEl.querySelector<HTMLButtonElement>("#update-banner-btn")!.onclick = async () => {
+  await invoke("open_settings_window");
+  await emit("open-update-tab");
+};
+if (autoCheckEnabled()) {
+  checkUpdate().then((info) => {
+    if (info) {
+      updateBannerEl.querySelector<HTMLSpanElement>("#update-banner-text")!.textContent = `发现新版本 v${info.version}`;
+      updateBannerEl.hidden = false;
+    }
+  });
+}
