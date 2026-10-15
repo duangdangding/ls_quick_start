@@ -633,8 +633,49 @@ fn scan_folder(dir: String, recursive: Option<bool>) -> Result<Vec<DesktopEntry>
     scan_dir(&path, recursive.unwrap_or(false))
 }
 
+/// 系统开始菜单目录（当前用户 + 所有用户），不存在的直接忽略
+fn start_menu_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(appdata) = dirs::data_dir() {
+        dirs.push(appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+    }
+    if let Ok(program_data) = std::env::var("ProgramData") {
+        dirs.push(PathBuf::from(program_data).join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+    }
+    dirs.retain(|dir| dir.is_dir());
+    dirs
+}
+
+/// 扫描系统开始菜单（当前用户 + 所有用户）
 #[tauri::command]
-fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id: Option<String>) -> Result<ImportResult, String> {
+fn scan_start_menu(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
+    let dirs = start_menu_dirs();
+    if dirs.is_empty() { return Err("未找到系统开始菜单目录".into()); }
+    let recursive = recursive.unwrap_or(false);
+    let mut entries = Vec::new();
+    for dir in dirs { entries.append(&mut scan_dir(&dir, recursive)?); }
+    entries.sort_by_key(|a| a.name.to_lowercase());
+    // 同一快捷方式可能同时存在于用户与全局开始菜单，按来源路径去重
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.source_path.to_lowercase()));
+    Ok(entries)
+}
+
+/// 取路径所在文件夹的名称，用于导入时「按文件夹名称分组」
+fn parent_folder_name(path: &str) -> Option<String> {
+    Path::new(path).parent()?.file_name().map(|name| name.to_string_lossy().to_string())
+}
+
+/// 按名称查找分组，不存在则新建并返回其 id
+fn group_id_by_name(store: &mut Store, name: &str) -> String {
+    if let Some(group) = store.groups.iter().find(|group| group.name == name) { return group.id.clone(); }
+    let group = Group { id: new_id(), name: name.to_string(), sort_order: store.groups.iter().map(|group| group.sort_order).max().unwrap_or(-1) + 1 };
+    store.groups.push(group.clone());
+    group.id
+}
+
+#[tauri::command]
+fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id: Option<String>, group_by_folder: bool) -> Result<ImportResult, String> {
     let shortcut_paths: Vec<PathBuf> = entries.iter().filter(|e| e.is_shortcut).map(|e| PathBuf::from(&e.source_path)).collect();
     let shortcut_targets = resolve_shortcuts(&shortcut_paths);
     let mut shortcut_index = 0;
@@ -642,12 +683,13 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut skipped_invalid = 0;
     for entry in entries {
         if entry.name.trim().is_empty() { skipped_invalid += 1; continue; }
+        let folder = parent_folder_name(&entry.source_path);
         let candidate = if entry.is_shortcut {
             let target = shortcut_targets.get(shortcut_index).cloned().unwrap_or_default();
             shortcut_index += 1; target
-        } else { entry.source_path };
+        } else { entry.source_path.clone() };
         match normalize_target(&candidate, false) {
-            Ok(target) => prepared.push((entry.name, target)),
+            Ok(target) => prepared.push((entry.name, target, folder)),
             Err(_) => skipped_invalid += 1,
         }
     }
@@ -656,9 +698,13 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut added = 0;
     let mut skipped_duplicates = 0;
     let mut order = store.items.iter().map(|item| item.sort_order).max().unwrap_or(-1) + 1;
-    for (name, target) in prepared {
+    for (name, target, folder) in prepared {
         if !known.insert(target.to_lowercase()) { skipped_duplicates += 1; continue; }
-        store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, group_id: group_id.clone(), is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now() });
+        // 勾选「按文件夹名称分组」时优先使用条目所在文件夹名（不存在则新建），取不到时回退到当前分组
+        let target_group = if group_by_folder {
+            folder.filter(|name| !name.trim().is_empty()).map(|name| group_id_by_name(&mut store, &name)).or_else(|| group_id.clone())
+        } else { group_id.clone() };
+        store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, group_id: target_group, is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now() });
         order += 1; added += 1;
     }
     persist(&data, &store)?;
@@ -1349,7 +1395,7 @@ pub fn run() {
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, open_item, create_group, rename_group,
-            delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop, scan_folder,
+            delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,

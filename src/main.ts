@@ -8,7 +8,8 @@ import "./styles.css";
 type Item = { id: string; name: string; keyword: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
 type Group = { id: string; name: string; sortOrder: number };
 type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null };
-type SortBy = "custom" | "name" | "created" | "type";
+type SortBy = "name" | "created" | "type";
+type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
 type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number };
 type ItemIcon = { id: string; iconPath: string | null };
@@ -43,10 +44,9 @@ const displayItems = () => {
     return activeGroup === "all" || item.groupId === activeGroup;
   });
   const matched = groupItems.filter((item) => !needle || fuzzyScore(item, needle) > -1);
-  return matched.sort((a, b) => sortBy === "name" ? a.name.localeCompare(b.name, "zh-CN")
-    : sortBy === "created" ? b.createdAt - a.createdAt
+  return matched.sort((a, b) => sortBy === "created" ? b.createdAt - a.createdAt
     : sortBy === "type" ? typeRank(a) - typeRank(b) || a.name.localeCompare(b.name, "zh-CN")
-    : a.sortOrder - b.sortOrder);
+    : a.name.localeCompare(b.name, "zh-CN"));
 };
 /** 类型排序用分组：0 命令、1 程序/快捷方式、2 文件、3 文件夹 */
 function typeRank(item: Item) {
@@ -139,10 +139,10 @@ function setViewMode(mode: ViewMode) {
 function render() {
   const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
   app.innerHTML = `<section class="shell">
-    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" /></label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
+    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
-    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option><option value="custom">自定义</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
-    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); return `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}" draggable="${sortBy === "custom"}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
+    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); return `<article class="card ${index === selected ? "selected" : ""}" data-id="${item.id}"><div class="icon">${itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div><button class="more" data-menu="${item.id}" title="更多">⋯</button></article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -171,12 +171,13 @@ function render() {
 function bindInteractions(shown: Item[]) {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((button) => button.onclick = () => void action(button.dataset.action!));
   document.querySelectorAll<HTMLElement>("[data-group]").forEach((tab) => { tab.onclick = () => { activeGroup = tab.dataset.group!; selected = 0; render(); }; tab.ondragstart = (event) => event.dataTransfer?.setData("group", tab.dataset.group!); tab.ondragover = (event) => event.preventDefault(); tab.ondrop = (event) => void reorderGroups(event, tab.dataset.group!); });
-  document.querySelectorAll<HTMLElement>(".card").forEach((card) => { card.onclick = (event) => { if ((event.target as HTMLElement).closest(".more")) return; selected = shown.findIndex((item) => item.id === card.dataset.id); render(); }; card.ondblclick = () => void openItem(card.dataset.id!); card.ondragstart = (event) => event.dataTransfer?.setData("item", card.dataset.id!); card.ondragover = (event) => event.preventDefault(); card.ondrop = (event) => void reorderItems(event, card.dataset.id!); });
+  document.querySelectorAll<HTMLElement>(".card").forEach((card) => { card.onclick = (event) => { if ((event.target as HTMLElement).closest(".more")) return; selected = shown.findIndex((item) => item.id === card.dataset.id); render(); }; card.ondblclick = () => void openItem(card.dataset.id!); });
   document.querySelectorAll<HTMLElement>("[data-menu]").forEach((button) => button.onclick = (event) => { event.stopPropagation(); showItemMenu(button.dataset.menu!, button); });
   document.querySelector("#grid")?.addEventListener("contextmenu", (event) => { if ((event.target as HTMLElement).closest(".card")) return; event.preventDefault(); openItemDialog(); });
 }
 async function action(type: string) {
   if (type === "add") openItemDialog();
+  if (type === "clear-search") { query = ""; searchSelection = null; selected = 0; render(); }
   if (type === "scan") await openScan();
   if (type === "groups") openGroupManager();
   if (type === "new-group") openGroupDialog();
@@ -218,23 +219,28 @@ function updateScanSelection(node: HTMLElement) {
   if (count) count.textContent = `已选 ${checked} / ${total}`;
 }
 async function openScan() {
-  const node = modal(`<h2>扫描导入</h2><p class="hint">默认扫描桌面，也可以选择其他文件夹；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
-    <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-recursive"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><button type="button" id="pick-folder">选择文件夹…</button></div></div>
+  const node = modal(`<h2>扫描导入</h2><p class="hint">默认扫描桌面，也可以选择其他文件夹或系统开始菜单；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
+    <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">系统开始菜单</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
     <div class="modal-actions"><button data-close>取消</button><button class="primary" id="import">导入已选</button></div>`);
-  const source = node.querySelector<HTMLElement>("#scan-source")!;
+  const sourceText = node.querySelector<HTMLElement>("#scan-source")!;
   const body = node.querySelector<HTMLElement>("#scan-body")!;
   const importButton = node.querySelector<HTMLButtonElement>("#import")!;
   const recursiveInput = node.querySelector<HTMLInputElement>("#scan-recursive")!;
-  let currentDir: string | null = null;
-  const refresh = async (dir: string | null) => {
-    currentDir = dir;
+  const groupByFolderInput = node.querySelector<HTMLInputElement>("#group-by-folder")!;
+  const describe = (src: ScanSource) => src.kind === "folder" ? src.dir : src.kind === "start-menu" ? "系统开始菜单" : "桌面";
+  let currentSource: ScanSource = { kind: "desktop" };
+  const refresh = async (source: ScanSource) => {
+    currentSource = source;
     importButton.disabled = true;
     body.innerHTML = `<p class="muted"><i class="loading-dot"></i>正在扫描…</p>`;
     const recursive = recursiveInput.checked;
-    try { scanning = await invoke<DesktopEntry[]>(dir ? "scan_folder" : "scan_desktop", dir ? { dir, recursive } : { recursive }); }
+    try {
+      scanning = source.kind === "folder" ? await invoke<DesktopEntry[]>("scan_folder", { dir: source.dir, recursive })
+        : await invoke<DesktopEntry[]>(source.kind === "start-menu" ? "scan_start_menu" : "scan_desktop", { recursive });
+    }
     catch (error) { body.innerHTML = ""; importButton.disabled = false; message(error); return; }
-    source.textContent = `来源：${dir ?? "桌面"}${recursive ? "（含子文件夹）" : ""}`;
+    sourceText.textContent = `来源：${describe(source)}${recursive ? "（含子文件夹）" : ""}`;
     const countByType = (type: DesktopEntry["entryType"]) => scanning.filter((entry) => entry.entryType === type).length;
     body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">清空</button></div></div>
       <div class="scan-list">${scanning.map((entry, index) => { const meta = scanMeta(entry); return `<label><input type="checkbox" value="${index}" data-type="${entry.entryType}" ${entry.isShortcut ? "checked" : ""}/><span><i class="scan-icon ${entry.entryType}">${scanIcon(entry)}</i>${escape(entry.name)}<em>${meta.label}</em></span><small>${escape(entry.target)}</small></label>`; }).join("") || "<p class=muted>该目录没有可导入的文件或目录</p>"}</div>`;
@@ -249,16 +255,18 @@ async function openScan() {
   };
   node.querySelector<HTMLButtonElement>("#pick-folder")!.onclick = async () => {
     const dir = await chooseFile({ directory: true, multiple: false });
-    if (typeof dir === "string") await refresh(dir);
+    if (typeof dir === "string") await refresh({ kind: "folder", dir });
   };
-  recursiveInput.onchange = () => { void refresh(currentDir); };
+  // 开始菜单层级较多，切换到该来源时默认勾选“扫描子文件夹”
+  node.querySelector<HTMLButtonElement>("#pick-start-menu")!.onclick = async () => { recursiveInput.checked = true; await refresh({ kind: "start-menu" }); };
+  recursiveInput.onchange = () => { void refresh(currentSource); };
   importButton.addEventListener("click", async () => {
     const selectedEntries = [...node.querySelectorAll<HTMLInputElement>(".scan-list input:checked")].map((input) => scanning[Number(input.value)]);
     if (!selectedEntries.length) { message("请至少选择一项"); return; }
     importButton.disabled = true; importButton.innerHTML = `<i class="loading-dot"></i>正在导入…`;
     node.querySelectorAll<HTMLButtonElement>("button").forEach((control) => { if (control !== importButton) control.disabled = true; });
     try {
-      const result = await invoke<ImportResult>("import_scanned", { entries: selectedEntries, groupId: selectedGroup() });
+      const result = await invoke<ImportResult>("import_scanned", { entries: selectedEntries, groupId: selectedGroup(), groupByFolder: groupByFolderInput.checked });
       node.remove(); await load();
       const skipped = result.skippedDuplicates + result.skippedInvalid;
       alert(`已导入 ${result.added} 项${skipped ? `；跳过重复 ${result.skippedDuplicates} 项、无效 ${result.skippedInvalid} 项。` : "。"}`);
@@ -268,9 +276,8 @@ async function openScan() {
       message(error);
     }
   });
-  await refresh(null);
+  await refresh(currentSource);
 }
-async function reorderItems(event: DragEvent, targetId: string) { event.preventDefault(); if (sortBy !== "custom") return; const sourceId = event.dataTransfer?.getData("item"); if (!sourceId || sourceId === targetId) return; const visible = displayItems(); const from = visible.findIndex((item) => item.id === sourceId); const to = visible.findIndex((item) => item.id === targetId); if (from < 0 || to < 0) return; visible.splice(to, 0, visible.splice(from, 1)[0]); try { await invoke("save_item_order", { ids: visible.map((item) => item.id) }); await load(); } catch (error) { message(error); } }
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
 window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
