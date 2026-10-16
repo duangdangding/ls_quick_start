@@ -5,7 +5,7 @@ import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, i
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
 
-type Item = { id: string; name: string; keyword: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
+type Item = { id: string; name: string; keyword: string; description: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
 type Group = { id: string; name: string; sortOrder: number };
 type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
 type SortBy = "relevance" | "name" | "created" | "type";
@@ -65,20 +65,27 @@ function typeRank(item: Item) {
   return (target.split(/[\\/]/).pop() ?? "").includes(".") ? 2 : 3;
 }
 /**
- * 搜索匹配打分（越大越靠前），按匹配质量分档：
- * 3 名称 / 关键字以关键字开头 > 2 拼音以关键字开头 > 1 名称 / 关键字中间包含 > 0 子序列命中；
- * 同一档内命中位置越靠前分越高。未命中返回 -1（调用方据此过滤）。
+ * 搜索匹配打分（越大越靠前）：关键字（含拼音）优先于名称（含拼音）。
+ * 关键字命中统一加上大偏移，保证任何关键字命中都排在名称命中之前；同组内按匹配质量分档：
+ * 3 以关键字开头 > 2 拼音以关键字开头 > 1 中间包含 > 0 子序列命中；未命中返回 -1（调用方据此过滤）。
  */
+const KEYWORD_BONUS = 10000;
 function fuzzyScore(item: Item, needle: string) {
   const extra = item as Item & { fullPinyin?: string; initials?: string; keywordFullPinyin?: string; keywordInitials?: string };
-  const fields: { value: string; tier: number }[] = [
-    { value: item.name.toLowerCase(), tier: 3 },
+  const keywordScore = bestFieldScore([
     { value: item.keyword.toLowerCase(), tier: 3 },
-    { value: extra.fullPinyin?.toLowerCase() ?? "", tier: 2 },
-    { value: extra.initials?.toLowerCase() ?? "", tier: 2 },
     { value: extra.keywordFullPinyin?.toLowerCase() ?? "", tier: 2 },
     { value: extra.keywordInitials?.toLowerCase() ?? "", tier: 2 },
-  ];
+  ], needle);
+  if (keywordScore > -1) return KEYWORD_BONUS + keywordScore;
+  return bestFieldScore([
+    { value: item.name.toLowerCase(), tier: 3 },
+    { value: extra.fullPinyin?.toLowerCase() ?? "", tier: 2 },
+    { value: extra.initials?.toLowerCase() ?? "", tier: 2 },
+  ], needle);
+}
+/** 取多个字段中的最高匹配分：完全包含时按「是否开头 + 分档」计分，否则退回子序列匹配 */
+function bestFieldScore(fields: { value: string; tier: number }[], needle: string) {
   let best = -1;
   for (const { value, tier } of fields) {
     if (!value) continue;
@@ -138,7 +145,7 @@ async function load() {
   items.forEach((item) => { if (!item.iconPath) item.iconPath = iconMap.get(item.id) ?? null; });
   groups = data.groups; passwordSet = data.passwordSet;
   if (!fixedGroups().some((group) => group.id === activeGroup)) activeGroup = "all";
-  render();
+  render(true);
 }
 function itemIcon(item: Item) {
   if (item.iconPath) return `<img src="${escape(convertFileSrc(item.iconPath))}" alt="" />`;
@@ -164,7 +171,10 @@ function setViewMode(mode: ViewMode) {
   }
   render();
 }
-function render() {
+/** 重绘面板；keepScroll 为 true 时保留列表滚动位置（点击 / 方向键切换选中项、多选勾选等不改变内容的重绘不跳回顶部） */
+function render(keepScroll = false) {
+  hideTip();
+  const scrollTop = keepScroll ? document.querySelector<HTMLElement>("#grid")?.scrollTop ?? 0 : 0;
   const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
   app.innerHTML = `<section class="shell">
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
@@ -188,7 +198,7 @@ function render() {
       const width = arrowColumns();
       const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width;
       selected = (selected + delta + shownItems.length) % shownItems.length;
-      render();
+      render(true);
     }
   });
   input.focus();
@@ -196,7 +206,30 @@ function render() {
   document.querySelector<HTMLSelectElement>("#sort")!.value = sortBy;
   document.querySelector<HTMLSelectElement>("#sort")!.onchange = (event) => { sortBy = (event.target as HTMLSelectElement).value as SortBy; render(); };
   document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => button.onclick = () => setViewMode(button.dataset.view as ViewMode));
+  // 重建 DOM 会把列表滚动位置清零，放在最后恢复，避免聚焦搜索框等操作再次影响滚动
+  if (scrollTop) document.querySelector<HTMLElement>("#grid")!.scrollTop = scrollTop;
   bindInteractions(shown);
+}
+/**
+ * 条目悬停提示：卡片正文受宽度限制会截断名称，鼠标移入时用气泡展示完整名称与说明。
+ * 全局单例，移开 / 列表滚动 / 重绘时销毁。
+ */
+let tipNode: HTMLElement | null = null;
+function hideTip() { tipNode?.remove(); tipNode = null; }
+function showTip(card: HTMLElement, item: Item) {
+  hideTip();
+  const node = document.createElement("div");
+  node.className = "tip";
+  node.innerHTML = `<b>${escape(item.name)}</b>${item.description ? `<span>${escape(item.description)}</span>` : ""}`;
+  document.body.append(node);
+  tipNode = node;
+  const box = card.getBoundingClientRect();
+  const size = node.getBoundingClientRect();
+  // 优先显示在卡片下方，空间不足时翻到上方；左右做视口边界钳制
+  const below = box.bottom + 6;
+  const top = below + size.height > window.innerHeight - 8 ? box.top - size.height - 6 : below;
+  node.style.left = `${Math.min(Math.max(8, box.left), Math.max(8, window.innerWidth - size.width - 8))}px`;
+  node.style.top = `${Math.max(8, top)}px`;
 }
 function bindInteractions(shown: Item[]) {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((button) => button.onclick = () => void action(button.dataset.action!));
@@ -205,15 +238,19 @@ function bindInteractions(shown: Item[]) {
     card.onclick = (event) => {
       if ((event.target as HTMLElement).closest(".more")) return;
       // 多选模式下点击卡片切换勾选，不移动键盘光标
-      if (selectMode) { const id = card.dataset.id!; if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id); render(); return; }
+      if (selectMode) { const id = card.dataset.id!; if (selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id); render(true); return; }
       // 已选中的条目再次点击名称区域：直接进入内联改名
       if (card.dataset.id === shown[selected]?.id && (event.target as HTMLElement).closest(".card-text b")) { renameItemInline(card.dataset.id!); return; }
-      selected = shown.findIndex((item) => item.id === card.dataset.id); render();
+      selected = shown.findIndex((item) => item.id === card.dataset.id); render(true);
     };
     card.ondblclick = (event) => { if (selectMode || (event.target as HTMLElement).closest(".card-text b")) return; void openItem(card.dataset.id!); };
+    card.onmouseenter = () => { const item = shown.find((target) => target.id === card.dataset.id); if (item) showTip(card, item); };
+    card.onmouseleave = hideTip;
   });
   document.querySelectorAll<HTMLElement>("[data-menu]").forEach((button) => button.onclick = (event) => { event.stopPropagation(); showItemMenu(button.dataset.menu!, button); });
   document.querySelector("#grid")?.addEventListener("contextmenu", (event) => { if ((event.target as HTMLElement).closest(".card")) return; event.preventDefault(); openItemDialog(); });
+  // 滚动时卡片位置变化，悬停提示会错位，直接隐藏
+  document.querySelector("#grid")?.addEventListener("scroll", hideTip);
 }
 async function action(type: string) {
   if (type === "add") openItemDialog();
@@ -222,10 +259,10 @@ async function action(type: string) {
   if (type === "groups") openGroupManager();
   if (type === "new-group") openGroupDialog();
   if (type === "password") openPasswordDialog();
-  if (type === "select-mode") { selectMode = !selectMode; selectedIds.clear(); render(); }
-  if (type === "select-all") { displayItems().forEach((item) => selectedIds.add(item.id)); render(); }
-  if (type === "select-invert") { displayItems().forEach((item) => selectedIds.has(item.id) ? selectedIds.delete(item.id) : selectedIds.add(item.id)); render(); }
-  if (type === "select-none") { selectedIds.clear(); render(); }
+  if (type === "select-mode") { selectMode = !selectMode; selectedIds.clear(); render(true); }
+  if (type === "select-all") { displayItems().forEach((item) => selectedIds.add(item.id)); render(true); }
+  if (type === "select-invert") { displayItems().forEach((item) => selectedIds.has(item.id) ? selectedIds.delete(item.id) : selectedIds.add(item.id)); render(true); }
+  if (type === "select-none") { selectedIds.clear(); render(true); }
   if (type === "delete-items") await deleteSelectedItems();
   if (type === "move-items") openMoveDialog([...selectedIds]);
   if (type === "settings") {
@@ -239,10 +276,10 @@ async function action(type: string) {
 }
 async function openItem(id: string) {
   if (opening) return;
-  opening = true; render();
+  opening = true; render(true);
   try { await invoke("open_item", { id, unlocked }); }
   catch (error) { message(error); }
-  finally { opening = false; render(); }
+  finally { opening = false; render(true); }
 }
 function modal(content: string) {
   const node = document.createElement("div");
@@ -262,14 +299,27 @@ function modal(content: string) {
   });
   return node;
 }
+/**
+ * 应用内确认弹窗：WebView 中的 window.confirm 不会等待用户点击就返回（导致未确认即执行删除），
+ * 故统一改用弹窗确认；点击取消 / 遮罩 / Esc 关闭都返回 false。
+ */
+function confirmDialog(text: string, okLabel = "删除") {
+  return new Promise<boolean>((resolve) => {
+    const node = modal(`<h2>确认操作</h2><p class="hint">${escape(text)}</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="danger" id="confirm-ok">${escape(okLabel)}</button></div>`);
+    // 遮罩 / Esc 关闭由 modal 内部处理，这里监听节点被移除来兜底返回 false
+    const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(false); } });
+    observer.observe(document.body, { childList: true });
+    node.querySelector<HTMLButtonElement>("#confirm-ok")!.onclick = () => { observer.disconnect(); node.remove(); resolve(true); };
+  });
+}
 function selectedGroup() { return activeGroup === "all" || activeGroup === "none" ? null : activeGroup; }
 function openItemDialog(item?: Item) {
-  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
+  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>说明（可选）<input name="description" value="${escape(item?.description ?? "")}" placeholder="备注信息，鼠标悬停条目时显示" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
   node.querySelector<HTMLButtonElement>("#pick")!.onclick = async () => { const path = await chooseFile({ directory: false, multiple: false }); if (typeof path === "string") (form.elements.namedItem("target") as HTMLInputElement).value = path; };
   node.querySelector<HTMLButtonElement>("#pick-icon")!.onclick = async () => { const path = await chooseFile({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "ico", "svg"] }] }); if (typeof path === "string") (form.elements.namedItem("icon") as HTMLInputElement).value = path; };
-  form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
+  form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", description: values.get("description") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
 }
-function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button data-move>移动到分组</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); menu.style.left = `${box.left - 100}px`; menu.style.top = `${box.bottom + 4}px`; menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-move]")!.addEventListener("click", () => { menu.remove(); const item = items.find((target) => target.id === id); if (item) openMoveDialog([id], item.groupId); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { if (!confirm("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); menu.remove(); await load(); } catch (error) { message(error); } }); }
+function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button data-move>移动到分组</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); menu.style.left = `${box.left - 100}px`; menu.style.top = `${box.bottom + 4}px`; menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-move]")!.addEventListener("click", () => { menu.remove(); const item = items.find((target) => target.id === id); if (item) openMoveDialog([id], item.groupId); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { menu.remove(); if (!await confirmDialog("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); await load(); } catch (error) { message(error); } }); }
 /** 点击已选中条目的名称：在卡片内直接把名称换成输入框，失焦 / 回车保存，Esc 取消 */
 function renameItemInline(id: string) {
   const item = items.find((target) => target.id === id);
@@ -306,7 +356,7 @@ function renameItemInline(id: string) {
 async function deleteSelectedItems() {
   const ids = [...selectedIds];
   if (!ids.length) return;
-  if (!confirm(`确认删除选中的 ${ids.length} 个启动项？`)) return;
+  if (!await confirmDialog(`确认删除选中的 ${ids.length} 个启动项？`)) return;
   try { await invoke("delete_items", { ids }); selectedIds.clear(); await load(); }
   catch (error) { message(error); }
 }
@@ -532,7 +582,7 @@ async function openScan() {
   await refresh(currentSource);
 }
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
-window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
+window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
 listen("panel-shown", () => { void load(); });

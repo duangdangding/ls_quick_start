@@ -15,6 +15,56 @@ const markDirty = () => { $("#save-msg").textContent = "有未保存的修改"; 
 // 默认数据目录：Windows 为程序（exe）目录，macOS 为 ~/Library/Application Support
 const defaultDirLabel = isMac ? "应用支持目录" : "程序目录";
 
+// ---------- 应用内弹窗 ----------
+// WebView 中原生 confirm / alert 不会阻塞等待用户点击（对话框刚显示代码就继续执行），故统一改用 DOM 弹窗
+const escapeHtml = (text: string) => text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
+
+/** 创建遮罩弹窗；点击 [data-close] 元素或遮罩空白处关闭 */
+function overlay(html: string) {
+  const node = document.createElement("div");
+  node.className = "overlay";
+  node.innerHTML = `<div class="modal">${html}</div>`;
+  document.body.append(node);
+  // 仅当鼠标「按下」与「松开」都落在遮罩空白处时才关闭，避免在弹窗内按下、拖到遮罩上松开时误关闭
+  let pressedOnBackdrop = false;
+  node.addEventListener("mousedown", (event) => { pressedOnBackdrop = event.target === node; });
+  node.addEventListener("mouseup", (event) => { if (event.target !== node) pressedOnBackdrop = false; });
+  node.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.dataset.close !== undefined) { node.remove(); return; }
+    if (target === node && pressedOnBackdrop) node.remove();
+    pressedOnBackdrop = false;
+  });
+  return node;
+}
+
+/** 确认框：点确定返回 true；取消 / 点遮罩 / Esc 关闭返回 false */
+function confirmDialog(text: string, okLabel = "确定", danger = false) {
+  return new Promise<boolean>((resolve) => {
+    const node = overlay(`<h2>确认操作</h2><p class="hint">${escapeHtml(text).replace(/\n/g, "<br>")}</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="${danger ? "danger" : "primary"}" id="confirm-ok">${escapeHtml(okLabel)}</button></div>`);
+    // 遮罩 / Esc 关闭时节点被移除，监听节点被移除兜底返回 false
+    const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(false); } });
+    observer.observe(document.body, { childList: true });
+    node.querySelector<HTMLButtonElement>("#confirm-ok")!.onclick = () => { observer.disconnect(); node.remove(); resolve(true); };
+  });
+}
+
+/** 提示框：替代原生 alert，点确定 / 点遮罩 / Esc 关闭 */
+function alertDialog(text: string) {
+  return new Promise<void>((resolve) => {
+    const node = overlay(`<h2>提示</h2><p class="hint">${escapeHtml(text).replace(/\n/g, "<br>")}</p><div class="modal-actions"><button class="primary" data-close>知道了</button></div>`);
+    const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(); } });
+    observer.observe(document.body, { childList: true });
+  });
+}
+
+// Esc 关闭最上层的弹窗
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  const overlays = document.querySelectorAll<HTMLElement>(".overlay");
+  overlays[overlays.length - 1]?.remove();
+});
+
 // ---------- tab 切换 ----------
 document.querySelectorAll<HTMLButtonElement>(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -98,17 +148,17 @@ async function refreshConfigDir() { $("#config-dir").textContent = await invoke<
 $("#btn-change-config-dir").addEventListener("click", async () => {
   const path = await openDialog({ directory: true, title: "选择配置文件目录" });
   if (!path || typeof path !== "string") return;
-  const action = confirm("是否将现有配置文件移动到新目录？\n确定=移动文件，取消=仅修改路径") ? "move" : "keep";
+  const action = (await confirmDialog("是否将现有配置文件移动到新目录？\n确定=移动文件，取消=仅修改路径", "移动文件")) ? "move" : "keep";
   await invoke("set_data_dirs", { configDir: path, dbDir: null, action });
   await refreshConfigDir();
-  alert("配置目录已更改，重启应用后生效");
+  await alertDialog("配置目录已更改，重启应用后生效");
 });
 
 $("#btn-reset-config-dir").addEventListener("click", async () => {
-  if (!confirm(`确定恢复默认配置目录（${defaultDirLabel}）？`)) return;
+  if (!await confirmDialog(`确定恢复默认配置目录（${defaultDirLabel}）？`, "恢复默认", true)) return;
   await invoke("set_data_dirs", { configDir: null, dbDir: null, action: "reset" });
   await refreshConfigDir();
-  alert("配置目录已恢复默认，重启应用后生效");
+  await alertDialog("配置目录已恢复默认，重启应用后生效");
 });
 
 // ---------- 数据库 ----------
@@ -117,19 +167,19 @@ async function refreshDbDir() { $("#db-dir").textContent = await invoke<string>(
 $("#btn-change-db-dir").addEventListener("click", async () => {
   const path = await openDialog({ directory: true, title: "选择数据库目录" });
   if (!path || typeof path !== "string") return;
-  const action = confirm("是否将现有数据库文件移动到新目录？\n确定=移动文件，取消=仅修改路径") ? "move" : "keep";
+  const action = (await confirmDialog("是否将现有数据库文件移动到新目录？\n确定=移动文件，取消=仅修改路径", "移动文件")) ? "move" : "keep";
   await invoke("set_data_dirs", { configDir: null, dbDir: path, action });
   await refreshDbDir();
   await refreshDbInfo();
-  alert("数据库目录已更改，重启应用后生效");
+  await alertDialog("数据库目录已更改，重启应用后生效");
 });
 
 $("#btn-reset-db-dir").addEventListener("click", async () => {
-  if (!confirm(`确定恢复默认数据库目录（${defaultDirLabel}）？`)) return;
+  if (!await confirmDialog(`确定恢复默认数据库目录（${defaultDirLabel}）？`, "恢复默认", true)) return;
   await invoke("set_data_dirs", { configDir: null, dbDir: null, action: "reset" });
   await refreshDbDir();
   await refreshDbInfo();
-  alert("数据库目录已恢复默认，重启应用后生效");
+  await alertDialog("数据库目录已恢复默认，重启应用后生效");
 });
 
 async function refreshDbInfo() {
@@ -282,7 +332,7 @@ bgEnabledEl.addEventListener("change", async () => {
     config.background = bg;
     await invoke("show_panel");
   } catch (e) {
-    alert(`切换背景开关失败: ${e}`);
+    await alertDialog(`切换背景开关失败: ${e}`);
   }
 });
 
@@ -307,12 +357,12 @@ bgPickBtn.addEventListener("click", async () => {
     syncBgControls();
     rebakeBgPreview();
   } catch (e) {
-    alert(`选择背景图失败: ${e}`);
+    await alertDialog(`选择背景图失败: ${e}`);
   }
 });
 
 bgClearBtn.addEventListener("click", async () => {
-  if (!confirm("确定清除面板背景图？")) return;
+  if (!await confirmDialog("确定清除面板背景图？", "清除", true)) return;
   try {
     await invoke("clear_background_image");
     bgDraft = defaultBackground();
@@ -324,7 +374,7 @@ bgClearBtn.addEventListener("click", async () => {
     syncBgControls();
     applyBgDraftToSelfWindow();
   } catch (e) {
-    alert(`清除背景失败: ${e}`);
+    await alertDialog(`清除背景失败: ${e}`);
   }
 });
 
@@ -421,7 +471,7 @@ window.addEventListener("mouseup", () => {
 bgApplyBtn.addEventListener("click", async () => {
   const c = bakeBackground(1600);
   if (!c) {
-    alert("请先选择图片");
+    await alertDialog("请先选择图片");
     return;
   }
   bgApplyBtn.disabled = true;
@@ -435,7 +485,7 @@ bgApplyBtn.addEventListener("click", async () => {
     syncBgControls();
     await invoke("show_panel");
   } catch (e) {
-    alert(`应用背景失败: ${e}`);
+    await alertDialog(`应用背景失败: ${e}`);
   } finally {
     bgApplyBtn.disabled = false;
   }
@@ -621,7 +671,7 @@ async function installedUpdate() {
       if (!ok) { updateStatusEl.textContent = "SHA-256 校验不一致，文件可能损坏，请重试"; return; }
     }
 
-    if (await confirm(`安装包已下载完成。\n\n点击「确定」将退出速启并运行安装程序；\n点击「取消」稍后可到下载文件夹手动运行。`)) {
+    if (await confirmDialog("安装包已下载完成。\n\n点击「退出并安装」将退出速启并运行安装程序；\n点击「取消」稍后可到下载文件夹手动运行。", "退出并安装")) {
       await invoke("installer_update_run", { path });
     } else {
       updateStatusEl.textContent = `安装包已下载到「下载」文件夹：${fileName}，可稍后手动运行`;
@@ -712,7 +762,7 @@ $("#btn-save").addEventListener("click", async () => {
     setTimeout(() => { $("#save-msg").textContent = ""; }, 2000);
     refreshConfigDir();
   } catch (e) {
-    alert(String(e));
+    await alertDialog(String(e));
   }
 });
 

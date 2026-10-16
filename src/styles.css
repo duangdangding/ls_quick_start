@@ -146,6 +146,11 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .update-progress-bar { height: 100%; width: 0; border-radius: 3px; background: var(--blue); transition: width 0.2s ease; }
 .update-status { color: var(--muted); font-size: 12px; margin-top: 6px; }
 
+/* ---------- 条目悬停提示：完整名称 + 说明 ---------- */
+.tip { position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 3px; max-width: 320px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 6px 18px rgba(0,0,0,.18); color: var(--text); font-size: 12px; line-height: 1.45; pointer-events: none; word-break: break-word; }
+.tip b { font-size: 13px; font-weight: 600; }
+.tip span { color: var(--muted); white-space: pre-wrap; }
+
 /* ---------- 搜索命中高亮 ---------- */
 /* 命中字符用 <mark> 标出；颜色取「高亮颜色」（空 = 跟随主题强调色） */
 .card-text b mark {
@@ -199,6 +204,8 @@ button.small { padding: 3px 8px; font-size: 12px; }
 }
 :root[data-effect]:not([data-effect="default"]) .search { background: var(--surface-glass); }
 :root[data-effect]:not([data-effect="default"]) .modal { background: color-mix(in srgb, var(--bg-glass) 88%, transparent); }
+/* 窗口效果下 --surface 为半透明，悬停提示需要不透明背景才看得清 */
+:root[data-effect]:not([data-effect="default"]) .tip { background: var(--bg); }
 
 /* ---------- 设置页：背景图预览与选区编辑器 ---------- */
 .bg-preview {
