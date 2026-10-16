@@ -603,6 +603,9 @@ struct DesktopEntry {
     scan_icon_path: Option<String>,
     /// 条目所在文件夹名称（用于扫描结果页展示）
     folder_name: Option<String>,
+    /// 条目相对扫描根目录的路径分段（含条目自身名称），用于扫描结果树状展示
+    #[serde(default)]
+    rel_path: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -638,6 +641,9 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
             let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
             let source_path = display_path(path.display().to_string());
             let folder_name = parent_folder_name(&source_path);
+            let rel_path: Vec<String> = path.strip_prefix(dir)
+                .map(|relative| relative.components().map(|part| part.as_os_str().to_string_lossy().to_string()).collect())
+                .unwrap_or_default();
             let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
             let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
             if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
@@ -649,6 +655,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
                 entry_type: entry_type.into(),
                 scan_icon_path: None,
                 folder_name,
+                rel_path,
             });
         }
     }

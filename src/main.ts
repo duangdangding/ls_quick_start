@@ -7,7 +7,7 @@ import "./styles.css";
 
 type Item = { id: string; name: string; keyword: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
 type Group = { id: string; name: string; sortOrder: number };
-type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null };
+type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
 type SortBy = "name" | "created" | "type";
 type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
@@ -309,17 +309,83 @@ function openClearEncryptedConfirm(parent: HTMLElement) {
 const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: "快捷方式", icon: "↗" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
 function scanIcon(entry: DesktopEntry) { return entry.scanIconPath ? `<img src="${escape(convertFileSrc(entry.scanIconPath))}" alt="" />` : scanMeta(entry).icon; }
 function updateScanSelection(node: HTMLElement) {
-  const checked = node.querySelectorAll<HTMLInputElement>(".scan-items input:checked").length;
-  const total = node.querySelectorAll<HTMLInputElement>(".scan-items input").length;
+  const checked = node.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked").length;
+  const total = node.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").length;
   const count = node.querySelector<HTMLElement>("#scan-count");
   if (count) count.textContent = `已选 ${checked} / ${total}`;
 }
-/** 渲染扫描结果列表（卡片 / 列表两种布局共用，外层 class 控制形态） */
-function renderScanEntries(entries: DesktopEntry[]) {
-  return entries.map((entry, index) => { const meta = scanMeta(entry); const folder = entry.folderName ? `<i class="scan-folder" title="所在文件夹">▰ ${escape(entry.folderName)}</i>` : ""; return `<label><input type="checkbox" value="${index}" data-type="${entry.entryType}" ${entry.isShortcut ? "checked" : ""}/><i class="scan-icon ${entry.entryType}">${scanIcon(entry)}</i><span class="scan-name">${escape(entry.name)}<em>${meta.label}</em>${folder}</span><small>${escape(entry.target)}</small></label>`; }).join("") || "<p class=muted>该目录没有可导入的文件或目录</p>";
+/** 渲染扫描结果（卡片 / 列表两种扁平布局共用，外层 class 控制形态） */
+function renderScanEntries(entries: DesktopEntry[], chosen: Set<number>) {
+  return entries.map((entry, index) => { const meta = scanMeta(entry); const folder = entry.folderName ? `<i class="scan-folder" title="所在文件夹">▰ ${escape(entry.folderName)}</i>` : ""; return `<label><input type="checkbox" class="scan-entry" value="${index}" data-type="${entry.entryType}" ${chosen.has(index) ? "checked" : ""}/><i class="scan-icon ${entry.entryType}">${scanIcon(entry)}</i><span class="scan-name">${escape(entry.name)}<em>${meta.label}</em>${folder}</span><small>${escape(entry.target)}</small></label>`; }).join("") || "<p class=muted>该目录没有可导入的文件或目录</p>";
+}
+/** 扫描结果树节点：children 为子目录，files 为当前目录下的文件 / 快捷方式索引 */
+type ScanTreeNode = { name: string; folderIndex: number | null; children: ScanTreeNode[]; files: number[] };
+/** 按相对路径把扫描结果组织成目录树 */
+function buildScanTree(entries: DesktopEntry[]) {
+  const root: ScanTreeNode = { name: "", folderIndex: null, children: [], files: [] };
+  const dirs = new Map<string, ScanTreeNode>();
+  const openDir = (segments: string[]) => {
+    let current = root; let key = "";
+    for (const segment of segments) {
+      key = key ? `${key}/${segment}` : segment;
+      let child = dirs.get(key);
+      if (!child) { child = { name: segment, folderIndex: null, children: [], files: [] }; dirs.set(key, child); current.children.push(child); }
+      current = child;
+    }
+    return current;
+  };
+  entries.forEach((entry, index) => {
+    const segments = entry.relPath?.length ? entry.relPath : [entry.name];
+    if (entry.entryType === "folder") openDir(segments).folderIndex = index;
+    else openDir(segments.slice(0, -1)).files.push(index);
+  });
+  return root;
+}
+/** 渲染树状扫描结果：目录层级缩进，节点默认展开 */
+function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel: string) {
+  if (!entries.length) return "<p class=muted>该目录没有可导入的文件或目录</p>";
+  const sortByName = (list: number[]) => [...list].sort((a, b) => entries[a].name.localeCompare(entries[b].name, "zh"));
+  const renderNode = (treeNode: ScanTreeNode, isRoot = false): string => {
+    const children = [...treeNode.children].sort((a, b) => a.name.localeCompare(b.name, "zh"));
+    const folderIndex = treeNode.folderIndex;
+    const entry = folderIndex === null ? null : entries[folderIndex];
+    const box = entry
+      ? `<input type="checkbox" class="scan-entry" value="${folderIndex}" data-type="${entry.entryType}" ${chosen.has(folderIndex!) ? "checked" : ""}/>`
+      : `<input type="checkbox" class="scan-folder-check"/>`;
+    const hasChildren = children.length > 0 || treeNode.files.length > 0;
+    const files = sortByName(treeNode.files).map((index) => {
+      const file = entries[index];
+      return `<label class="scan-file"><input type="checkbox" class="scan-entry" value="${index}" data-type="${file.entryType}" ${chosen.has(index) ? "checked" : ""}/><i class="scan-icon ${file.entryType}">${scanIcon(file)}</i><span class="scan-name">${escape(file.name)}<em>${scanMeta(file).label}</em></span><small>${escape(file.target)}</small></label>`;
+    }).join("");
+    return `<div class="scan-node${hasChildren ? " has-children" : ""}">
+      <div class="scan-row">
+        ${hasChildren ? `<button type="button" class="scan-toggle" title="展开 / 折叠">▾</button>` : `<span class="scan-toggle-spacer"></span>`}
+        ${box}
+        <i class="scan-icon ${entry ? entry.entryType : "folder"}">${entry ? scanIcon(entry) : "▰"}</i>
+        <span class="scan-name">${escape(isRoot ? rootLabel : treeNode.name)}${entry ? `<em>${scanMeta(entry).label}</em>` : ""}</span>
+        <small>${escape(entry ? entry.target : "")}</small>
+      </div>
+      <div class="scan-children">${children.map((child) => renderNode(child)).join("")}${files}</div>
+    </div>`;
+  };
+  return renderNode(buildScanTree(entries), true);
+}
+/** 依据子节点勾选情况刷新目录节点的勾选 / 半选状态（自底向上） */
+function refreshScanTreeChecks(container: HTMLElement) {
+  [...container.querySelectorAll<HTMLElement>(".scan-node")].reverse().forEach((treeNode) => {
+    const box = treeNode.querySelector<HTMLInputElement>(":scope > .scan-row input");
+    const children = treeNode.querySelector<HTMLElement>(":scope > .scan-children");
+    if (!box || !children) return;
+    const inputs = [...children.querySelectorAll<HTMLInputElement>("input")];
+    if (!inputs.length) { box.indeterminate = false; return; }
+    const checked = inputs.filter((input) => input.checked).length;
+    box.checked = checked === inputs.length;
+    box.indeterminate = checked > 0 && checked < inputs.length;
+  });
 }
 async function openScan() {
-  let scanView: "card" | "list" = "card";
+  let scanView: "tree" | "card" | "list" = "tree";
+  let chosen = new Set<number>();
   const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">默认扫描桌面，也可以选择其他文件夹或系统开始菜单；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
     <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">系统开始菜单</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
@@ -346,26 +412,55 @@ async function openScan() {
     }
     catch (error) { body.innerHTML = ""; importButton.disabled = false; message(error); return; }
     sourceText.textContent = `来源：${describe(source)}${recursive ? "（含子文件夹）" : ""}`;
+    // 默认勾选全部快捷方式
+    chosen = new Set(scanning.map((entry, index) => entry.isShortcut ? index : -1).filter((index) => index >= 0));
     const countByType = (type: DesktopEntry["entryType"]) => scanning.filter((entry) => entry.entryType === type).length;
-    body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div class="scan-view-toggle"><button type="button" data-scan-view="card" class="${scanView === "card" ? "active" : ""}" title="卡片布局">▦</button><button type="button" data-scan-view="list" class="${scanView === "list" ? "active" : ""}" title="列表布局">☰</button></div><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">取消全选</button></div></div>
-      <div class="scan-items ${scanView}">${renderScanEntries(scanning)}</div>`;
-    const toggle = (type: string) => {
-      body.querySelectorAll<HTMLInputElement>(".scan-items input").forEach((input) => {
-        if (type === "all") input.checked = true;
-        else if (type === "none") input.checked = false;
-        else input.checked = input.dataset.type === type;
+    const rootLabel = source.kind === "folder" ? (source.dir.split(/[\\/]/).filter(Boolean).pop() ?? source.dir) : describe(source);
+    const syncChosen = () => { chosen = new Set([...body.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked")].map((input) => Number(input.value))); };
+    const bindItems = () => {
+      const container = body.querySelector<HTMLElement>(".scan-items")!;
+      if (scanView !== "tree") {
+        container.querySelectorAll<HTMLInputElement>("input.scan-entry").forEach((input) => input.onchange = () => { syncChosen(); updateScanSelection(node); });
+        return;
+      }
+      container.querySelectorAll<HTMLElement>(".scan-node").forEach((treeNode) => {
+        const box = treeNode.querySelector<HTMLInputElement>(":scope > .scan-row input");
+        if (box) box.onchange = () => {
+          treeNode.querySelectorAll<HTMLInputElement>(":scope > .scan-children input").forEach((input) => { input.checked = box.checked; input.indeterminate = false; });
+          refreshScanTreeChecks(container); syncChosen(); updateScanSelection(node);
+        };
+        const row = treeNode.querySelector<HTMLElement>(":scope > .scan-row")!;
+        const toggle = () => { treeNode.classList.toggle("collapsed"); row.querySelector<HTMLElement>(".scan-toggle")!.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾"; };
+        row.querySelector<HTMLButtonElement>(".scan-toggle")?.addEventListener("click", (event) => { event.preventDefault(); toggle(); });
+        row.querySelector<HTMLElement>(".scan-name")?.addEventListener("click", () => { if (treeNode.classList.contains("has-children")) toggle(); });
       });
+      container.querySelectorAll<HTMLInputElement>(".scan-file input").forEach((input) => input.onchange = () => { refreshScanTreeChecks(container); syncChosen(); updateScanSelection(node); });
+      refreshScanTreeChecks(container);
+    };
+    const renderList = () => {
+      body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div class="scan-view-toggle"><button type="button" data-scan-view="tree" class="${scanView === "tree" ? "active" : ""}" title="树状布局">🌲</button><button type="button" data-scan-view="card" class="${scanView === "card" ? "active" : ""}" title="卡片布局">▦</button><button type="button" data-scan-view="list" class="${scanView === "list" ? "active" : ""}" title="列表布局">☰</button></div><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">取消全选</button></div></div>
+        <div class="scan-items ${scanView}">${scanView === "tree" ? renderScanTree(scanning, chosen, rootLabel) : renderScanEntries(scanning, chosen)}</div>`;
+      const toggle = (type: string) => {
+        body.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => {
+          input.checked = type === "all" ? true : type === "none" ? false : input.dataset.type === type;
+          input.indeterminate = false;
+        });
+        const container = body.querySelector<HTMLElement>(".scan-items");
+        if (container && scanView === "tree") refreshScanTreeChecks(container);
+        syncChosen();
+        updateScanSelection(node);
+      };
+      body.querySelectorAll<HTMLButtonElement>("[data-select]").forEach((button) => button.onclick = () => toggle(button.dataset.select!));
+      // 视图切换：重建列表，保留已勾选状态
+      body.querySelectorAll<HTMLButtonElement>("[data-scan-view]").forEach((button) => button.onclick = () => {
+        syncChosen();
+        scanView = button.dataset.scanView as "tree" | "card" | "list";
+        renderList();
+      });
+      bindItems();
       updateScanSelection(node);
     };
-    body.querySelectorAll<HTMLButtonElement>("[data-select]").forEach((button) => button.onclick = () => toggle(button.dataset.select!));
-    // 卡片 / 列表布局切换：只换容器 class，保留勾选状态
-    body.querySelectorAll<HTMLButtonElement>("[data-scan-view]").forEach((button) => button.onclick = () => {
-      scanView = button.dataset.scanView as "card" | "list";
-      body.querySelector<HTMLElement>(".scan-items")!.className = `scan-items ${scanView}`;
-      body.querySelectorAll<HTMLButtonElement>("[data-scan-view]").forEach((other) => other.classList.toggle("active", other === button));
-    });
-    body.querySelectorAll<HTMLInputElement>(".scan-items input").forEach((input) => input.onchange = () => updateScanSelection(node));
-    updateScanSelection(node);
+    renderList();
     importButton.disabled = false;
   };
   node.querySelector<HTMLButtonElement>("#pick-folder")!.onclick = async () => {
@@ -376,7 +471,7 @@ async function openScan() {
   node.querySelector<HTMLButtonElement>("#pick-start-menu")!.onclick = async () => { recursiveInput.checked = true; await refresh({ kind: "start-menu" }); };
   recursiveInput.onchange = () => { void refresh(currentSource); };
   importButton.addEventListener("click", async () => {
-    const selectedEntries = [...node.querySelectorAll<HTMLInputElement>(".scan-items input:checked")].map((input) => scanning[Number(input.value)]);
+    const selectedEntries = [...node.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked")].map((input) => scanning[Number(input.value)]);
     if (!selectedEntries.length) { message("请至少选择一项"); return; }
     importButton.disabled = true; importButton.innerHTML = `<i class="loading-dot"></i>正在导入…`;
     node.querySelectorAll<HTMLButtonElement>("button").forEach((control) => { if (control !== importButton) control.disabled = true; });
