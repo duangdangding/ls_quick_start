@@ -591,6 +591,8 @@ struct DesktopEntry {
     is_shortcut: bool,
     entry_type: String,
     scan_icon_path: Option<String>,
+    /// 条目所在文件夹名称（用于扫描结果页展示）
+    folder_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -625,6 +627,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
             if recursive && kind.is_dir() { pending.push((path.clone(), false)); }
             let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
             let source_path = display_path(path.display().to_string());
+            let folder_name = parent_folder_name(&source_path);
             let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
             let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
             if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
@@ -635,6 +638,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
                 is_shortcut: shortcut,
                 entry_type: entry_type.into(),
                 scan_icon_path: None,
+                folder_name,
             });
         }
     }
@@ -644,8 +648,16 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
         let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
         entry.scan_icon_path = icon_file.exists().then(|| display_path(icon_file.display().to_string()));
     }
-    entries.sort_by_key(|a| a.name.to_lowercase());
+    sort_scan_entries(&mut entries);
     Ok(entries)
+}
+
+/// 扫描结果排序：快捷方式在前，其余类型按名称排序
+fn sort_scan_entries(entries: &mut Vec<DesktopEntry>) {
+    entries.sort_by(|a, b| {
+        let rank = |e: &DesktopEntry| if e.is_shortcut { 0 } else { 1 };
+        rank(a).cmp(&rank(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 /// 扫描桌面（默认入口）
@@ -684,7 +696,7 @@ fn scan_start_menu(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String>
     let recursive = recursive.unwrap_or(false);
     let mut entries = Vec::new();
     for dir in dirs { entries.append(&mut scan_dir(&dir, recursive)?); }
-    entries.sort_by_key(|a| a.name.to_lowercase());
+    sort_scan_entries(&mut entries);
     // 同一快捷方式可能同时存在于用户与全局开始菜单，按来源路径去重
     let mut seen = HashSet::new();
     entries.retain(|entry| seen.insert(entry.source_path.to_lowercase()));
