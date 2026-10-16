@@ -395,34 +395,82 @@ fn resolve_shortcuts(paths: &[PathBuf]) -> Vec<String> {
     }
     paths.iter().map(|path| display_path(path.display().to_string())).collect()
 }
+/// Windows 图标提取：用 shell32 的 SHGetFileInfo 取系统图标，文件 / 文件夹 / 快捷方式均适用。
+/// 注意：System.Drawing 的 ExtractAssociatedIcon 对「目录」会抛异常（对文件夹永远取不到图标），故改用 SHGetFileInfo。
+/// 图标数量较多时直接拼进命令行会超出长度上限导致部分失败，这里把脚本写入临时文件后执行。
 #[cfg(windows)]
 fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
     if pairs.is_empty() { return; }
+    const TYPE_DEF: &str = r#"Add-Type -AssemblyName System.Drawing
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public static class SuqiIcon {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)]
+  public struct SHFILEINFO { public IntPtr hIcon; public int iIcon; public uint dwAttributes; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szDisplayName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=80)] public string szTypeName; }
+  [DllImport("shell32.dll", CharSet=CharSet.Auto)] public static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+  [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+  public static bool Save(string path, string output) {
+    SHFILEINFO info = new SHFILEINFO();
+    IntPtr res = SHGetFileInfo(path, 0, ref info, (uint)Marshal.SizeOf(info), 0x100);
+    if (res == IntPtr.Zero || info.hIcon == IntPtr.Zero) { return false; }
+    try { using (Icon icon = Icon.FromHandle(info.hIcon)) using (Bitmap bmp = icon.ToBitmap()) { bmp.Save(output, System.Drawing.Imaging.ImageFormat.Png); } }
+    catch { return false; }
+    DestroyIcon(info.hIcon);
+    return true;
+  }
+}
+'@
+"#;
     let values = pairs.iter().flat_map(|(input, output)| [ps_quote(input.display().to_string()), ps_quote(output.display().to_string())]).collect::<Vec<_>>().join(",");
-    let script = format!("Add-Type -AssemblyName System.Drawing; $p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ try {{ $icon=[System.Drawing.Icon]::ExtractAssociatedIcon($p[$i]); if($icon){{ $bitmap=$icon.ToBitmap(); $bitmap.Save($p[$i+1],[System.Drawing.Imaging.ImageFormat]::Png); $bitmap.Dispose(); $icon.Dispose() }} }} catch {{}} }}");
+    let script = format!("{TYPE_DEF}$p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ [SuqiIcon]::Save($p[$i],$p[$i+1]) | Out-Null }}");
+    let script_file = std::env::temp_dir().join(format!("suqi-icons-{}-{}.ps1", std::process::id(), now()));
+    // PowerShell 5.1 默认按 ANSI 读取脚本文件，含中文路径时必须带 UTF-8 BOM 才不会乱码
+    let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
+    bytes.extend_from_slice(script.as_bytes());
+    if fs::write(&script_file, bytes).is_err() { return; }
     let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-Command", &script]);
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script_file);
     hide_console(&mut command);
     let _ = command.output();
+    let _ = fs::remove_file(&script_file);
 }
 /// macOS 下用 QuickLook 批量生成 128px 缩略图作为条目图标（.app 应用包 / 文件 / 文件夹均支持）
 #[cfg(target_os = "macos")]
 fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
     if pairs.is_empty() { return; }
-    let temp = std::env::temp_dir().join(format!("suqi-icons-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&temp);
-    if fs::create_dir_all(&temp).is_err() { return; }
-    let mut command = Command::new("qlmanage");
-    command.args(["-t", "-s", "128", "-o"]).arg(&temp);
-    for (input, _) in pairs { command.arg(input); }
-    let _ = command.output();
-    // qlmanage 产物名固定为「原文件名.png」，按文件名回填到目标缓存路径
-    for (input, output) in pairs {
-        let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let produced = temp.join(format!("{name}.png"));
-        if produced.exists() { let _ = fs::rename(&produced, output); }
+    // 一次性传入过多文件会让 qlmanage 长时间无响应，分批处理并加超时保护
+    for (batch, chunk) in pairs.chunks(20).enumerate() {
+        let temp = std::env::temp_dir().join(format!("suqi-icons-{}-{batch}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        if fs::create_dir_all(&temp).is_err() { return; }
+        let mut command = Command::new("qlmanage");
+        command.args(["-t", "-s", "128", "-o"]).arg(&temp);
+        for (input, _) in chunk { command.arg(input); }
+        run_with_timeout(&mut command, std::time::Duration::from_secs(20));
+        // qlmanage 产物名固定为「原文件名.png」，按文件名回填到目标缓存路径
+        for (input, output) in chunk {
+            let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let produced = temp.join(format!("{name}.png"));
+            if produced.exists() { let _ = fs::rename(&produced, output); }
+        }
+        let _ = fs::remove_dir_all(&temp);
     }
-    let _ = fs::remove_dir_all(&temp);
+}
+/// 运行外部命令并在超时后强制结束，返回是否正常退出（避免 qlmanage 等工具挂起导致界面长时间无响应）
+#[cfg(target_os = "macos")]
+fn run_with_timeout(command: &mut Command, timeout: std::time::Duration) -> bool {
+    let Ok(mut child) = command.spawn() else { return false; };
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Ok(None) => { let _ = child.kill(); let _ = child.wait(); return false; }
+            Err(_) => { let _ = child.kill(); return false; }
+        }
+    }
 }
 #[cfg(not(any(windows, target_os = "macos")))]
 fn extract_icons(_pairs: &[(PathBuf, PathBuf)]) {}
@@ -716,16 +764,16 @@ fn sort_scan_entries(entries: &mut Vec<DesktopEntry>) {
     });
 }
 
-/// 扫描桌面（默认入口）
+/// 扫描桌面（默认入口）。声明为 async 以脱离主线程执行，避免耗时扫描阻塞界面（macOS 上曾表现为「点击扫描没反应」）
 #[tauri::command]
-fn scan_desktop(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
+async fn scan_desktop(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
     scan_dir(&desktop, recursive.unwrap_or(false))
 }
 
 /// 扫描用户手动选择的文件夹（与桌面扫描同规则）
 #[tauri::command]
-fn scan_folder(dir: String, recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
+async fn scan_folder(dir: String, recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let path = PathBuf::from(dir.trim());
     if !path.is_dir() { return Err("请选择一个有效的文件夹".into()); }
     scan_dir(&path, recursive.unwrap_or(false))
@@ -752,9 +800,9 @@ fn start_menu_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 扫描系统开始菜单 / macOS 应用程序目录（当前用户 + 所有用户）
+/// 扫描系统开始菜单 / macOS 应用程序目录（当前用户 + 所有用户）。async 理由同 scan_desktop
 #[tauri::command]
-fn scan_start_menu(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
+async fn scan_start_menu(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let dirs = start_menu_dirs();
     if dirs.is_empty() { return Err("未找到系统应用目录".into()); }
     let recursive = recursive.unwrap_or(false);

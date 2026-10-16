@@ -8,7 +8,7 @@ import "./styles.css";
 type Item = { id: string; name: string; keyword: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
 type Group = { id: string; name: string; sortOrder: number };
 type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
-type SortBy = "name" | "created" | "type";
+type SortBy = "relevance" | "name" | "created" | "type";
 type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
 type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number };
@@ -20,7 +20,7 @@ let groups: Group[] = [];
 let passwordSet = false;
 let unlocked = false;
 let activeGroup = "all";
-let sortBy: SortBy = "name";
+let sortBy: SortBy = "relevance";
 let viewMode: ViewMode = "card";
 let appConfig: AppConfig | null = null;
 let query = "";
@@ -49,10 +49,13 @@ const displayItems = () => {
     if (activeGroup === "none") return !item.groupId;
     return activeGroup === "all" || item.groupId === activeGroup;
   });
-  const matched = groupItems.filter((item) => !needle || fuzzyScore(item, needle) > -1);
-  return matched.sort((a, b) => sortBy === "created" ? b.createdAt - a.createdAt
-    : sortBy === "type" ? typeRank(a) - typeRank(b) || a.name.localeCompare(b.name, "zh-CN")
-    : a.name.localeCompare(b.name, "zh-CN"));
+  // 匹配度：无搜索词时统一记 0 分，退化为按名称排序
+  const scored = groupItems.map((item) => ({ item, score: needle ? fuzzyScore(item, needle) : 0 })).filter((entry) => !needle || entry.score > -1);
+  const byName = (a: { item: Item }, b: { item: Item }) => a.item.name.localeCompare(b.item.name, "zh-CN");
+  return scored.sort((a, b) => sortBy === "created" ? b.item.createdAt - a.item.createdAt
+    : sortBy === "type" ? typeRank(a.item) - typeRank(b.item) || byName(a, b)
+    : sortBy === "relevance" ? b.score - a.score || byName(a, b)
+    : byName(a, b)).map((entry) => entry.item);
 };
 /** 类型排序用分组：0 命令、1 程序/快捷方式、2 文件、3 文件夹 */
 function typeRank(item: Item) {
@@ -147,7 +150,7 @@ function render() {
   app.innerHTML = `<section class="shell">
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
-    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
+    <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="relevance">匹配度</option><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
     <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
@@ -222,7 +225,24 @@ async function openItem(id: string) {
   catch (error) { message(error); }
   finally { opening = false; render(); }
 }
-function modal(content: string) { const node = document.createElement("div"); node.className = "overlay"; node.innerHTML = `<div class="modal">${content}</div>`; document.body.append(node); node.addEventListener("click", (event) => { if (event.target === node || (event.target as HTMLElement).dataset.close !== undefined) node.remove(); }); return node; }
+function modal(content: string) {
+  const node = document.createElement("div");
+  node.className = "overlay";
+  node.innerHTML = `<div class="modal">${content}</div>`;
+  document.body.append(node);
+  // 仅当鼠标「按下」与「松开」都落在遮罩空白处时才关闭：
+  // 在弹窗内按下、拖到遮罩上松开会触发 target 为遮罩的 click，此前会误关闭
+  let pressedOnBackdrop = false;
+  node.addEventListener("mousedown", (event) => { pressedOnBackdrop = event.target === node; });
+  node.addEventListener("mouseup", (event) => { if (event.target !== node) pressedOnBackdrop = false; });
+  node.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.dataset.close !== undefined) { node.remove(); return; }
+    if (target === node && pressedOnBackdrop) node.remove();
+    pressedOnBackdrop = false;
+  });
+  return node;
+}
 function selectedGroup() { return activeGroup === "all" || activeGroup === "none" ? null : activeGroup; }
 function openItemDialog(item?: Item) {
   const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
@@ -274,9 +294,9 @@ async function deleteSelectedItems() {
 /** 移动到其他分组（可选「未分组」或已有普通分组）：支持批量多选或单个条目，currentGroupId 用于预选当前分组 */
 function openMoveDialog(ids: string[], currentGroupId: string | null = null) {
   if (!ids.length) return;
-  const options = [{ id: "", name: "未分组" }, ...groups.sort((a, b) => a.sortOrder - b.sortOrder)];
+  const options = [{ id: "", name: "未分组" }, ...groups.sort((a, b) => a.sortOrder - b.sortOrder), { id: encryptedId, name: "🔒 加密" }];
   const node = modal(`<h2>移动到分组</h2><form id="move-form"><label>目标分组<select name="group">${options.map((option) => `<option value="${option.id}">${escape(option.name)}</option>`).join("")}</select></label><p class="hint">共 ${ids.length} 项将移动到所选分组。</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">移动</button></div></form>`);
-  // 预选当前分组；加密分组等不在选项中的值回落到「未分组」
+  // 预选当前分组；不在选项中的值回落到「未分组」
   node.querySelector<HTMLSelectElement>("#move-form select[name='group']")!.value = options.some((option) => option.id === currentGroupId) ? currentGroupId! : "";
   node.querySelector<HTMLFormElement>("#move-form")!.onsubmit = async (event) => {
     event.preventDefault();
