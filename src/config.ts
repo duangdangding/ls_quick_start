@@ -36,8 +36,9 @@ export interface AppConfig {
   background: BackgroundConfig;
 }
 
-export const DEFAULT_HOTKEY = "Win+`";
 export const isMac = navigator.platform.toUpperCase().includes("MAC");
+/** 默认全局快捷键：与后端 DEFAULT_HOTKEY 保持一致（macOS 上 Cmd+` 与系统「切换窗口」冲突，改用 Alt+Space） */
+export const DEFAULT_HOTKEY = isMac ? "Alt+Space" : "Win+`";
 
 /** 背景设置的默认值（与后端 BackgroundConfig::default 一致） */
 export function defaultBackground(): BackgroundConfig {

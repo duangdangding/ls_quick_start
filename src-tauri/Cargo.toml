@@ -1,7 +1,7 @@
 [package]
 name = "suqi"
-version = "0.9.0"
-description = "速启 - Windows 快捷启动器"
+version = "0.10.0"
+description = "速启 - 快捷启动器"
 authors = ["you"]
 edition = "2021"
 
@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
@@ -32,7 +32,6 @@ pinyin = { version = "0.10", default-features = false, features = ["plain"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tauri-plugin-updater = "2"
 ureq = "2"
-winreg = "0.52"
 base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]

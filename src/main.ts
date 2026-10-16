@@ -1,7 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
 import { emit, listen } from "@tauri-apps/api/event";
-import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, loadConfig, saveConfig } from "./config";
+import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, isMac, loadConfig, saveConfig } from "./config";
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
 
@@ -32,6 +32,10 @@ let searchSelection: [number, number] | null = null;
 let pinned = false;
 let selectMode = false;
 const selectedIds = new Set<string>();
+// 平台相关文案：macOS 无 CMD、「开始菜单」对应「应用程序」，快捷方式即 .app 应用包
+const cmdLabel = isMac ? "命令" : "CMD 命令";
+const shortcutLabel = isMac ? "应用程序" : "快捷方式";
+const startMenuLabel = isMac ? "应用程序" : "系统开始菜单";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 const escape = (text: string) => text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
@@ -54,7 +58,7 @@ const displayItems = () => {
 function typeRank(item: Item) {
   if (item.isCmd) return 0;
   const target = item.target.toLowerCase();
-  if (/\.(exe|com|bat|cmd|ps1|msi|lnk|url)$/.test(target)) return 1;
+  if (/\.(exe|com|bat|cmd|ps1|msi|lnk|url|app)$/.test(target)) return 1;
   return (target.split(/[\\/]/).pop() ?? "").includes(".") ? 2 : 3;
 }
 function fuzzyScore(item: Item, needle: string) {
@@ -118,7 +122,7 @@ function itemIcon(item: Item) {
   if (item.iconPath) return `<img src="${escape(convertFileSrc(item.iconPath))}" alt="" />`;
   if (item.isCmd) return "⌘";
   if (/^https?:\/\//.test(item.target)) return "◎";
-  if (/\.(exe|bat|cmd)$/i.test(item.target)) return "▣";
+  if (/\.(exe|bat|cmd|app)$/i.test(item.target)) return "▣";
   if (/\\[^\\]+$/.test(item.target)) return "▰";
   return "▤";
 }
@@ -145,7 +149,7 @@ function render() {
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
-    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? "CMD 命令" : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，也不会参与全部搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -221,7 +225,7 @@ async function openItem(id: string) {
 function modal(content: string) { const node = document.createElement("div"); node.className = "overlay"; node.innerHTML = `<div class="modal">${content}</div>`; document.body.append(node); node.addEventListener("click", (event) => { if (event.target === node || (event.target as HTMLElement).dataset.close !== undefined) node.remove(); }); return node; }
 function selectedGroup() { return activeGroup === "all" || activeGroup === "none" ? null : activeGroup; }
 function openItemDialog(item?: Item) {
-  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">CMD 命令</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
+  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
   node.querySelector<HTMLButtonElement>("#pick")!.onclick = async () => { const path = await chooseFile({ directory: false, multiple: false }); if (typeof path === "string") (form.elements.namedItem("target") as HTMLInputElement).value = path; };
   node.querySelector<HTMLButtonElement>("#pick-icon")!.onclick = async () => { const path = await chooseFile({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "ico", "svg"] }] }); if (typeof path === "string") (form.elements.namedItem("icon") as HTMLInputElement).value = path; };
   form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
@@ -306,7 +310,7 @@ function openClearEncryptedConfirm(parent: HTMLElement) {
     try { await invoke("clear_encrypted"); parent.remove(); node.remove(); unlocked = false; activeGroup = encryptedId; await load(); } catch (error) { message(error); }
   };
 }
-const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: "快捷方式", icon: "↗" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
+const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: shortcutLabel, icon: "↗" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
 function scanIcon(entry: DesktopEntry) { return entry.scanIconPath ? `<img src="${escape(convertFileSrc(entry.scanIconPath))}" alt="" />` : scanMeta(entry).icon; }
 function updateScanSelection(node: HTMLElement) {
   const checked = node.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked").length;
@@ -386,8 +390,8 @@ function refreshScanTreeChecks(container: HTMLElement) {
 async function openScan() {
   let scanView: "tree" | "card" | "list" = "tree";
   let chosen = new Set<number>();
-  const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">默认扫描桌面，也可以选择其他文件夹或系统开始菜单；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
-    <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">系统开始菜单</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
+  const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">默认扫描桌面，也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
+    <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
     <div class="modal-actions"><button data-close>取消</button><button class="primary" id="import">导入已选</button></div>`);
   node.classList.add("scan-overlay");
@@ -399,7 +403,7 @@ async function openScan() {
   const importButton = node.querySelector<HTMLButtonElement>("#import")!;
   const recursiveInput = node.querySelector<HTMLInputElement>("#scan-recursive")!;
   const groupByFolderInput = node.querySelector<HTMLInputElement>("#group-by-folder")!;
-  const describe = (src: ScanSource) => src.kind === "folder" ? src.dir : src.kind === "start-menu" ? "系统开始菜单" : "桌面";
+  const describe = (src: ScanSource) => src.kind === "folder" ? src.dir : src.kind === "start-menu" ? startMenuLabel : "桌面";
   let currentSource: ScanSource = { kind: "desktop" };
   const refresh = async (source: ScanSource) => {
     currentSource = source;
@@ -467,7 +471,7 @@ async function openScan() {
     const dir = await chooseFile({ directory: true, multiple: false });
     if (typeof dir === "string") await refresh({ kind: "folder", dir });
   };
-  // 开始菜单层级较多，切换到该来源时默认勾选“扫描子文件夹”
+  // 开始菜单 / 应用程序目录层级较多，切换到该来源时默认勾选“扫描子文件夹”
   node.querySelector<HTMLButtonElement>("#pick-start-menu")!.onclick = async () => { recursiveInput.checked = true; await refresh({ kind: "start-menu" }); };
   recursiveInput.onchange = () => { void refresh(currentSource); };
   importButton.addEventListener("click", async () => {

@@ -24,6 +24,14 @@ const ENCRYPTED_GROUP: &str = "__encrypted__";
 const DB_FILE: &str = "suqi.db";
 const POINTER_FILE: &str = "suqi-data-dir.txt";
 
+/// 默认全局快捷键：Windows 用 Win+`；macOS 的 Cmd+` 与系统「切换窗口」冲突，改用 Alt+Space
+#[cfg(target_os = "windows")]
+const DEFAULT_HOTKEY: &str = "Win+`";
+#[cfg(target_os = "macos")]
+const DEFAULT_HOTKEY: &str = "Alt+Space";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const DEFAULT_HOTKEY: &str = "Ctrl+`";
+
 // ---------- 数据结构 ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +134,7 @@ impl Default for BackgroundConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            hotkey: "Win+`".into(),
+            hotkey: DEFAULT_HOTKEY.into(),
             autostart: false,
             silent_start: false,
             always_on_top: false,
@@ -156,7 +164,14 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 默认数据目录：Windows 用 exe 同目录（便携）；macOS 的 .app 包内不可写，用 ~/Library/Application Support
+#[cfg(windows)]
 fn default_data_dir() -> PathBuf { exe_dir() }
+
+#[cfg(not(windows))]
+fn default_data_dir() -> PathBuf {
+    dirs::data_dir().map(|dir| dir.join("com.suqi.launcher")).unwrap_or_else(exe_dir)
+}
 
 fn default_config_path() -> PathBuf { default_data_dir().join("config.json") }
 
@@ -362,7 +377,9 @@ fn hide_console(command: &mut Command) {
     let _ = command.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn hide_console(_command: &mut Command) {}
+#[cfg(windows)]
 fn ps_quote(value: impl AsRef<str>) -> String { format!("'{}'", value.as_ref().replace('\'', "''")) }
 fn resolve_shortcuts(paths: &[PathBuf]) -> Vec<String> {
     #[cfg(windows)] {
@@ -378,17 +395,37 @@ fn resolve_shortcuts(paths: &[PathBuf]) -> Vec<String> {
     }
     paths.iter().map(|path| display_path(path.display().to_string())).collect()
 }
+#[cfg(windows)]
 fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
-    #[cfg(windows)] {
-        if pairs.is_empty() { return; }
-        let values = pairs.iter().flat_map(|(input, output)| [ps_quote(input.display().to_string()), ps_quote(output.display().to_string())]).collect::<Vec<_>>().join(",");
-        let script = format!("Add-Type -AssemblyName System.Drawing; $p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ try {{ $icon=[System.Drawing.Icon]::ExtractAssociatedIcon($p[$i]); if($icon){{ $bitmap=$icon.ToBitmap(); $bitmap.Save($p[$i+1],[System.Drawing.Imaging.ImageFormat]::Png); $bitmap.Dispose(); $icon.Dispose() }} }} catch {{}} }}");
-        let mut command = Command::new("powershell");
-        command.args(["-NoProfile", "-Command", &script]);
-        hide_console(&mut command);
-        let _ = command.output();
-    }
+    if pairs.is_empty() { return; }
+    let values = pairs.iter().flat_map(|(input, output)| [ps_quote(input.display().to_string()), ps_quote(output.display().to_string())]).collect::<Vec<_>>().join(",");
+    let script = format!("Add-Type -AssemblyName System.Drawing; $p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ try {{ $icon=[System.Drawing.Icon]::ExtractAssociatedIcon($p[$i]); if($icon){{ $bitmap=$icon.ToBitmap(); $bitmap.Save($p[$i+1],[System.Drawing.Imaging.ImageFormat]::Png); $bitmap.Dispose(); $icon.Dispose() }} }} catch {{}} }}");
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", &script]);
+    hide_console(&mut command);
+    let _ = command.output();
 }
+/// macOS 下用 QuickLook 批量生成 128px 缩略图作为条目图标（.app 应用包 / 文件 / 文件夹均支持）
+#[cfg(target_os = "macos")]
+fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
+    if pairs.is_empty() { return; }
+    let temp = std::env::temp_dir().join(format!("suqi-icons-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp);
+    if fs::create_dir_all(&temp).is_err() { return; }
+    let mut command = Command::new("qlmanage");
+    command.args(["-t", "-s", "128", "-o"]).arg(&temp);
+    for (input, _) in pairs { command.arg(input); }
+    let _ = command.output();
+    // qlmanage 产物名固定为「原文件名.png」，按文件名回填到目标缓存路径
+    for (input, output) in pairs {
+        let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let produced = temp.join(format!("{name}.png"));
+        if produced.exists() { let _ = fs::rename(&produced, output); }
+    }
+    let _ = fs::remove_dir_all(&temp);
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn extract_icons(_pairs: &[(PathBuf, PathBuf)]) {}
 fn normalize_target(value: &str, is_cmd: bool) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() { return Err("启动目标不能为空".into()); }
@@ -634,10 +671,12 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.eq_ignore_ascii_case("desktop.ini") { continue; }
+            if file_name.eq_ignore_ascii_case("desktop.ini") || file_name == ".DS_Store" { continue; }
             let kind = entry.file_type().map_err(|e| e.to_string())?;
-            let shortcut = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
-            if recursive && kind.is_dir() { pending.push((path.clone(), false)); }
+            // macOS 的 .app 是目录形态的应用包，按「快捷方式」处理且不再递归进入其内部
+            let is_app_bundle = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("app"));
+            let shortcut = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) || is_app_bundle;
+            if recursive && kind.is_dir() && !is_app_bundle { pending.push((path.clone(), false)); }
             let entry_type = if shortcut { "shortcut" } else if kind.is_dir() { "folder" } else if kind.is_file() { "file" } else { continue };
             let source_path = display_path(path.display().to_string());
             let folder_name = parent_folder_name(&source_path);
@@ -692,24 +731,32 @@ fn scan_folder(dir: String, recursive: Option<bool>) -> Result<Vec<DesktopEntry>
     scan_dir(&path, recursive.unwrap_or(false))
 }
 
-/// 系统开始菜单目录（当前用户 + 所有用户），不存在的直接忽略
+/// 系统「开始菜单 / 应用程序」目录（当前用户 + 所有用户），不存在的直接忽略
 fn start_menu_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(appdata) = dirs::data_dir() {
-        dirs.push(appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = dirs::data_dir() {
+            dirs.push(appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+        }
+        if let Ok(program_data) = std::env::var("ProgramData") {
+            dirs.push(PathBuf::from(program_data).join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+        }
     }
-    if let Ok(program_data) = std::env::var("ProgramData") {
-        dirs.push(PathBuf::from(program_data).join("Microsoft").join("Windows").join("Start Menu").join("Programs"));
+    #[cfg(target_os = "macos")]
+    {
+        dirs.push(PathBuf::from("/Applications"));
+        if let Some(home) = dirs::home_dir() { dirs.push(home.join("Applications")); }
     }
     dirs.retain(|dir| dir.is_dir());
     dirs
 }
 
-/// 扫描系统开始菜单（当前用户 + 所有用户）
+/// 扫描系统开始菜单 / macOS 应用程序目录（当前用户 + 所有用户）
 #[tauri::command]
 fn scan_start_menu(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let dirs = start_menu_dirs();
-    if dirs.is_empty() { return Err("未找到系统开始菜单目录".into()); }
+    if dirs.is_empty() { return Err("未找到系统应用目录".into()); }
     let recursive = recursive.unwrap_or(false);
     let mut entries = Vec::new();
     for dir in dirs { entries.append(&mut scan_dir(&dir, recursive)?); }
@@ -775,7 +822,8 @@ fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<It
     let items = data.store.lock().unwrap().items.clone();
     let cache_dir = state.data_dir.join("icons");
     let _ = fs::create_dir_all(&cache_dir);
-    #[cfg(windows)] {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
         let pairs = items.iter().filter_map(|item| {
             if item.icon_path.is_some() || item.is_cmd || is_url(&item.target) { return None; }
             let output = cache_dir.join(format!("{}.png", item.id));
@@ -1494,7 +1542,7 @@ pub fn run() {
         // 单实例插件必须最先注册：重复启动时新进程直接退出，并在已运行的实例里提示
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             app.dialog()
-                .message("速启已在运行，请从系统托盘或快捷键 Win + ` 呼出面板。")
+                .message("速启已在运行，请从系统托盘或全局快捷键呼出面板。")
                 .title("速启")
                 .kind(MessageDialogKind::Info)
                 .show(|_| {});
@@ -1555,7 +1603,10 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-            register_hotkey(app.handle(), &hotkey)?;
+            // 快捷键注册失败（与系统或其他应用冲突）不应阻断启动，仅记录日志
+            if let Err(error) = register_hotkey(app.handle(), &hotkey) {
+                eprintln!("注册全局快捷键失败：{error}");
+            }
             apply_autostart(app.handle(), autostart);
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_always_on_top(always_on_top);

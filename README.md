@@ -1,6 +1,6 @@
 # 速启 (Suqi Launcher)
 
-Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
+跨平台桌面快捷启动器（Windows / macOS），基于 Tauri 2 + Vite + TypeScript + Rust。
 
 ## 功能
 
@@ -15,7 +15,7 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 - 条目「⋯」菜单支持编辑 / 打开 / 移动到分组 / 删除
 - 多选模式：工具栏「多选」进入后，点击卡片勾选，支持全选 / 反选 / 清空，可批量删除或批量移动到其他分组（未分组 / 自定义分组）
 - 删除分组时可选择处理方式：仅删除分组（组内项目转为未分组）或同时删除组内全部项目
-- 全局快捷键呼出 / 隐藏（默认 `Win + \``）
+- 全局快捷键呼出 / 隐藏（Windows 默认 `Win + \``，macOS 默认 `Alt + Space`）
 - 单实例运行（重复启动时提示"速启已在运行"，不再开启第二个进程）
 - 系统托盘图标
 - 钉住面板（置顶，按钮与托盘菜单实时同步）
@@ -27,11 +27,11 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 - 数据存储于 SQLite，旧版 JSON 数据自动迁移
 - 自定义配置文件目录（默认软件同目录，目标目录已有配置文件时直接使用）
 - 自定义数据库文件目录（默认软件同目录）
-- 自动更新（启动自动检查 + 面板横幅提示；注册表探测安装方式：便携版就地替换重启 / 可下载到其他目录，安装版下载 NSIS 安装包）
+- 自动更新（启动自动检查 + 面板横幅提示；Windows 便携版就地替换重启 / 可下载到其他目录，安装版下载 NSIS 安装包；macOS 走官方 updater 通道下载安装并重启）
 - 更新下载支持系统代理：优先走 `HTTPS_PROXY` / Windows 系统代理，代理不可用时自动回退直连
-- 更新文件 SHA-256 校验（Release 的 sha256sums.txt）
+- 更新文件 SHA-256 校验（Release 的 `sha256sums.txt`）；Release 同时提供 MD5 校验文件（`md5sums.txt` / `md5sums-macos-*.txt`）
 - 便携版更新辅助进程：退出后替换 exe 并自动重启（%TEMP% 副本执行）
-- Windows 代码签名（GitHub Actions 注入）
+- 代码签名（Windows / macOS 均由 GitHub Actions 注入）
 - 数据库信息查看
 
 ## 技术栈
@@ -39,7 +39,7 @@ Windows 快捷启动器，基于 Tauri 2 + Vite + TypeScript + Rust。
 - **前端**: Vite + TypeScript
 - **后端**: Rust (Tauri 2)
 - **插件**: global-shortcut, autostart, process, fs, dialog, opener, updater, single-instance
-- **存储**: SQLite（`suqi.db`，默认在软件同目录）
+- **存储**: SQLite（`suqi.db`，Windows 默认在软件同目录，macOS 默认在 `~/Library/Application Support/com.suqi.launcher`）
 
 ## 开发
 
@@ -56,6 +56,13 @@ cargo check          # Rust 检查（src-tauri/ 下）
 bun run tauri build  # 打包
 ```
 
+macOS 打包（Apple Silicon 原生 / Intel 交叉编译，Intel 需先 `rustup target add x86_64-apple-darwin`）：
+
+```bash
+bun run tauri build                              # Apple Silicon（arm64）
+bun run tauri build --target x86_64-apple-darwin # Intel（x86_64）
+```
+
 ## 发布
 
 打 `v*` 标签推送即可触发 GitHub Actions 自动构建 Release：
@@ -65,7 +72,10 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-产物：NSIS 安装包 + 便携版 exe + SHA-256 校验文件 + latest.json（updater）。
+产物（Windows + macOS 双平台，同一 Release 内发布）：
+- Windows：NSIS 安装包 + 便携版 exe + `sha256sums.txt` / `md5sums.txt`
+- macOS：arm64（Apple Silicon）与 x86_64（Intel）各自的 dmg + app.tar.gz + `sha256sums-macos-*.txt` / `md5sums-macos-*.txt`
+- `latest.json`（updater）：同时包含 `windows-x86_64` / `darwin-aarch64` / `darwin-x86_64`
 
 ### 代码签名
 
@@ -75,4 +85,10 @@ GitHub 仓库需配置以下 secrets：
 - `TAURI_SIGNING_PRIVATE_KEY`：Tauri updater 签名私钥
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：私钥密码
 
+macOS 如需公证（notarization），需额外配置 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` / `APPLE_SIGNING_IDENTITY` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`；未配置时产出的 dmg 未签名，首次打开需右键「打开」或在「系统设置 → 隐私与安全性」中放行。
+
 生成 updater 密钥对：`npx @tauri-apps/cli signer generate -w ~/.tauri/suqi.key`。
+
+### 图标
+
+`node design/make-icon.mjs`（或 `bun design/make-icon.mjs`）由 `design/icon.svg` 生成 Windows 的 `icon.ico` 与 macOS 的 `icon.icns`。

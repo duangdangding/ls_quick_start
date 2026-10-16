@@ -21,7 +21,7 @@
             <button id="hotkey" class="hotkey-btn" type="button">点击录制</button>
             <button id="hotkey-reset" type="button">恢复默认</button>
           </div>
-          <small>按下组合键后松开即完成录制（例如 Win+`）</small>
+          <small id="hotkey-hint">按下组合键后松开即完成录制（例如 Win+`）</small>
         </div>
         <div class="field">
           <label>启动</label>
@@ -48,7 +48,7 @@
             <button id="btn-change-config-dir" type="button">更改…</button>
             <button id="btn-reset-config-dir" type="button">恢复默认</button>
           </div>
-          <small>默认在程序目录下，可自定义到其他位置</small>
+          <small id="config-dir-hint">默认在程序目录下，可自定义到其他位置</small>
         </div>
       </section>
 
@@ -75,8 +75,8 @@
           <label>窗口效果（透明材质）</label>
           <select id="window-effect">
             <option value="default">默认（不透明）</option>
-            <option value="acrylic">亚克力</option>
-            <option value="mica">云母</option>
+            <option value="acrylic" data-win-only>亚克力</option>
+            <option value="mica" data-win-only>云母</option>
             <option value="vibrancy">毛玻璃</option>
           </select>
           <small>切换后呼出主面板可实时预览</small>
@@ -177,7 +177,7 @@
             <button id="btn-change-db-dir" type="button">更改…</button>
             <button id="btn-reset-db-dir" type="button">恢复默认</button>
           </div>
-          <small>数据库文件默认在程序目录下，可自定义到其他位置</small>
+          <small id="db-dir-hint">数据库文件默认在程序目录下，可自定义到其他位置</small>
         </div>
         <div class="field">
           <label>数据库信息</label>
@@ -195,7 +195,7 @@
       <section class="tab-page" id="tab-about">
         <div class="field">
           <h2>速启</h2>
-          <p>Windows 快捷启动器</p>
+          <p id="about-desc">Windows 快捷启动器</p>
           <div class="db-info">
             <div>当前版本：<code id="cur-version">-</code></div>
             <div>最新版本：<code id="latest-version">尚未检查</code></div>

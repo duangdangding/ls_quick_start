@@ -12,6 +12,8 @@ let recordingHotkey = false;
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 const markDirty = () => { $("#save-msg").textContent = "有未保存的修改"; };
+// 默认数据目录：Windows 为程序（exe）目录，macOS 为 ~/Library/Application Support
+const defaultDirLabel = isMac ? "应用支持目录" : "程序目录";
 
 // ---------- tab 切换 ----------
 document.querySelectorAll<HTMLButtonElement>(".tab").forEach((btn) => {
@@ -37,7 +39,7 @@ hotkeyBtn.addEventListener("keydown", (e) => {
   if (e.ctrlKey) parts.push("Ctrl");
   if (e.shiftKey) parts.push("Shift");
   if (e.altKey) parts.push("Alt");
-  if (e.metaKey) parts.push(isMacLike() ? "Cmd" : "Win");
+  if (e.metaKey) parts.push(isMac ? "Cmd" : "Win");
   let key = e.key;
   if (key === "Control" || key === "Shift" || key === "Alt" || key === "Meta") return; // 等待更多键
   if (key === " ") key = "Space";
@@ -51,7 +53,6 @@ hotkeyBtn.addEventListener("keydown", (e) => {
   renderHotkey();
   markDirty();
 });
-function isMacLike() { return navigator.platform.toUpperCase().includes("MAC"); }
 
 $("#hotkey-reset").addEventListener("click", () => { config.hotkey = DEFAULT_HOTKEY; renderHotkey(); markDirty(); });
 
@@ -104,7 +105,7 @@ $("#btn-change-config-dir").addEventListener("click", async () => {
 });
 
 $("#btn-reset-config-dir").addEventListener("click", async () => {
-  if (!confirm("确定恢复默认配置目录（程序目录）？")) return;
+  if (!confirm(`确定恢复默认配置目录（${defaultDirLabel}）？`)) return;
   await invoke("set_data_dirs", { configDir: null, dbDir: null, action: "reset" });
   await refreshConfigDir();
   alert("配置目录已恢复默认，重启应用后生效");
@@ -124,7 +125,7 @@ $("#btn-change-db-dir").addEventListener("click", async () => {
 });
 
 $("#btn-reset-db-dir").addEventListener("click", async () => {
-  if (!confirm("确定恢复默认数据库目录（程序目录）？")) return;
+  if (!confirm(`确定恢复默认数据库目录（${defaultDirLabel}）？`)) return;
   await invoke("set_data_dirs", { configDir: null, dbDir: null, action: "reset" });
   await refreshDbDir();
   await refreshDbInfo();
@@ -717,6 +718,14 @@ $("#btn-save").addEventListener("click", async () => {
 
 // ---------- 初始化 ----------
 (async () => {
+  // 平台相关静态文案（Windows / macOS 展示不同示例与目录说明）
+  $("#hotkey-hint").textContent = `按下组合键后松开即完成录制（例如 ${formatHotkey(DEFAULT_HOTKEY)}）`;
+  $("#config-dir-hint").textContent = `默认在${defaultDirLabel}下，可自定义到其他位置`;
+  $("#db-dir-hint").textContent = `数据库文件默认在${defaultDirLabel}下，可自定义到其他位置`;
+  $("#about-desc").textContent = isMac ? "macOS 快捷启动器" : "Windows 快捷启动器";
+  // macOS 无亚克力/云母材质，仅保留「默认」与「毛玻璃」
+  if (isMac) document.querySelectorAll("#window-effect [data-win-only]").forEach((option) => option.remove());
+
   config = await loadConfig();
 
   bindCheck("autostart", "autostart");
