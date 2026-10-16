@@ -445,19 +445,100 @@ public static class SuqiIcon {
     let _ = command.output();
     let _ = fs::remove_file(&script_file);
 }
-/// macOS 下用 QuickLook 批量生成 128px 缩略图作为条目图标（.app 应用包 / 文件 / 文件夹均支持）
+/// macOS 下判断是否为 `.app` 应用包（应用包是目录形态，以 .app 结尾）
+#[cfg(target_os = "macos")]
+fn is_app_bundle(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+/// macOS 下取 `.app` 应用包内的图标文件：优先 AppIcon.icns，否则取体积最大的 .icns
+#[cfg(target_os = "macos")]
+fn app_icon_icns(app: &Path) -> Option<PathBuf> {
+    let mut preferred: Option<PathBuf> = None;
+    let mut largest: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(app.join("Contents").join("Resources")).ok()?.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("icns")) { continue; }
+        if entry.file_name().to_string_lossy().eq_ignore_ascii_case("appicon.icns") { preferred = Some(path.clone()); }
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let better = match &largest { Some((best, _)) => size > *best, None => true };
+        if better { largest = Some((size, path)); }
+    }
+    preferred.or_else(|| largest.map(|(_, path)| path))
+}
+/// macOS 下用 sips（系统自带）把 icns 转成 128px PNG。比 qlmanage 快很多，也不会挂起
+#[cfg(target_os = "macos")]
+fn icns_to_png(source: &Path, output: &Path) -> bool {
+    if output.exists() { return true; }
+    let mut command = Command::new("sips");
+    command.args(["-s", "format", "png", "-Z", "128"]).arg(source).arg("--out").arg(output);
+    run_with_timeout(&mut command, std::time::Duration::from_secs(10));
+    output.exists()
+}
+/// macOS 下系统 CoreTypes.bundle 里的通用图标（应用 / 文件夹等）
+#[cfg(target_os = "macos")]
+fn system_icon_icns(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from("/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources").join(name);
+    path.exists().then_some(path)
+}
+/// 把同一张通用 icns 转换后复制给一批目标路径（只转换一次，避免逐个调用外部命令）
+#[cfg(target_os = "macos")]
+fn copy_generic_icon(source: &Path, outputs: &[&PathBuf]) {
+    let mut cached: Option<PathBuf> = None;
+    let mut converted = false;
+    for output in outputs {
+        if output.exists() { continue; }
+        if !converted {
+            converted = true;
+            let temp = output.with_extension("tmp.png");
+            if icns_to_png(source, &temp) { cached = Some(temp); }
+        }
+        if let Some(temp) = &cached { let _ = fs::copy(temp, output); }
+    }
+    if let Some(temp) = cached { let _ = fs::remove_file(temp); }
+}
+/// macOS 图标提取。原实现统一走 qlmanage，但 qlmanage 对 `.app` 应用包经常不产出缩略图且单批耗时长
+/// （分批 + 20s 超时会让扫描 / 导入都很慢且拿不到图标）。现改为：
+/// 1. `.app` 应用包：直接读包内 `.icns`（优先 AppIcon.icns）用 sips 转 128px PNG，并发执行；
+/// 2. 仍缺图标的应用包 / 文件夹：用系统 CoreTypes.bundle 里的通用图标兜底；
+/// 3. 其余（普通文件等）：回退 qlmanage 批量生成缩略图。
 #[cfg(target_os = "macos")]
 fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
     if pairs.is_empty() { return; }
-    // 一次性传入过多文件会让 qlmanage 长时间无响应，分批处理并加超时保护
-    for (batch, chunk) in pairs.chunks(20).enumerate() {
+    // 1) .app 应用包：并发调用 sips，避免应用数量多时串行等待
+    let apps: Vec<&(PathBuf, PathBuf)> = pairs.iter().filter(|(input, _)| is_app_bundle(input)).collect();
+    if !apps.is_empty() {
+        let workers = std::thread::available_parallelism().map(|count| count.get().min(4)).unwrap_or(2);
+        let chunk_size = apps.len().div_ceil(workers).max(1);
+        std::thread::scope(|scope| {
+            for chunk in apps.chunks(chunk_size) {
+                scope.spawn(move || {
+                    for (input, output) in chunk {
+                        if output.exists() { continue; }
+                        if let Some(icns) = app_icon_icns(input) { icns_to_png(&icns, output); }
+                    }
+                });
+            }
+        });
+    }
+    // 2) 通用图标兜底：仍缺图标的应用包 / 文件夹
+    let app_outputs: Vec<&PathBuf> = pairs.iter().filter(|(input, output)| !output.exists() && is_app_bundle(input)).map(|(_, output)| output).collect();
+    if !app_outputs.is_empty() {
+        if let Some(source) = system_icon_icns("GenericApplicationIcon.icns") { copy_generic_icon(&source, &app_outputs); }
+    }
+    let folder_outputs: Vec<&PathBuf> = pairs.iter().filter(|(input, output)| !output.exists() && !is_app_bundle(input) && input.is_dir()).map(|(_, output)| output).collect();
+    if !folder_outputs.is_empty() {
+        if let Some(source) = system_icon_icns("GenericFolderIcon.icns") { copy_generic_icon(&source, &folder_outputs); }
+    }
+    // 3) 仍未产出图标的（普通文件等）：回退 qlmanage，分批 + 超时保护避免长时间无响应
+    let remaining: Vec<&(PathBuf, PathBuf)> = pairs.iter().filter(|(_, output)| !output.exists()).collect();
+    for (batch, chunk) in remaining.chunks(10).enumerate() {
         let temp = std::env::temp_dir().join(format!("suqi-icons-{}-{batch}", std::process::id()));
         let _ = fs::remove_dir_all(&temp);
         if fs::create_dir_all(&temp).is_err() { return; }
         let mut command = Command::new("qlmanage");
         command.args(["-t", "-s", "128", "-o"]).arg(&temp);
         for (input, _) in chunk { command.arg(input); }
-        run_with_timeout(&mut command, std::time::Duration::from_secs(20));
+        run_with_timeout(&mut command, std::time::Duration::from_secs(10));
         // qlmanage 产物名固定为「原文件名.png」，按文件名回填到目标缓存路径
         for (input, output) in chunk {
             let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -881,8 +962,10 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     Ok(ImportResult { added, skipped_duplicates, skipped_invalid })
 }
 
+/// 补齐缺失的条目图标。声明为 async + spawn_blocking：图标提取要调用外部命令
+/// （Windows PowerShell / macOS sips），同步命令会在主线程执行导致界面卡死（导入后刷新图标时尤其明显）。
 #[tauri::command]
-fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<ItemIcon> {
+async fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Result<Vec<ItemIcon>, String> {
     let items = data.store.lock().unwrap().items.clone();
     let cache_dir = state.data_dir.join("icons");
     let _ = fs::create_dir_all(&cache_dir);
@@ -893,12 +976,13 @@ fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<It
             let output = cache_dir.join(format!("{}.png", item.id));
             (!output.exists()).then(|| (PathBuf::from(&item.target), output))
         }).collect::<Vec<_>>();
-        extract_icons(&pairs);
+        let _ = tauri::async_runtime::spawn_blocking(move || extract_icons(&pairs)).await;
     }
-    items.into_iter().map(|item| {
+    let icons = items.into_iter().map(|item| {
         let cached = cache_dir.join(format!("{}.png", item.id));
         ItemIcon { id: item.id, icon_path: item.icon_path.or_else(|| cached.exists().then(|| display_path(cached.display().to_string()))) }
-    }).collect()
+    }).collect();
+    Ok(icons)
 }
 
 // ---------- 设置页命令 ----------
