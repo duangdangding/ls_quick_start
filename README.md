@@ -92,3 +92,33 @@ macOS 如需公证（notarization），需额外配置 `APPLE_CERTIFICATE` / `AP
 ### 图标
 
 `node design/make-icon.mjs`（或 `bun design/make-icon.mjs`）由 `design/icon.svg` 生成 Windows 的 `icon.ico` 与 macOS 的 `icon.icns`。
+
+## macOS 安装与常见问题
+
+### 首次打开提示「"速启"已损坏，无法打开」
+
+这是**未签名 / 未公证**应用被 Gatekeeper 的隔离属性（quarantine）拦截导致的正常现象，并非文件真的损坏。任选一种方式解决：
+
+**方式一：右键打开（最简单）**
+
+在「访达 → 应用程序」中右键「速启」→ 选择「打开」→ 在弹窗中再次点击「打开」。
+
+**方式二：移除隔离属性（终端）**
+
+先把「速启」拖入「应用程序」，再执行：
+
+```bash
+xattr -cr /Applications/速启.app
+```
+
+若提示权限不足，前面加 `sudo`：
+
+```bash
+sudo xattr -cr /Applications/速启.app
+```
+
+**方式三：系统设置放行**
+
+「系统设置 → 隐私与安全性」→ 在「安全性」区域点击「仍要打开」。
+
+> 若下载的是 dmg：先双击挂载，把「速启」拖到「应用程序」后再执行上述操作。
