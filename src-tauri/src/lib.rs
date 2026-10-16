@@ -1097,6 +1097,67 @@ fn portable_update_begin(target_dir: Option<String>) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 构建 ureq Agent：优先尝试系统/环境代理，代理不可用时回退直连
+fn ureq_agent() -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new();
+    // 优先读环境变量（Clash/V2Ray 等命令行代理会写 HTTPS_PROXY）
+    if let Ok(proxy) = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
+    {
+        if let Ok(proxy) = ureq::Proxy::new(&proxy) {
+            return builder.proxy(proxy).build();
+        }
+    }
+    // Windows 下尝试读注册表系统代理
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
+            let enable: u32 = hkcu.get_value("ProxyEnable").unwrap_or(0);
+            let server: String = hkcu.get_value("ProxyServer").unwrap_or_default();
+            if enable != 0 && !server.is_empty() {
+                // ProxyServer 格式可能是 "http=host:port;https=host:port" 或 "host:port"
+                let server = if server.contains('=') {
+                    server.split(';').find_map(|s| {
+                        let mut kv = s.splitn(2, '=');
+                        match (kv.next(), kv.next()) {
+                            (Some("https"), Some(v)) => Some(v.to_string()),
+                            _ => None,
+                        }
+                    })
+                } else {
+                    Some(server)
+                };
+                if let Some(server) = server {
+                    let proxy_url = format!("http://{}", server);
+                    if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
+                        return builder.proxy(proxy).build();
+                    }
+                }
+            }
+        }
+    }
+    builder.build()
+}
+
+/// 带代理回退的 GET：先用代理，连接类错误时自动降级直连
+fn ureq_get_with_fallback(url: &str) -> Result<ureq::Response, ureq::Error> {
+    let agent = ureq_agent();
+    let resp = agent.get(url).call();
+    match resp {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Transport(t)) => {
+            // 代理连接失败/超时，回退直连
+            eprintln!("代理连接失败，回退直连：{t}");
+            ureq::AgentBuilder::new().build().get(url).call()
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// 流式下载更新包到指定路径，进度通过 portable-update-progress 事件回传
 #[tauri::command]
 async fn portable_update_download(
@@ -1105,7 +1166,7 @@ async fn portable_update_download(
     path: String,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let resp = ureq::get(&url).call().map_err(|e| format!("下载失败：{e}"))?;
+        let resp = ureq_get_with_fallback(&url).map_err(|e| format!("下载失败：{e}"))?;
         let total: u64 = resp
             .header("content-length")
             .and_then(|v| v.parse().ok())
@@ -1136,8 +1197,7 @@ async fn portable_update_download(
 #[tauri::command]
 async fn http_get_text(url: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        ureq::get(&url)
-            .call()
+        ureq_get_with_fallback(&url)
             .map_err(|e| format!("请求失败：{e}"))?
             .into_string()
             .map_err(|e| e.to_string())
