@@ -64,10 +64,29 @@ function typeRank(item: Item) {
   if (/\.(exe|com|bat|cmd|ps1|msi|lnk|url|app)$/.test(target)) return 1;
   return (target.split(/[\\/]/).pop() ?? "").includes(".") ? 2 : 3;
 }
+/**
+ * 搜索匹配打分（越大越靠前），按匹配质量分档：
+ * 3 名称 / 关键字以关键字开头 > 2 拼音以关键字开头 > 1 名称 / 关键字中间包含 > 0 子序列命中；
+ * 同一档内命中位置越靠前分越高。未命中返回 -1（调用方据此过滤）。
+ */
 function fuzzyScore(item: Item, needle: string) {
   const extra = item as Item & { fullPinyin?: string; initials?: string; keywordFullPinyin?: string; keywordInitials?: string };
-  const values = [item.name.toLowerCase(), item.keyword.toLowerCase(), extra.fullPinyin?.toLowerCase() ?? "", extra.initials?.toLowerCase() ?? "", extra.keywordFullPinyin?.toLowerCase() ?? "", extra.keywordInitials?.toLowerCase() ?? ""];
-  return Math.max(...values.map((value) => subsequenceScore(value, needle)));
+  const fields: { value: string; tier: number }[] = [
+    { value: item.name.toLowerCase(), tier: 3 },
+    { value: item.keyword.toLowerCase(), tier: 3 },
+    { value: extra.fullPinyin?.toLowerCase() ?? "", tier: 2 },
+    { value: extra.initials?.toLowerCase() ?? "", tier: 2 },
+    { value: extra.keywordFullPinyin?.toLowerCase() ?? "", tier: 2 },
+    { value: extra.keywordInitials?.toLowerCase() ?? "", tier: 2 },
+  ];
+  let best = -1;
+  for (const { value, tier } of fields) {
+    if (!value) continue;
+    const at = value.indexOf(needle);
+    if (at >= 0) best = Math.max(best, (at === 0 ? tier : 1) * 1000 + (200 - at));
+    else { const sub = subsequenceScore(value, needle); if (sub > -1) best = Math.max(best, sub); }
+  }
+  return best;
 }
 function subsequenceScore(value: string, needle: string) {
   const exact = value.indexOf(needle); if (exact >= 0) return 200 - exact;
