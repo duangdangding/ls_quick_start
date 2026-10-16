@@ -31,7 +31,8 @@ function overlay(html: string) {
   node.addEventListener("mouseup", (event) => { if (event.target !== node) pressedOnBackdrop = false; });
   node.addEventListener("click", (event) => {
     const target = event.target as HTMLElement;
-    if (target.dataset.close !== undefined) { node.remove(); return; }
+    // 用 closest 兜底：点到按钮内的文字等子节点也能命中 data-close
+    if (target.closest("[data-close]")) { node.remove(); return; }
     if (target === node && pressedOnBackdrop) node.remove();
     pressedOnBackdrop = false;
   });
@@ -45,7 +46,10 @@ function confirmDialog(text: string, okLabel = "确定", danger = false) {
     // 遮罩 / Esc 关闭时节点被移除，监听节点被移除兜底返回 false
     const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(false); } });
     observer.observe(document.body, { childList: true });
-    node.querySelector<HTMLButtonElement>("#confirm-ok")!.onclick = () => { observer.disconnect(); node.remove(); resolve(true); };
+    const finish = (value: boolean) => { observer.disconnect(); node.remove(); resolve(value); };
+    // 每个按钮直接绑定关闭，不依赖事件委托，保证点击必定生效
+    node.querySelectorAll<HTMLButtonElement>("[data-close]").forEach((btn) => { btn.onclick = () => finish(false); });
+    node.querySelector<HTMLButtonElement>("#confirm-ok")!.onclick = () => finish(true);
   });
 }
 
@@ -55,6 +59,7 @@ function alertDialog(text: string) {
     const node = overlay(`<h2>提示</h2><p class="hint">${escapeHtml(text).replace(/\n/g, "<br>")}</p><div class="modal-actions"><button class="primary" data-close>知道了</button></div>`);
     const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(); } });
     observer.observe(document.body, { childList: true });
+    node.querySelectorAll<HTMLButtonElement>("[data-close]").forEach((btn) => { btn.onclick = () => { observer.disconnect(); node.remove(); resolve(); }; });
   });
 }
 

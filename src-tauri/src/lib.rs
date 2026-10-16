@@ -996,8 +996,11 @@ fn set_window_effect(app: tauri::AppHandle, state: State<'_, ConfigState>, effec
 }
 
 #[tauri::command]
-fn get_config_dir(state: State<'_, ConfigState>) -> String {
-    display_path(state.data_dir.display().to_string())
+fn get_config_dir(_state: State<'_, ConfigState>) -> String {
+    // 返回「当前生效」的配置文件目录（可能来自指针文件指向的自定义目录），
+    // 而非启动时的默认目录；否则重启 / 更新后会显示成默认路径，看起来像配置丢失
+    let dir = effective_config_path().parent().map(PathBuf::from).unwrap_or_else(default_data_dir);
+    display_path(dir.display().to_string())
 }
 
 #[tauri::command]
@@ -1018,6 +1021,7 @@ fn set_data_dirs(state: State<'_, ConfigState>, config_dir: Option<String>, db_d
                 let old = effective_config_path();
                 if old != new_path { let _ = fs::rename(&old, &new_path); }
             }
+            if let Some(parent) = pointer_path().parent() { fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败：{e}"))?; }
             fs::write(pointer_path(), dir).map_err(|e| format!("写入指针文件失败：{e}"))?;
             cfg.config_dir = Some(dir.clone());
         }

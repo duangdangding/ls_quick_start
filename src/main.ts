@@ -486,8 +486,14 @@ function refreshScanTreeChecks(container: HTMLElement) {
 async function openScan() {
   let scanView: "tree" | "card" | "list" = "tree";
   let chosen = new Set<number>();
-  const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">默认扫描桌面，也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。</p>
-    <div class="scan-bulk"><span id="scan-source">来源：桌面</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
+  // macOS 默认扫描「应用程序」目录（/Applications + ~/Applications），Windows 默认扫描桌面
+  const defaultSource: ScanSource = isMac ? { kind: "start-menu" } : { kind: "desktop" };
+  const defaultSourceLabel = isMac ? startMenuLabel : "桌面";
+  const hintText = isMac
+    ? `默认扫描${startMenuLabel}目录（/Applications），也可以选择其他文件夹；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`
+    : `默认扫描桌面，也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`;
+  const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">${hintText}</p>
+    <div class="scan-bulk"><span id="scan-source">来源：${defaultSourceLabel}</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" ${isMac ? "checked" : ""} />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
     <div class="modal-actions"><button data-close>取消</button><button class="primary" id="import">导入已选</button></div>`);
   node.classList.add("scan-overlay");
@@ -500,7 +506,7 @@ async function openScan() {
   const recursiveInput = node.querySelector<HTMLInputElement>("#scan-recursive")!;
   const groupByFolderInput = node.querySelector<HTMLInputElement>("#group-by-folder")!;
   const describe = (src: ScanSource) => src.kind === "folder" ? src.dir : src.kind === "start-menu" ? startMenuLabel : "桌面";
-  let currentSource: ScanSource = { kind: "desktop" };
+  let currentSource: ScanSource = defaultSource;
   const refresh = async (source: ScanSource) => {
     currentSource = source;
     importButton.disabled = true;
