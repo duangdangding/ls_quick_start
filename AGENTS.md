@@ -110,3 +110,23 @@ cargo clippy           # lint
 3. **构建结果由用户自行查看确认**（GitHub Actions 页面）。助手**不要用任何方式查询构建状态**——包括 GitHub API、gh CLI、轮询、下载日志等；推完 tag 即停下，等用户主动告知结果后再继续下一步。（用户明确要求，2026-10-14）
 4. 写 release notes（用户确认构建成功后执行）：先在工作区写 `release-notes-X.Y.Z.md`（新功能 / 升级提醒 / 其他），`GET /releases/tags/vX.Y.Z` 拿 release id → `PATCH /releases/{id}` 写入 `body`。
    核对：重新 GET，确认 body 首尾完整、assets 数量正确（通常 5 个：setup + .sig + portable exe + latest.json + sha256sums）。
+
+### GitHub API 凭据
+
+- 本机无 `gh` CLI、无系统 `python`/`uv`。token 在 Windows 凭据管理器（git credential manager）里，PowerShell 获取方式：
+
+```powershell
+$env:GH_TOKEN = ("protocol=https`nhost=github.com`n`n" | git credential fill 2>$null | Where-Object { $_ -like "password=*" }) -replace "^password=", ""
+```
+
+- **任何时候不得明文打印 token**。
+- 写 release notes 用 Node 18 原生 fetch（`https.get` 也行，不用装依赖），参考实现：
+
+```js
+const [tag, notesPath] = process.argv.slice(2);
+const repo = "duangdangding/ls_quick_start";
+const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: "application/vnd.github+json", "Content-Type": "application/json" };
+const rel = await (await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`, { headers })).json();
+const body = require("fs").readFileSync(notesPath, "utf-8");
+await fetch(`https://api.github.com/repos/${repo}/releases/${rel.id}`, { method: "PATCH", headers, body: JSON.stringify({ body }) });
+```
