@@ -29,7 +29,8 @@ button.link:hover { background: transparent; filter: brightness(1.15); }.menu { 
 .scan-overlay .modal.max { width: 100vw; height: 100vh; border-radius: 0; resize: none; }
 .scan-overlay #scan-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .scan-overlay #scan-body > .scan-bulk { flex: none; }
-.scan-overlay .scan-items { flex: 1; min-height: 120px; overflow: auto; }
+/* 覆盖基础样式的 max-height:310px，使列表随弹窗高度自适应占满剩余空间 */
+.scan-overlay .scan-items { flex: 1; min-height: 120px; max-height: none; overflow: auto; }
 .scan-max { float: right; padding: 1px 8px; font-size: 14px; line-height: 1.5; }
 .scan-view-toggle { display: flex; gap: 4px; }
 .scan-view-toggle button { padding: 3px 8px; font-size: 13px; line-height: 1; color: var(--muted); }
