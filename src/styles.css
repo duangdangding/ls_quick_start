@@ -23,21 +23,18 @@
 /* 所在文件夹小标签 */
 .scan-folder { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: #f9e2af; font-style: normal; font-size: 10px; }
 /* 扫描弹窗：最大化按钮 + 可拖拽大小 + 视图切换 */
-.scan-overlay .modal { width: min(720px, calc(100vw - 32px)); min-width: 420px; min-height: 320px; resize: both; display: flex; flex-direction: column; }
-.scan-overlay .modal.max { width: calc(100vw - 40px); height: calc(100vh - 40px); max-height: none; resize: none; }
+.scan-overlay .modal { width: min(720px, calc(100vw - 32px)); height: min(560px, calc(100vh - 32px)); min-width: 420px; min-height: 320px; max-width: none; max-height: none; resize: both; overflow: hidden; display: flex; flex-direction: column; }
+.scan-overlay .modal.max { width: 100vw; height: 100vh; border-radius: 0; resize: none; }
 .scan-overlay #scan-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .scan-overlay .scan-items { flex: 1; min-height: 120px; }
 .scan-max { float: right; padding: 1px 8px; font-size: 14px; line-height: 1.5; }
 .scan-view-toggle { display: flex; gap: 4px; }
 .scan-view-toggle button { padding: 3px 8px; font-size: 13px; line-height: 1; color: var(--muted); }
 .scan-view-toggle button.active { color: var(--hl-color); border-color: var(--hl-color); background: color-mix(in srgb, var(--hl-color) 14%, transparent); }
-/* 卡片内联重命名：✎ 按钮与输入框 */
-.card .rename { position: absolute; right: 28px; top: 7px; border: 0; background: transparent; color: var(--muted); padding: 2px 6px; opacity: 0; }
-.card:hover .rename { opacity: 1; }
-.card .rename:hover { color: var(--text); background: var(--surface); }
+/* 卡片内联重命名：点击已选中条目的名称出现输入框 */
+.card-text b { cursor: text; }
 .rename-input { width: 100%; min-width: 0; padding: 2px 6px; border: 1px solid var(--hl-color); border-radius: 5px; outline: 0; background: #181825; color: var(--text); font-size: 13px; font-weight: 700; }
-.grid:not(.list) .card .rename { right: 25px; top: 4px; padding: 0 5px; font-size: 12px; line-height: 1.4; }
-.grid.list .card .rename, .grid.list .card .more { position: static; opacity: 1; } button:disabled { cursor: wait; opacity: .7; } .loading-dot { width: 12px; height: 12px; display: inline-block; margin-right: 6px; vertical-align: -2px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .65s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
+.grid.list .card .more { position: static; } button:disabled { cursor: wait; opacity: .7; } .loading-dot { width: 12px; height: 12px; display: inline-block; margin-right: 6px; vertical-align: -2px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .65s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- 扫描导入：扫描子文件夹 / 按文件夹名称分组开关 ---------- */
 .scan-bulk label.scan-check { display: flex; align-items: center; gap: 5px; padding: 0 3px; cursor: pointer; white-space: nowrap; }
