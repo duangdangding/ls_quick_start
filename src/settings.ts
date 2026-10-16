@@ -689,32 +689,101 @@ async function installedUpdate() {
   }
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// 把插件的英文报错转成可读中文，并给出对应处理办法
+function macUpdateErrorText(e: unknown): string {
+  const msg = String(e);
+  if (/Failed to move the new app into place/i.test(msg)) {
+    return "安装失败：没有权限替换「应用程序」里的速启。若刚才弹出了管理员授权窗口，请点击「好」并输入密码；也可以先把速启拖到「应用程序」目录（不要直接在 DMG 安装盘或下载目录里运行）再重试。";
+  }
+  if (/signature|minisign|verify/i.test(msg)) {
+    return `安装包校验失败：${msg}。请稍后重试；若持续失败，请到 Releases 页面手动下载安装。`;
+  }
+  if (/Download request failed with status/i.test(msg)) {
+    return `下载失败：${msg}。多为网络问题，请检查网络或代理后重试。`;
+  }
+  if (/error sending request|timed out|connection|dns|Network/i.test(msg)) {
+    return `网络错误：${msg}。GitHub 下载可能被中断，请检查网络或代理后重试。`;
+  }
+  return `更新失败：${msg}`;
+}
+
+// macOS 更新：下载 signed bundle → 校验 → 就地替换 .app
+// 拆成 download + install 两段：下载阶段显示真实进度，校验/安装阶段插件不再发进度事件，改为明确文案
+async function macUpdate() {
+  if (!pendingUpdate) return;
+  const update = pendingUpdate.update;
+  setBusy(true);
+  progressWrapEl.hidden = false;
+  progressBarEl.style.width = "0%";
+  updateStatusEl.textContent = "正在连接更新服务器…";
+
+  let total = 0;
+  let received = 0;
+  let lastPaint = 0;
+  let stallTimer: number | undefined;
+  // 长时间没有新数据时补一句说明，避免界面看起来像卡死
+  const armStallTimer = () => {
+    window.clearTimeout(stallTimer);
+    stallTimer = window.setTimeout(() => {
+      updateStatusEl.textContent = "网络响应较慢，仍在等待下载…如长时间无进展，请检查网络或代理后重试";
+    }, 30000);
+  };
+  // 节流写 DOM：下载分片很密，每个分片都重排会让设置窗口发卡
+  const paint = (text: string, force = false) => {
+    const now = performance.now();
+    if (!force && now - lastPaint < 100) return;
+    lastPaint = now;
+    if (total > 0) {
+      progressBarEl.style.width = `${Math.min(100, Math.round((received / total) * 100))}%`;
+      updateStatusEl.textContent = `${text} ${formatBytes(received)} / ${formatBytes(total)}`;
+    } else {
+      updateStatusEl.textContent = `${text} 已下载 ${formatBytes(received)}`;
+    }
+  };
+
+  try {
+    armStallTimer();
+    // 第二参数给个足够宽松的超时：插件默认不限时，网络中断时可能一直挂着，超时后报错可重试
+    await update.download((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength ?? 0;
+        paint("正在下载更新", true);
+      } else if (event.event === "Progress") {
+        received += event.data.chunkLength;
+        armStallTimer();
+        paint("正在下载更新");
+      } else if (event.event === "Finished") {
+        window.clearTimeout(stallTimer);
+        progressBarEl.style.width = "100%";
+        paint("正在下载更新", true);
+      }
+    }, { timeout: 10 * 60 * 1000 });
+    // 之后插件要校验签名、解包并替换 .app，可能弹管理员授权窗口，这里必须给出提示
+    updateStatusEl.textContent = "正在校验并安装更新，如弹出授权窗口请点击「好」并输入密码…";
+    await update.install();
+    window.clearTimeout(stallTimer);
+    progressBarEl.style.width = "100%";
+    updateStatusEl.textContent = "更新已安装，重启应用完成更新";
+    relaunchBtn.hidden = false;
+  } catch (e) {
+    window.clearTimeout(stallTimer);
+    progressWrapEl.hidden = true;
+    updateStatusEl.textContent = macUpdateErrorText(e);
+  } finally {
+    setBusy(false);
+  }
+}
+
 doUpdateBtn.addEventListener("click", async () => {
   if (!pendingUpdate) return;
   if (installKind === "portable") return portableUpdate(false);
-  if (isMac) {
-    // macOS 走官方更新通道：updater 插件下载 signed bundle 并就地替换
-    setBusy(true);
-    try {
-      updateStatusEl.textContent = "正在下载更新…";
-      await pendingUpdate.update.downloadAndInstall((event) => {
-        if (event.event === "Started" && event.data.contentLength) {
-          progressWrapEl.hidden = false;
-        } else if (event.event === "Progress") {
-          progressBarEl.style.width = "50%";
-        } else if (event.event === "Finished") {
-          progressBarEl.style.width = "100%";
-        }
-      });
-      updateStatusEl.textContent = "更新已就绪，重启应用完成更新";
-      relaunchBtn.hidden = false;
-    } catch (e) {
-      updateStatusEl.textContent = `更新失败：${e}`;
-    } finally {
-      setBusy(false);
-    }
-    return;
-  }
+  if (isMac) return macUpdate();
   await installedUpdate();
 });
 
