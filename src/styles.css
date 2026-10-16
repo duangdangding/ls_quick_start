@@ -26,7 +26,8 @@
 .scan-overlay .modal { width: min(720px, calc(100vw - 32px)); height: min(560px, calc(100vh - 32px)); min-width: 420px; min-height: 320px; max-width: none; max-height: none; resize: both; overflow: hidden; display: flex; flex-direction: column; }
 .scan-overlay .modal.max { width: 100vw; height: 100vh; border-radius: 0; resize: none; }
 .scan-overlay #scan-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.scan-overlay .scan-items { flex: 1; min-height: 120px; }
+.scan-overlay #scan-body > .scan-bulk { flex: none; }
+.scan-overlay .scan-items { flex: 1; min-height: 120px; overflow: auto; }
 .scan-max { float: right; padding: 1px 8px; font-size: 14px; line-height: 1.5; }
 .scan-view-toggle { display: flex; gap: 4px; }
 .scan-view-toggle button { padding: 3px 8px; font-size: 13px; line-height: 1; color: var(--muted); }
