@@ -660,6 +660,12 @@ fn unlock_encrypted(data: State<'_, AppData>, password: String) -> Result<bool, 
     Ok(ok)
 }
 
+/// 手动上锁：立即锁定加密分组，重新查看需再次输入密码
+#[tauri::command]
+fn lock_encrypted(data: State<'_, AppData>) {
+    data.unlocked.store(false, Ordering::SeqCst);
+}
+
 #[tauri::command]
 fn reset_password(data: State<'_, AppData>, current_password: Option<String>, new_password: String) -> Result<(), String> {
     if new_password.trim().len() < 4 { return Err("密码至少需要 4 个字符".into()); }
@@ -1620,7 +1626,7 @@ pub fn run() {
         .manage(config_state)
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
-            delete_group, save_group_order, save_item_order, unlock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
+            delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
