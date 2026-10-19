@@ -374,7 +374,7 @@ fn resolve_lnk(path: &Path) -> String {
     #[cfg(windows)] {
         let escaped = path.display().to_string().replace('\'', "''");
         let mut command = Command::new("powershell");
-        command.args(["-NoProfile", "-Command", &format!("$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath", escaped)]);
+        command.args(["-NoProfile", "-Command", &format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath", escaped)]);
         hide_console(&mut command);
         if let Ok(output) = command.output() {
             let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -402,7 +402,9 @@ fn resolve_shortcuts(paths: &[PathBuf]) -> Vec<String> {
     #[cfg(windows)] {
         if paths.is_empty() { return Vec::new(); }
         let values = paths.iter().map(|path| ps_quote(path.display().to_string())).collect::<Vec<_>>().join(",");
-        let script = format!("$w=New-Object -ComObject WScript.Shell; @({values}) | ForEach-Object {{ try {{ $w.CreateShortcut($_).TargetPath }} catch {{ '' }} }}");
+        // 强制 stdout 为 UTF-8：中文 Windows 默认按 GBK 输出，含中文的目标路径会乱码导致导入判为无效；
+        // $null 的 TargetPath 不产出任何行，显式转成空串，保证每个输入对应一行、与 paths 按序对齐\r
+        let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $w=New-Object -ComObject WScript.Shell; @({values}) | ForEach-Object {{ try {{ $t=$w.CreateShortcut($_).TargetPath; if ($null -eq $t) {{ '' }} else {{ $t }} }} catch {{ '' }} }}");
         let mut command = Command::new("powershell");
         command.args(["-NoProfile", "-Command", &script]);
         hide_console(&mut command);
@@ -974,6 +976,14 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
         } else { (entry.source_path.clone(), None) };
         match normalize_target(&candidate, false) {
             Ok(target) => prepared.push((entry.name, target, folder, lnk_path)),
+            Err(_) if lnk_path.is_some() => {
+                // 快捷方式目标解析失败（目标为空、已被删除等特殊链接）：退化为按 .lnk 自身导入，
+                // 启动时仍经 lnk_path 由 Shell 处理，避免误报「无效」
+                match fs::canonicalize(&entry.source_path) {
+                    Ok(path) => prepared.push((entry.name, display_path(path.display().to_string()), folder, lnk_path)),
+                    Err(_) => skipped_invalid += 1,
+                }
+            }
             Err(_) => skipped_invalid += 1,
         }
     }
