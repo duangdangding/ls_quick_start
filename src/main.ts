@@ -5,7 +5,8 @@ import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, i
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
 
-type Item = { id: string; name: string; keyword: string; description: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number };
+type SearchCache = { kw: string; kwPy: string; kwIn: string; nm: string; nmPy: string; nmIn: string };
+type Item = { id: string; name: string; keyword: string; description: string; target: string; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number; search?: SearchCache };
 type Group = { id: string; name: string; sortOrder: number };
 type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
 type SortBy = "relevance" | "name" | "created" | "type";
@@ -70,18 +71,30 @@ function typeRank(item: Item) {
  * 3 以关键字开头 > 2 拼音以关键字开头 > 1 中间包含 > 0 子序列命中；未命中返回 -1（调用方据此过滤）。
  */
 const KEYWORD_BONUS = 10000;
-function fuzzyScore(item: Item, needle: string) {
+/** 预计算小写搜索字段：加载时算一次，避免每次按键对全部条目重复 toLowerCase */
+const buildSearchCache = (item: Item): SearchCache => {
   const extra = item as Item & { fullPinyin?: string; initials?: string; keywordFullPinyin?: string; keywordInitials?: string };
+  return {
+    kw: item.keyword.toLowerCase(),
+    kwPy: extra.keywordFullPinyin?.toLowerCase() ?? "",
+    kwIn: extra.keywordInitials?.toLowerCase() ?? "",
+    nm: item.name.toLowerCase(),
+    nmPy: extra.fullPinyin?.toLowerCase() ?? "",
+    nmIn: extra.initials?.toLowerCase() ?? "",
+  };
+};
+function fuzzyScore(item: Item, needle: string) {
+  const cache = item.search;
   const keywordScore = bestFieldScore([
-    { value: item.keyword.toLowerCase(), tier: 3 },
-    { value: extra.keywordFullPinyin?.toLowerCase() ?? "", tier: 2 },
-    { value: extra.keywordInitials?.toLowerCase() ?? "", tier: 2 },
+    { value: cache?.kw ?? item.keyword.toLowerCase(), tier: 3 },
+    { value: cache?.kwPy ?? "", tier: 2 },
+    { value: cache?.kwIn ?? "", tier: 2 },
   ], needle);
   if (keywordScore > -1) return KEYWORD_BONUS + keywordScore;
   return bestFieldScore([
-    { value: item.name.toLowerCase(), tier: 3 },
-    { value: extra.fullPinyin?.toLowerCase() ?? "", tier: 2 },
-    { value: extra.initials?.toLowerCase() ?? "", tier: 2 },
+    { value: cache?.nm ?? item.name.toLowerCase(), tier: 3 },
+    { value: cache?.nmPy ?? "", tier: 2 },
+    { value: cache?.nmIn ?? "", tier: 2 },
   ], needle);
 }
 /** 取多个字段中的最高匹配分：完全包含时按「是否开头 + 分档」计分，否则退回子序列匹配 */
@@ -134,15 +147,19 @@ function renderName(name: string, needle: string): string {
   return html;
 }
 async function load() {
-  const data = await invoke<{ items: Item[]; groups: Group[]; passwordSet: boolean; unlocked: boolean }>("list_data", { includeEncrypted: unlocked });
   // 解锁状态以后端会话为准：面板重开/页面重载后仍保持已解锁
+  // 三个读取相互独立，并行发起，缩短面板加载时间
+  const [data, index, icons] = await Promise.all([
+    invoke<{ items: Item[]; groups: Group[]; passwordSet: boolean; unlocked: boolean }>("list_data", { includeEncrypted: unlocked }),
+    invoke<{ id: string; fullPinyin: string; initials: string }[]>("searchable_items", { includeEncrypted: unlocked }),
+    invoke<ItemIcon[]>("item_icons"),
+  ]);
   unlocked = data.unlocked;
-  const index = await invoke<{ id: string; fullPinyin: string; initials: string }[]>("searchable_items", { includeEncrypted: unlocked });
   const words = new Map(index.map((entry) => [entry.id, entry]));
   items = data.items.map((item) => Object.assign(item, words.get(item.id)));
-  const icons = await invoke<ItemIcon[]>("item_icons");
   const iconMap = new Map(icons.map((icon) => [icon.id, icon.iconPath]));
   items.forEach((item) => { if (!item.iconPath) item.iconPath = iconMap.get(item.id) ?? null; });
+  items.forEach((item) => { item.search = buildSearchCache(item); });
   groups = data.groups; passwordSet = data.passwordSet;
   if (!fixedGroups().some((group) => group.id === activeGroup)) activeGroup = "all";
   render(true);
@@ -181,7 +198,7 @@ function render(keepScroll = false) {
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="relevance">匹配度</option><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `${unlocked ? `<button data-action="lock" title="立即锁定加密分组，再次查看需输入密码">加密</button>` : ""}<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
-    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，并参与「全部」搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，并参与「全部」搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${selectMode ? (picked ? "✓" : "") : itemIcon(item)}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><i class="empty-icon">🗂️</i><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
     <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
@@ -284,7 +301,8 @@ async function action(type: string) {
 async function openItem(id: string) {
   if (opening) return;
   opening = true; render(true);
-  try { await invoke("open_item", { id, unlocked }); }
+  // 启动成功后隐藏面板，回到之前的窗口（双击 / Enter / 菜单「打开」共用此入口）
+  try { await invoke("open_item", { id, unlocked }); void invoke("hide_panel"); }
   catch (error) { message(error); }
   finally { opening = false; render(true); }
 }
@@ -389,7 +407,7 @@ function openDeleteGroupDialog(groupId: string, manager: HTMLElement) {
   node.querySelector<HTMLFormElement>("#delete-group-form")!.onsubmit = async (event) => {
     event.preventDefault();
     const mode = String(new FormData(event.currentTarget as HTMLFormElement).get("mode"));
-    if (mode === "delete" && !confirm(`将同时删除「${group?.name ?? ""}」中的 ${count} 个启动项，确认继续？`)) return;
+    if (mode === "delete" && !await confirmDialog(`将同时删除「${group?.name ?? ""}」中的 ${count} 个启动项？`, "确认删除")) return;
     try { await invoke("delete_group", { id: groupId, deleteItems: mode === "delete" }); node.remove(); manager.remove(); await load(); }
     catch (error) { message(error); }
   };
@@ -451,7 +469,7 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
     const entry = folderIndex === null ? null : entries[folderIndex];
     const box = entry
       ? `<input type="checkbox" class="scan-entry" value="${folderIndex}" data-type="${entry.entryType}" ${chosen.has(folderIndex!) ? "checked" : ""}/>`
-      : `<input type="checkbox" class="scan-folder-check"/>`;
+      : `<span class="scan-toggle-spacer"></span>`;
     const hasChildren = children.length > 0 || treeNode.files.length > 0;
     const files = sortByName(treeNode.files).map((index) => {
       const file = entries[index];
@@ -470,19 +488,6 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
   };
   return renderNode(buildScanTree(entries), true);
 }
-/** 依据子节点勾选情况刷新目录节点的勾选 / 半选状态（自底向上） */
-function refreshScanTreeChecks(container: HTMLElement) {
-  [...container.querySelectorAll<HTMLElement>(".scan-node")].reverse().forEach((treeNode) => {
-    const box = treeNode.querySelector<HTMLInputElement>(":scope > .scan-row input");
-    const children = treeNode.querySelector<HTMLElement>(":scope > .scan-children");
-    if (!box || !children) return;
-    const inputs = [...children.querySelectorAll<HTMLInputElement>("input")];
-    if (!inputs.length) { box.indeterminate = false; return; }
-    const checked = inputs.filter((input) => input.checked).length;
-    box.checked = checked === inputs.length;
-    box.indeterminate = checked > 0 && checked < inputs.length;
-  });
-}
 async function openScan() {
   let scanView: "tree" | "card" | "list" = "tree";
   let chosen = new Set<number>();
@@ -493,7 +498,7 @@ async function openScan() {
     ? `默认扫描${startMenuLabel}目录（/Applications），也可以选择其他文件夹；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`
     : `默认扫描桌面，也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`;
   const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">${hintText}</p>
-    <div class="scan-bulk"><span id="scan-source">来源：${defaultSourceLabel}</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" checked />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
+    <div class="scan-bulk"><span id="scan-source">来源：${defaultSourceLabel}</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
     <div class="modal-actions"><button data-close>取消</button><button class="primary" id="import">导入已选</button></div>`);
   node.classList.add("scan-overlay");
@@ -529,19 +534,14 @@ async function openScan() {
         container.querySelectorAll<HTMLInputElement>("input.scan-entry").forEach((input) => input.onchange = () => { syncChosen(); updateScanSelection(node); });
         return;
       }
+      // 父子勾选不关联：勾文件夹不等于勾选其内容，选快捷方式也不会带上父目录
       container.querySelectorAll<HTMLElement>(".scan-node").forEach((treeNode) => {
-        const box = treeNode.querySelector<HTMLInputElement>(":scope > .scan-row input");
-        if (box) box.onchange = () => {
-          treeNode.querySelectorAll<HTMLInputElement>(":scope > .scan-children input").forEach((input) => { input.checked = box.checked; input.indeterminate = false; });
-          refreshScanTreeChecks(container); syncChosen(); updateScanSelection(node);
-        };
         const row = treeNode.querySelector<HTMLElement>(":scope > .scan-row")!;
         const toggle = () => { treeNode.classList.toggle("collapsed"); row.querySelector<HTMLElement>(".scan-toggle")!.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾"; };
         row.querySelector<HTMLButtonElement>(".scan-toggle")?.addEventListener("click", (event) => { event.preventDefault(); toggle(); });
         row.querySelector<HTMLElement>(".scan-name")?.addEventListener("click", () => { if (treeNode.classList.contains("has-children")) toggle(); });
       });
-      container.querySelectorAll<HTMLInputElement>(".scan-file input").forEach((input) => input.onchange = () => { refreshScanTreeChecks(container); syncChosen(); updateScanSelection(node); });
-      refreshScanTreeChecks(container);
+      container.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => input.onchange = () => { syncChosen(); updateScanSelection(node); });
     };
     const renderList = () => {
       body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div class="scan-view-toggle"><button type="button" data-scan-view="tree" class="${scanView === "tree" ? "active" : ""}" title="树状布局">🌲</button><button type="button" data-scan-view="card" class="${scanView === "card" ? "active" : ""}" title="卡片布局">▦</button><button type="button" data-scan-view="list" class="${scanView === "list" ? "active" : ""}" title="列表布局">☰</button></div><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">取消全选</button></div></div>
@@ -549,10 +549,7 @@ async function openScan() {
       const toggle = (type: string) => {
         body.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => {
           input.checked = type === "all" ? true : type === "none" ? false : input.dataset.type === type;
-          input.indeterminate = false;
         });
-        const container = body.querySelector<HTMLElement>(".scan-items");
-        if (container && scanView === "tree") refreshScanTreeChecks(container);
         syncChosen();
         updateScanSelection(node);
       };
@@ -598,11 +595,26 @@ async function reorderGroups(event: DragEvent, targetId: string) { event.prevent
 window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
 void load();
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
-listen("panel-shown", () => { void load(); });
+// 每次打开面板都清空上次的搜索词，从全部条目重新开始
+listen("panel-shown", () => {
+  query = "";
+  searchSelection = null;
+  selected = 0;
+  void load();
+});
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
 document.addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest(".menu")) return;
   document.querySelector(".menu")?.remove();
+});
+// 切到其他窗口再切回时，WebView 不会自动恢复焦点：主动把光标收回搜索框
+// 弹窗打开 / 正在内联改名时不抢焦点
+window.addEventListener("focus", () => {
+  if (document.querySelector(".overlay") || document.querySelector("input.rename-input")) return;
+  const input = document.querySelector<HTMLInputElement>("#search");
+  if (!input) return;
+  input.focus({ preventScroll: true });
+  if (searchSelection) input.setSelectionRange(...searchSelection);
 });
 // 应用外观配置（主题、高亮色、字号、窗口效果、面板背景）并监听设置页变更实时生效
 loadConfig().then(async (cfg) => {

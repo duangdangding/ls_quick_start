@@ -854,7 +854,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
 }
 
 /// 扫描结果排序：快捷方式在前，其余类型按名称排序
-fn sort_scan_entries(entries: &mut Vec<DesktopEntry>) {
+fn sort_scan_entries(entries: &mut [DesktopEntry]) {
     entries.sort_by(|a, b| {
         let rank = |e: &DesktopEntry| if e.is_shortcut { 0 } else { 1 };
         rank(a).cmp(&rank(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
@@ -1361,7 +1361,7 @@ fn ureq_agent() -> ureq::Agent {
 }
 
 /// 带代理回退的 GET：先用代理，连接类错误时自动降级直连
-fn ureq_get_with_fallback(url: &str) -> Result<ureq::Response, ureq::Error> {
+fn ureq_get_with_fallback(url: &str) -> Result<ureq::Response, Box<ureq::Error>> {
     let agent = ureq_agent();
     let resp = agent.get(url).call();
     match resp {
@@ -1369,9 +1369,9 @@ fn ureq_get_with_fallback(url: &str) -> Result<ureq::Response, ureq::Error> {
         Err(ureq::Error::Transport(t)) => {
             // 代理连接失败/超时，回退直连
             eprintln!("代理连接失败，回退直连：{t}");
-            ureq::AgentBuilder::new().build().get(url).call()
+            ureq::AgentBuilder::new().build().get(url).call().map_err(Box::new)
         }
-        Err(e) => Err(e),
+        Err(e) => Err(Box::new(e)),
     }
 }
 
@@ -1766,7 +1766,8 @@ pub fn run() {
                     let _ = win.set_size(tauri::PhysicalSize::new(window_width, window_height));
                 }
                 apply_window_effect(&win, &window_effect_cfg, theme_dark);
-                if silent_start { let _ = win.hide(); }
+                // 窗口默认隐藏（visible: false），非静默启动时在这里统一显示，避免启动闪现
+                if !silent_start { let _ = win.show(); let _ = win.set_focus(); }
                 let w = win.clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {

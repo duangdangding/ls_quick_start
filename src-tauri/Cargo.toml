@@ -1,6 +1,6 @@
 [package]
 name = "suqi"
-version = "0.13.3"
+version = "0.13.4"
 description = "速启 - 快捷启动器"
 authors = ["you"]
 edition = "2021"
