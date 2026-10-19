@@ -46,6 +46,9 @@ struct LauncherItem {
     #[serde(default)]
     description: String,
     target: String,
+    /// 来源快捷方式（.lnk）路径：存在时优先经它启动，由系统 Shell 还原 目标+参数+工作目录
+    #[serde(default)]
+    lnk_path: Option<String>,
     group_id: Option<String>,
     is_encrypted: bool,
     #[serde(default)]
@@ -224,6 +227,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
             keyword TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
             target TEXT NOT NULL,
+            lnk_path TEXT,
             group_id TEXT,
             is_encrypted INTEGER NOT NULL DEFAULT 0,
             is_cmd INTEGER NOT NULL DEFAULT 0,
@@ -257,13 +261,16 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     if !has_column("description") {
         conn.execute("ALTER TABLE items ADD COLUMN description TEXT NOT NULL DEFAULT ''", []).map_err(|e| format!("升级数据库失败：{e}"))?;
     }
+    if !has_column("lnk_path") {
+        conn.execute("ALTER TABLE items ADD COLUMN lnk_path TEXT", []).map_err(|e| format!("升级数据库失败：{e}"))?;
+    }
     Ok(())
 }
 
 fn load_store_from_db(conn: &Connection) -> Result<Store, String> {
     let mut store = Store::default();
 
-    let mut stmt = conn.prepare("SELECT id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword, description FROM items ORDER BY sort_order").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword, description, lnk_path FROM items ORDER BY sort_order").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| {
         Ok(LauncherItem {
             id: row.get(0)?,
@@ -277,6 +284,7 @@ fn load_store_from_db(conn: &Connection) -> Result<Store, String> {
             created_at: row.get(8)?,
             keyword: row.get(9)?,
             description: row.get(10)?,
+            lnk_path: row.get(11)?,
         })
     }).map_err(|e| e.to_string())?;
     for row in rows { store.items.push(row.map_err(|e| e.to_string())?); }
@@ -303,8 +311,8 @@ fn save_store_to_db(conn: &Connection, store: &Store) -> Result<(), String> {
     tx.execute("DELETE FROM password", []).map_err(|e| e.to_string())?;
     for item in &store.items {
         tx.execute(
-            "INSERT INTO items (id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword, description) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![item.id, item.name, item.target, item.group_id, item.is_encrypted as i64, item.is_cmd as i64, item.icon_path, item.sort_order, item.created_at, item.keyword, item.description],
+            "INSERT INTO items (id, name, target, group_id, is_encrypted, is_cmd, icon_path, sort_order, created_at, keyword, description, lnk_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![item.id, item.name, item.target, item.group_id, item.is_encrypted as i64, item.is_cmd as i64, item.icon_path, item.sort_order, item.created_at, item.keyword, item.description, item.lnk_path],
         ).map_err(|e| e.to_string())?;
     }
     for group in &store.groups {
@@ -574,6 +582,20 @@ fn normalize_target(value: &str, is_cmd: bool) -> Result<String, String> {
     let resolved = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) { PathBuf::from(resolve_lnk(path)) } else { path.to_path_buf() };
     fs::canonicalize(&resolved).map_err(|_| "本地路径不存在或无法访问".to_string()).map(|p| display_path(p.display().to_string()))
 }
+/// 记录条目的快捷方式来源（仅 Windows 的 .lnk 有意义）：
+/// 目标本身是 .lnk → 记录之；目标未变（仅改名等编辑）→ 沿用原值；其他情况 → 清空
+#[cfg(windows)]
+fn resolve_lnk_path(raw_target: &str, resolved: &str, is_cmd: bool, existing: Option<&LauncherItem>) -> Option<String> {
+    if !is_cmd && !is_url(raw_target) && Path::new(raw_target).extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+        return Some(fs::canonicalize(raw_target).map(|p| display_path(p.display().to_string())).unwrap_or_else(|_| raw_target.to_string()));
+    }
+    if existing.is_some_and(|old| old.target == resolved) { return existing.and_then(|old| old.lnk_path.clone()); }
+    None
+}
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+fn resolve_lnk_path(_raw_target: &str, _resolved: &str, _is_cmd: bool, _existing: Option<&LauncherItem>) -> Option<String> { None }
+
 fn pinyin_text(name: &str) -> (String, String) {
     let parts: Vec<String> = name.to_pinyin().map(|x| x.map(|p| p.plain().to_string()).unwrap_or_default()).collect();
     let full = parts.join("");
@@ -619,7 +641,11 @@ fn save_item(data: State<'_, AppData>, mut item: LauncherItem, is_cmd: bool) -> 
     item.keyword = item.keyword.trim().to_string();
     if item.keyword.is_empty() { item.keyword = item.name.clone(); }
     item.description = item.description.trim().to_string();
-    item.target = normalize_target(&item.target, is_cmd)?;
+    // 保存前取一次原条目，便于目标未变（仅改名等）时保留快捷方式来源
+    let existing = data.store.lock().unwrap().items.iter().find(|x| x.id == item.id).cloned();
+    let raw_target = item.target.trim().to_string();
+    item.target = normalize_target(&raw_target, is_cmd)?;
+    item.lnk_path = resolve_lnk_path(&raw_target, &item.target, is_cmd, existing.as_ref());
     item.is_encrypted = item.group_id.as_deref() == Some(ENCRYPTED_GROUP);
     item.is_cmd = is_cmd;
     let mut store = data.store.lock().unwrap();
@@ -674,7 +700,12 @@ fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(),
             command.args(["/C", &item.target]);
             hide_console(&mut command);
             command.spawn().map_err(|e| format!("无法打开目标：{e}"))?;
-        } else { Command::new("explorer.exe").arg(&item.target).spawn().map_err(|e| format!("无法打开目标：{e}"))?; }
+        } else {
+            // 快捷方式来源的条目优先启动原始 .lnk（Shell 会还原 目标+参数+工作目录）；lnk 缺失时回退解析后的目标
+            let lnk = item.lnk_path.as_deref().filter(|path| Path::new(path).is_file());
+            let launch = lnk.unwrap_or(&item.target);
+            Command::new("explorer.exe").arg(launch).spawn().map_err(|e| format!("无法打开目标：{e}"))?;
+        }
     }
     #[cfg(not(windows))] {
         let mut command = if item.is_cmd { let mut c = Command::new("sh"); c.args(["-c", &item.target]); c } else { let mut c = Command::new("open"); c.arg(&item.target); c };
@@ -930,17 +961,19 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let shortcut_paths: Vec<PathBuf> = entries.iter().filter(|e| e.is_shortcut).map(|e| PathBuf::from(&e.source_path)).collect();
     let shortcut_targets = resolve_shortcuts(&shortcut_paths);
     let mut shortcut_index = 0;
-    let mut prepared = Vec::new();
+    // (名称, 解析后的真实目标, 所在文件夹, 原始快捷方式路径)
+    let mut prepared: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
     let mut skipped_invalid = 0;
     for entry in entries {
         if entry.name.trim().is_empty() { skipped_invalid += 1; continue; }
         let folder = parent_folder_name(&entry.source_path);
-        let candidate = if entry.is_shortcut {
+        // 快捷方式条目同时保留原始 .lnk 路径，启动时经它还原 目标+参数+工作目录
+        let (candidate, lnk_path) = if entry.is_shortcut {
             let target = shortcut_targets.get(shortcut_index).cloned().unwrap_or_default();
-            shortcut_index += 1; target
-        } else { entry.source_path.clone() };
+            shortcut_index += 1; (target, Some(entry.source_path.clone()))
+        } else { (entry.source_path.clone(), None) };
         match normalize_target(&candidate, false) {
-            Ok(target) => prepared.push((entry.name, target, folder)),
+            Ok(target) => prepared.push((entry.name, target, folder, lnk_path)),
             Err(_) => skipped_invalid += 1,
         }
     }
@@ -949,13 +982,21 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut added = 0;
     let mut skipped_duplicates = 0;
     let mut order = store.items.iter().map(|item| item.sort_order).max().unwrap_or(-1) + 1;
-    for (name, target, folder) in prepared {
-        if !known.insert(target.to_lowercase()) { skipped_duplicates += 1; continue; }
+    for (name, target, folder, lnk_path) in prepared {
+        if !known.insert(target.to_lowercase()) {
+            // 旧条目缺少快捷方式来源时，本次扫描按真实目标匹配补齐，顺带修复历史数据
+            if let Some(lnk_path) = lnk_path {
+                if let Some(old) = store.items.iter_mut().find(|x| x.target.eq_ignore_ascii_case(&target)) {
+                    if old.lnk_path.is_none() { old.lnk_path = Some(lnk_path); }
+                }
+            }
+            skipped_duplicates += 1; continue;
+        }
         // 勾选「按文件夹名称分组」时优先使用条目所在文件夹名（不存在则新建），取不到时回退到当前分组
         let target_group = if group_by_folder {
             folder.filter(|name| !name.trim().is_empty()).map(|name| group_id_by_name(&mut store, &name)).or_else(|| group_id.clone())
         } else { group_id.clone() };
-        store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, group_id: target_group, is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now(), description: String::new() });
+        store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, lnk_path, group_id: target_group, is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now(), description: String::new() });
         order += 1; added += 1;
     }
     persist(&data, &store)?;
