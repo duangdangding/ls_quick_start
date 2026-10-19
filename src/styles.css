@@ -262,8 +262,9 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .bulk-bar button { padding: 5px 10px; font-size: 12px; }
 .bulk-bar button:disabled { cursor: not-allowed; opacity: .5; }
 .bulk-bar button.danger { color: var(--danger); }
-.icon.pick { border: 2px dashed var(--border); background: transparent; color: var(--hl-color); font-size: 18px; }
-.card.picked .icon.pick { border-style: solid; border-color: var(--hl-color); background: color-mix(in srgb, var(--hl-color) 22%, transparent); }
+.icon.pick { position: relative; overflow: visible; border: 2px dashed var(--border); }
+.icon .pick-mark { position: absolute; right: -6px; top: -6px; width: 16px; height: 16px; display: grid; place-items: center; border-radius: 50%; background: var(--hl-color); color: #fff; font-size: 11px; font-style: normal; line-height: 1; box-shadow: 0 1px 4px rgba(0,0,0,.45); }
+.card.picked .icon.pick { border-style: solid; border-color: var(--hl-color); }
 .card.picked { border-color: var(--hl-color); }
 
 /* ---------- 删除分组：处理方式单选 ---------- */
