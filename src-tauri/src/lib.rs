@@ -606,6 +606,15 @@ fn pinyin_text(name: &str) -> (String, String) {
 }
 fn encrypted(item: &LauncherItem) -> bool { item.is_encrypted || item.group_id.as_deref() == Some(ENCRYPTED_GROUP) }
 
+/// 条目所属分组的显示名称：加密分组 / 自定义分组名 / 未分组（用于导入结果中提示重复项位置）
+fn item_group_label(store: &Store, item: &LauncherItem) -> String {
+    if encrypted(item) { return "加密".into(); }
+    item.group_id.as_ref()
+        .and_then(|id| store.groups.iter().find(|group| &group.id == id))
+        .map(|group| group.name.clone())
+        .unwrap_or_else(|| "未分组".into())
+}
+
 fn persist(data: &AppData, store: &Store) -> Result<(), String> {
     let conn = data.conn.lock().unwrap();
     save_store_to_db(&conn, store)
@@ -825,7 +834,11 @@ struct DesktopEntry {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize }
+struct ImportSkip { name: String, target: String, group_name: Option<String>, reason: Option<String> }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize, duplicates: Vec<ImportSkip>, invalids: Vec<ImportSkip> }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -965,9 +978,13 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut shortcut_index = 0;
     // (名称, 解析后的真实目标, 所在文件夹, 原始快捷方式路径)
     let mut prepared: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
-    let mut skipped_invalid = 0;
+    // 失败明细：记录条目名、来源路径与失败原因，导入结束后统一列出
+    let mut invalids: Vec<ImportSkip> = Vec::new();
     for entry in entries {
-        if entry.name.trim().is_empty() { skipped_invalid += 1; continue; }
+        if entry.name.trim().is_empty() {
+            invalids.push(ImportSkip { name: "（未命名）".into(), target: entry.source_path.clone(), group_name: None, reason: Some("名称为空".into()) });
+            continue;
+        }
         let folder = parent_folder_name(&entry.source_path);
         // 快捷方式条目同时保留原始 .lnk 路径，启动时经它还原 目标+参数+工作目录
         let (candidate, lnk_path) = if entry.is_shortcut {
@@ -976,21 +993,22 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
         } else { (entry.source_path.clone(), None) };
         match normalize_target(&candidate, false) {
             Ok(target) => prepared.push((entry.name, target, folder, lnk_path)),
-            Err(_) if lnk_path.is_some() => {
+            Err(error) if lnk_path.is_some() => {
                 // 快捷方式目标解析失败（目标为空、已被删除等特殊链接）：退化为按 .lnk 自身导入，
                 // 启动时仍经 lnk_path 由 Shell 处理，避免误报「无效」
                 match fs::canonicalize(&entry.source_path) {
                     Ok(path) => prepared.push((entry.name, display_path(path.display().to_string()), folder, lnk_path)),
-                    Err(_) => skipped_invalid += 1,
+                    Err(_) => invalids.push(ImportSkip { name: entry.name, target: entry.source_path, group_name: None, reason: Some(error) }),
                 }
             }
-            Err(_) => skipped_invalid += 1,
+            Err(error) => invalids.push(ImportSkip { name: entry.name, target: entry.source_path, group_name: None, reason: Some(error) }),
         }
     }
     let mut store = data.store.lock().unwrap();
     let mut known: HashSet<String> = store.items.iter().map(|item| item.target.to_lowercase()).collect();
     let mut added = 0;
-    let mut skipped_duplicates = 0;
+    // 重复明细：记录与哪个已有条目冲突及其所在分组（同批次先入组的条目也能取到分组名）
+    let mut duplicates: Vec<ImportSkip> = Vec::new();
     let mut order = store.items.iter().map(|item| item.sort_order).max().unwrap_or(-1) + 1;
     for (name, target, folder, lnk_path) in prepared {
         if !known.insert(target.to_lowercase()) {
@@ -1000,7 +1018,9 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
                     if old.lnk_path.is_none() { old.lnk_path = Some(lnk_path); }
                 }
             }
-            skipped_duplicates += 1; continue;
+            let group_name = store.items.iter().find(|x| x.target.eq_ignore_ascii_case(&target)).map(|item| item_group_label(&store, item));
+            duplicates.push(ImportSkip { name, target, group_name, reason: None });
+            continue;
         }
         // 勾选「按文件夹名称分组」时优先使用条目所在文件夹名（不存在则新建），取不到时回退到当前分组
         let target_group = if group_by_folder {
@@ -1010,7 +1030,7 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
         order += 1; added += 1;
     }
     persist(&data, &store)?;
-    Ok(ImportResult { added, skipped_duplicates, skipped_invalid })
+    Ok(ImportResult { added, skipped_duplicates: duplicates.len(), skipped_invalid: invalids.len(), duplicates, invalids })
 }
 
 /// 补齐缺失的条目图标。声明为 async + spawn_blocking：图标提取要调用外部命令

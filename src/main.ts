@@ -12,7 +12,8 @@ type DesktopEntry = { name: string; sourcePath: string; target: string; isShortc
 type SortBy = "relevance" | "name" | "created" | "type";
 type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
-type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number };
+type ImportSkip = { name: string; target: string; groupName: string | null; reason: string | null };
+type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number; duplicates: ImportSkip[]; invalids: ImportSkip[] };
 type ItemIcon = { id: string; iconPath: string | null };
 
 const encryptedId = "__encrypted__";
@@ -490,6 +491,16 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
   };
   return renderNode(buildScanTree(entries), true);
 }
+/** 导入结果弹窗：汇总导入数量，并列出重复项（含已有条目的所在分组）与失败项（含失败原因） */
+function showImportResult(result: ImportResult) {
+  const row = (skip: ImportSkip, tag: string) => `<li><span class="skip-name">${escape(skip.name)}<em>${escape(tag)}</em></span><small>${escape(skip.target)}</small></li>`;
+  const skipped = result.skippedDuplicates + result.skippedInvalid;
+  const duplicates = result.duplicates.length
+    ? `<h3>重复已跳过（${result.skippedDuplicates}）</h3><ul class="skip-list">${result.duplicates.map((skip) => row(skip, `已存在于「${skip.groupName ?? "未分组"}」`)).join("")}</ul>` : "";
+  const invalids = result.invalids.length
+    ? `<h3>导入失败（${result.skippedInvalid}）</h3><ul class="skip-list">${result.invalids.map((skip) => row(skip, skip.reason ?? "未知原因")).join("")}</ul>` : "";
+  modal(`<h2>导入完成</h2><p class="hint">已导入 ${result.added} 项${skipped ? `；跳过重复 ${result.skippedDuplicates} 项、失败 ${result.skippedInvalid} 项，明细如下。` : "。"}</p>${duplicates}${invalids}<div class="modal-actions"><button class="primary" data-close>知道了</button></div>`);
+}
 async function openScan() {
   let scanView: "tree" | "card" | "list" = "tree";
   let chosen = new Set<number>();
@@ -583,8 +594,7 @@ async function openScan() {
     try {
       const result = await invoke<ImportResult>("import_scanned", { entries: selectedEntries, groupId: selectedGroup(), groupByFolder: groupByFolderInput.checked });
       node.remove(); await load();
-      const skipped = result.skippedDuplicates + result.skippedInvalid;
-      alert(`已导入 ${result.added} 项${skipped ? `；跳过重复 ${result.skippedDuplicates} 项、无效 ${result.skippedInvalid} 项。` : "。"}`);
+      showImportResult(result);
     } catch (error) {
       importButton.disabled = false; importButton.textContent = "导入已选";
       node.querySelectorAll<HTMLButtonElement>("button").forEach((control) => control.disabled = false);
