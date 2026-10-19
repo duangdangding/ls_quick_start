@@ -4,6 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>速启设置</title>
+    <!-- 首屏底色：JS/CSS 加载前先铺主题背景色，避免 WebView 默认白底闪烁（与默认深色主题一致，跟随系统浅色偏好） -->
+    <style>
+      html, body { background: #1e1e2e; }
+      @media (prefers-color-scheme: light) { html, body { background: #f4f4f8; } }
+    </style>
   </head>
   <body>
     <main id="settings">
