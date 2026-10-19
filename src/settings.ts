@@ -560,7 +560,7 @@ async function runCheck(manual: boolean) {
   try {
     const info = await checkUpdate();
     showUpdateResult(info);
-    updateStatusEl.textContent = info ? "发现新版本" : "已是最新版本";
+    updateStatusEl.textContent = info ? `发现新版本，可下载 v${info.version}` : "已是最新版本";
   } catch (e) {
     updateStatusEl.textContent = `检查更新失败：${e}`;
   } finally {
@@ -718,6 +718,7 @@ function macUpdateErrorText(e: unknown): string {
 async function macUpdate() {
   if (!pendingUpdate) return;
   const update = pendingUpdate.update;
+  if (!update) return;
   setBusy(true);
   progressWrapEl.hidden = false;
   progressBarEl.style.width = "0%";
@@ -783,7 +784,11 @@ async function macUpdate() {
 doUpdateBtn.addEventListener("click", async () => {
   if (!pendingUpdate) return;
   if (installKind === "portable") return portableUpdate(false);
-  if (isMac) return macUpdate();
+  // macOS 下载依赖插件构造的 update 对象；兜底场景对象为空，引导手动下载
+  if (isMac) {
+    if (!pendingUpdate.update) { updateStatusEl.textContent = "自动下载通道暂不可用，请到 GitHub Releases 页面手动下载新版本"; return; }
+    return macUpdate();
+  }
   await installedUpdate();
 });
 
