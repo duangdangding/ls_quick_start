@@ -475,7 +475,58 @@ fn app_icon_icns(app: &Path) -> Option<PathBuf> {
     }
     preferred.or_else(|| largest.map(|(_, path)| path))
 }
-/// macOS 下用 sips（系统自带）把 icns 转成 128px PNG。比 qlmanage 快很多，也不会挂起
+/// macOS 下用 plutil（系统自带）读取 plist / .strings 文件里的字符串键值，失败返回 None
+#[cfg(target_os = "macos")]
+fn plutil_string(path: &Path, key: &str) -> Option<String> {
+    if !path.exists() { return None; }
+    let output = Command::new("plutil").args(["-extract", key, "raw", "-o", "-"]).arg(path).output().ok()?;
+    if !output.status.success() { return None; }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+/// macOS 系统语言（如 zh_CN）。GUI 应用进程里通常没有 LANG 环境变量，读系统默认设置；进程内只读一次
+#[cfg(target_os = "macos")]
+fn mac_locale() -> &'static str {
+    static LOCALE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LOCALE.get_or_init(|| {
+        Command::new("defaults").args(["read", "-g", "AppleLocale"]).output().ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    })
+}
+/// macOS 下取 `.app` 的本地化显示名称（如「微信」而非「WeChat」）：
+/// 1. 按系统语言在对应 lproj 的 InfoPlist.strings 里找 CFBundleDisplayName / CFBundleName；
+/// 2. 回退 Info.plist 的 CFBundleDisplayName / CFBundleName；
+/// 3. 都没有则返回 None，由调用方用文件名兜底
+#[cfg(target_os = "macos")]
+fn app_display_name(app: &Path) -> Option<String> {
+    let resources = app.join("Contents").join("Resources");
+    // 不同 App 的 lproj 命名不一致（zh_CN / zh-Hans_CN / zh-Hans ...），按系统语言生成候选逐个尝试
+    let locale = mac_locale();
+    let mut lprojs: Vec<String> = Vec::new();
+    if !locale.is_empty() {
+        lprojs.push(locale.to_string());
+        let (lang, region) = locale.split_once('_').unwrap_or((locale, ""));
+        if lang == "zh" {
+            let script = if matches!(region, "TW" | "HK" | "MO") { "zh-Hant" } else { "zh-Hans" };
+            lprojs.push(format!("{script}_{region}"));
+            lprojs.push(script.to_string());
+        }
+        lprojs.push(lang.to_string());
+    }
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        for lproj in &lprojs {
+            if let Some(value) = plutil_string(&resources.join(format!("{lproj}.lproj")).join("InfoPlist.strings"), key) { return Some(value); }
+        }
+    }
+    let info = app.join("Contents").join("Info.plist");
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        if let Some(value) = plutil_string(&info, key) { return Some(value); }
+    }
+    None
+}
+/// macOS 下用 sips（系统自带）把 icns / 图片转成 128px PNG。比 qlmanage 快很多，也不会崩溃或挂起
 #[cfg(target_os = "macos")]
 fn icns_to_png(source: &Path, output: &Path) -> bool {
     if output.exists() { return true; }
@@ -506,11 +557,11 @@ fn copy_generic_icon(source: &Path, outputs: &[&PathBuf]) {
     }
     if let Some(temp) = cached { let _ = fs::remove_file(temp); }
 }
-/// macOS 图标提取。原实现统一走 qlmanage，但 qlmanage 对 `.app` 应用包经常不产出缩略图且单批耗时长
-/// （分批 + 20s 超时会让扫描 / 导入都很慢且拿不到图标）。现改为：
+/// macOS 图标提取：
 /// 1. `.app` 应用包：直接读包内 `.icns`（优先 AppIcon.icns）用 sips 转 128px PNG，并发执行；
 /// 2. 仍缺图标的应用包 / 文件夹：用系统 CoreTypes.bundle 里的通用图标兜底；
-/// 3. 其余（普通文件等）：回退 qlmanage 批量生成缩略图。
+/// 3. 普通文件：图片类直接用 sips 转缩略图，其余用系统通用文档图标兜底。
+///    全程不用 qlmanage —— 它对部分文件会直接崩溃，导致系统反复弹「“qlmanage”意外退出」
 #[cfg(target_os = "macos")]
 fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
     if pairs.is_empty() { return; }
@@ -539,23 +590,17 @@ fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
     if !folder_outputs.is_empty() {
         if let Some(source) = system_icon_icns("GenericFolderIcon.icns") { copy_generic_icon(&source, &folder_outputs); }
     }
-    // 3) 仍未产出图标的（普通文件等）：回退 qlmanage，分批 + 超时保护避免长时间无响应
-    let remaining: Vec<&(PathBuf, PathBuf)> = pairs.iter().filter(|(_, output)| !output.exists()).collect();
-    for (batch, chunk) in remaining.chunks(10).enumerate() {
-        let temp = std::env::temp_dir().join(format!("suqi-icons-{}-{batch}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        if fs::create_dir_all(&temp).is_err() { return; }
-        let mut command = Command::new("qlmanage");
-        command.args(["-t", "-s", "128", "-o"]).arg(&temp);
-        for (input, _) in chunk { command.arg(input); }
-        run_with_timeout(&mut command, std::time::Duration::from_secs(10));
-        // qlmanage 产物名固定为「原文件名.png」，按文件名回填到目标缓存路径
-        for (input, output) in chunk {
-            let name = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let produced = temp.join(format!("{name}.png"));
-            if produced.exists() { let _ = fs::rename(&produced, output); }
-        }
-        let _ = fs::remove_dir_all(&temp);
+    // 3) 普通文件：图片类直接用 sips 转缩略图，其余用系统通用文档图标兜底。
+    //    早期版本回退 qlmanage，但它对部分文件会崩溃，系统反复弹「“qlmanage”意外退出」，故彻底移除
+    let image_exts = ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "ico", "icns"];
+    let mut doc_outputs: Vec<&PathBuf> = Vec::new();
+    for (input, output) in pairs.iter().filter(|(_, output)| !output.exists()) {
+        let is_image = input.extension().is_some_and(|ext| image_exts.iter().any(|e| ext.eq_ignore_ascii_case(e)));
+        if is_image && icns_to_png(input, output) { continue; }
+        doc_outputs.push(output);
+    }
+    if !doc_outputs.is_empty() {
+        if let Some(source) = system_icon_icns("GenericDocumentIcon.icns") { copy_generic_icon(&source, &doc_outputs); }
     }
 }
 /// 运行外部命令并在超时后强制结束，返回是否正常退出（避免 qlmanage 等工具挂起导致界面长时间无响应）
@@ -719,8 +764,18 @@ fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(),
         }
     }
     #[cfg(not(windows))] {
-        let mut command = if item.is_cmd { let mut c = Command::new("sh"); c.args(["-c", &item.target]); c } else { let mut c = Command::new("open"); c.arg(&item.target); c };
-        command.spawn().map_err(|e| format!("无法打开目标：{e}"))?;
+        if item.is_cmd {
+            // 命令行可能长时间运行，保持异步拉起，不等退出码
+            Command::new("sh").args(["-c", &item.target]).spawn().map_err(|e| format!("无法打开目标：{e}"))?;
+        } else {
+            // open 失败时（应用已损坏、被隔离、无权限等）以非零码退出并把原因写到 stderr。
+            // 之前只 spawn 不等结果，启动失败完全无提示；这里等它结束（通常毫秒级）把原因反馈给用户
+            let output = Command::new("open").arg(&item.target).output().map_err(|e| format!("无法打开目标：{e}"))?;
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(if detail.is_empty() { "无法打开目标".to_string() } else { format!("无法打开目标：{detail}") });
+            }
+        }
     }
     Ok(())
 }
@@ -877,8 +932,14 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
             let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
             let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
             if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
+            // macOS 应用包优先用本地化显示名（如「微信」而非「WeChat」），其余条目用文件名
+            let fallback = || path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().into();
+            #[cfg(target_os = "macos")]
+            let name = if is_app_bundle { app_display_name(&path) } else { None }.unwrap_or_else(fallback);
+            #[cfg(not(target_os = "macos"))]
+            let name: String = fallback();
             entries.push(DesktopEntry {
-                name: path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().into(),
+                name,
                 target: source_path.clone(),
                 source_path,
                 is_shortcut: shortcut,
@@ -937,6 +998,8 @@ fn start_menu_dirs() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         dirs.push(PathBuf::from("/Applications"));
+        // macOS Catalina 起系统自带应用（App Store、备忘录、短信等）迁到了 /System/Applications
+        dirs.push(PathBuf::from("/System/Applications"));
         if let Some(home) = dirs::home_dir() { dirs.push(home.join("Applications")); }
     }
     dirs.retain(|dir| dir.is_dir());
