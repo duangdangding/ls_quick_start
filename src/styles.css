@@ -68,8 +68,9 @@ button.link:hover { background: transparent; filter: brightness(1.15); }.menu { 
 .skip-list small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; word-break: break-all; }
 
 /* ---------- 主题变量（浅色/深色） ---------- */
-:root[data-theme="light"] { --bg: #f4f4f8; --surface: #ffffff; --surface-hi: #ececf4; --text: #1e1e2e; --muted: #6b6f83; --border: #d5d7e4; --blue: #4c6ef5; --blue-ink: #ffffff; }
+:root[data-theme="light"] { --bg: #f4f4f8; --surface: #ffffff; --surface-hi: #ececf4; --text: #1e1e2e; --muted: #6b6f83; --border: #d5d7e4; --blue: #4c6ef5; --blue-ink: #ffffff; --gold: #b8860b; }
 :root { --hl-color: var(--blue); }
+:root { --gold: #f9e2af; }
 
 /* ---------- 设置页 ---------- */
 #settings { max-width: 640px; margin: 0 auto; padding: 18px 20px 80px; }
@@ -91,6 +92,12 @@ button.link:hover { background: transparent; filter: brightness(1.15); }.menu { 
 #settings small, #settings .hint { color: var(--muted); font-size: 12px; }
 #settings .hotkey-btn { min-width: 140px; font-family: monospace; }
 #settings .db-info { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 13px; }
+/* 免费开源声明（关于页顶部醒目展示） */
+#settings .free-notice { padding: 14px 16px; border: 1px solid var(--gold); border-radius: 10px; background: color-mix(in srgb, var(--gold) 12%, var(--surface)); }
+#settings .free-notice .free-notice-title { margin: 0 0 6px; font-size: 15px; font-weight: 800; color: var(--gold); }
+#settings .free-notice p { color: var(--text); line-height: 1.6; }
+#settings .free-notice strong { color: var(--gold); }
+#settings .free-notice a { font-weight: 700; }
 #settings footer { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 10px; align-items: center; justify-content: center; padding: 12px; border-top: 1px solid var(--border); background: var(--bg); }
 #settings #save-msg { color: var(--muted); font-size: 12px; }
 #settings h2 { margin: 0; color: var(--text); }

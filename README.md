@@ -2,6 +2,14 @@
 
 跨平台桌面快捷启动器（Windows / macOS），基于 Tauri 2 + Vite + TypeScript + Rust。
 
+## ⭐ 免费开源声明
+
+**速启是完全免费的个人开源软件，永久免费、无任何付费功能。**
+
+- 🚫 如果你是花钱买到本软件的（任何付费渠道均非官方行为），说明你被骗了——请**直接申请退款**，然后到 [GitHub Releases](https://github.com/duangdangding/ls_quick_start/releases) 免费下载正版。
+- ⭐ 如果这个小工具对你有帮助，欢迎到 [GitHub 仓库](https://github.com/duangdangding/ls_quick_start) 点一下 **Star**，这是对我持续更新最大的鼓励！
+
+
 ## 功能
 
 - 分组管理（全部 / 自定义分组 / 加密 / 未分组）；「全部」视图下条目卡片显示所属分组标签
