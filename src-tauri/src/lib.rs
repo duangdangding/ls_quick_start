@@ -89,6 +89,8 @@ struct AppConfig {
     view_mode: String,
     #[serde(default = "default_encrypt_unlock_mode")]
     encrypt_unlock_mode: String,
+    #[serde(default = "default_hotkey_unfocused_behavior")]
+    hotkey_unfocused_behavior: String,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
@@ -99,6 +101,9 @@ fn default_view_mode() -> String { "card".into() }
 
 /// 加密分组解锁策略默认值："always" 每次打开面板都需输入密码 | "session" 仅重启应用才需输入密码
 fn default_encrypt_unlock_mode() -> String { "session".into() }
+
+/// 面板已显示但未聚焦时按全局快捷键的行为："front" 置前显示 | "hide" 隐藏面板
+fn default_hotkey_unfocused_behavior() -> String { "front".into() }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -154,6 +159,7 @@ impl Default for AppConfig {
             window_effect: "default".into(),
             view_mode: "card".into(),
             encrypt_unlock_mode: "session".into(),
+            hotkey_unfocused_behavior: "front".into(),
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),
@@ -2040,7 +2046,15 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
 
 fn toggle_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) { hide_panel_internal(app); }
+        if win.is_visible().unwrap_or(false) {
+            // 面板已显示但被其他窗口盖住（未聚焦）时，按配置决定置前还是隐藏
+            let focused = win.is_focused().unwrap_or(true);
+            let behavior = app.try_state::<ConfigState>()
+                .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
+                .unwrap_or_else(|| "front".into());
+            if !focused && behavior != "hide" { let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); }
+            else { hide_panel_internal(app); }
+        }
         else { let _ = win.show(); let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); }
     }
 }

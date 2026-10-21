@@ -29,6 +29,14 @@
           <small id="hotkey-hint">按下组合键后松开即完成录制（例如 Win+`）</small>
         </div>
         <div class="field">
+          <label>面板已显示但被其他窗口盖住时，按快捷键</label>
+          <select id="hotkey-unfocused-behavior">
+            <option value="front">显示到最前面</option>
+            <option value="hide">隐藏面板</option>
+          </select>
+          <small>选「显示到最前面」时，面板已在最前再按快捷键才会隐藏</small>
+        </div>
+        <div class="field">
           <label>启动</label>
           <label class="check"><input type="checkbox" id="autostart" /> 开机自启动</label>
           <label class="check"><input type="checkbox" id="silent-start" /> 静默启动（不显示主面板）</label>

@@ -122,6 +122,10 @@ function bindCheck(id: string, key: keyof AppConfig) {
 const encryptUnlockSel = $<HTMLSelectElement>("#encrypt-unlock-mode");
 encryptUnlockSel.addEventListener("change", () => { config.encryptUnlockMode = encryptUnlockSel.value; markDirty(); });
 
+// ---------- 面板未聚焦时的热键行为 ----------
+const hotkeyUnfocusedSel = $<HTMLSelectElement>("#hotkey-unfocused-behavior");
+hotkeyUnfocusedSel.addEventListener("change", () => { config.hotkeyUnfocusedBehavior = hotkeyUnfocusedSel.value; markDirty(); });
+
 // ---------- 外观 ----------
 const themeSel = $<HTMLSelectElement>("#theme");
 const colorInput = $<HTMLInputElement>("#highlight-color");
@@ -863,6 +867,7 @@ $("#btn-save").addEventListener("click", async () => {
   bindCheck("remember-size", "rememberSize");
 
   encryptUnlockSel.value = config.encryptUnlockMode === "always" ? "always" : "session";
+  hotkeyUnfocusedSel.value = config.hotkeyUnfocusedBehavior === "hide" ? "hide" : "front";
 
   themeSel.value = config.theme;
   // 搜索高亮颜色：空 = 跟随主题强调色（勾选框勾上、取色器禁用但保留上次颜色）
