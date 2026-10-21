@@ -802,7 +802,23 @@ function openExportDialog() {
   renderTree();
 }
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
-window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
+// Esc 逐层关闭：最上层弹窗 → 「⋯」菜单 → 隐藏面板（内联改名输入框已 stopPropagation，不会触发到这里）
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    const overlays = document.querySelectorAll<HTMLElement>(".overlay");
+    const topOverlay = overlays[overlays.length - 1];
+    if (topOverlay) { topOverlay.remove(); return; }
+    const menu = document.querySelector<HTMLElement>(".menu");
+    if (menu) { menu.remove(); return; }
+    void invoke("hide_panel");
+    return;
+  }
+  const target = event.target as HTMLElement;
+  if (target.matches("input, textarea, select")) return;
+  const shown = displayItems();
+  if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); }
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); }
+});
 void load();
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
 // 每次打开面板都清空上次的搜索词，从全部条目重新开始

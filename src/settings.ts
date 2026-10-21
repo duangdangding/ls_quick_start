@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -63,11 +64,13 @@ function alertDialog(text: string) {
   });
 }
 
-// Esc 关闭最上层的弹窗
+// Esc 关闭最上层的弹窗；没有弹窗时关闭设置窗口（后端 CloseRequested 拦截转为隐藏，不退出进程）
 window.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   const overlays = document.querySelectorAll<HTMLElement>(".overlay");
-  overlays[overlays.length - 1]?.remove();
+  const top = overlays[overlays.length - 1];
+  if (top) { top.remove(); return; }
+  void getCurrentWindow().close();
 });
 
 // ---------- tab 切换 ----------
