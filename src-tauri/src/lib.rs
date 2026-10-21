@@ -91,6 +91,9 @@ struct AppConfig {
     encrypt_unlock_mode: String,
     #[serde(default = "default_hotkey_unfocused_behavior")]
     hotkey_unfocused_behavior: String,
+    /// 搜索框「直接运行」（仿 Win+R）开关：默认开启，搜索启动项的同时可当运行框用；关闭后仅搜索启动项
+    #[serde(default = "default_run_target_enabled")]
+    run_target_enabled: bool,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
@@ -104,6 +107,9 @@ fn default_encrypt_unlock_mode() -> String { "session".into() }
 
 /// 面板已显示但未聚焦时按全局快捷键的行为："front" 置前显示 | "hide" 隐藏面板
 fn default_hotkey_unfocused_behavior() -> String { "front".into() }
+
+/// 「直接运行」功能默认开启
+fn default_run_target_enabled() -> bool { true }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -160,6 +166,7 @@ impl Default for AppConfig {
             view_mode: "card".into(),
             encrypt_unlock_mode: "session".into(),
             hotkey_unfocused_behavior: "front".into(),
+            run_target_enabled: true,
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),
@@ -630,6 +637,9 @@ fn normalize_target(value: &str, is_cmd: bool) -> Result<String, String> {
     if value.is_empty() { return Err("启动目标不能为空".into()); }
     if is_cmd { return Ok(value.to_string()); }
     if is_url(value) { return normalize_url(value); }
+    // Windows 外壳命名空间目标（shell: 开头，如 shell:RecycleBinFolder）：由 explorer 负责解析，不能按本地路径校验
+    #[cfg(windows)]
+    if value.len() > 6 && value[..6].eq_ignore_ascii_case("shell:") { return Ok(value.to_string()); }
     let path = Path::new(value);
     if !path.is_absolute() { return Err("本地路径必须为绝对路径".into()); }
     let resolved = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) { PathBuf::from(resolve_lnk(path)) } else { path.to_path_buf() };
@@ -831,6 +841,139 @@ fn save_item_order(data: State<'_, AppData>, ids: Vec<String>) -> Result<(), Str
     persist(&data, &store)
 }
 
+// ---------- 直接运行（仿 Win + R） ----------
+
+/// 把搜索框内容当「运行」输入执行：UNC 路径、URL、shell: 目标、盘符路径、命令名（可带参数）均可
+#[tauri::command]
+fn run_target(raw: String) -> Result<(), String> {
+    let input = raw.trim();
+    if input.is_empty() { return Err("请输入要运行的内容".into()); }
+    #[cfg(windows)]
+    { run_target_windows(input) }
+    #[cfg(not(windows))]
+    { run_target_fallback(input) }
+}
+
+#[cfg(windows)]
+fn explorer_open(target: &str) -> Result<(), String> {
+    Command::new("explorer.exe").arg(target).spawn().map(|_| ()).map_err(|e| format!("无法打开：{e}"))
+}
+
+/// 展开 %VAR% 形式的环境变量（Win+R 同样支持，如 %appdata%）；未定义的变量原样保留
+#[cfg(windows)]
+fn expand_env_vars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        match tail.find('%') {
+            Some(end) if end > 0 => {
+                let name = &tail[..end];
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    Err(_) => { out.push('%'); out.push_str(&tail[..=end]); }
+                }
+                rest = &tail[end + 1..];
+            }
+            _ => { out.push('%'); out.push_str(tail); rest = ""; }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(windows)]
+fn run_target_windows(input: &str) -> Result<(), String> {
+    let expanded = expand_env_vars(input);
+    let lower = expanded.to_lowercase();
+    // UNC / URL / shell: 命名空间目标 → 交给资源管理器（等同 Win+R 的 ShellExecute 语义）
+    if expanded.starts_with(r"\\") || expanded.starts_with("//") || lower.contains("://") || lower.starts_with("shell:") {
+        return explorer_open(&expanded);
+    }
+    let words: Vec<&str> = expanded.split_whitespace().collect();
+    // 前缀探测：允许不带引号的含空格路径——前 k 个词拼起来是存在的路径，其余视为参数
+    for k in (1..=words.len()).rev() {
+        let candidate = words[..k].join(" ");
+        if Path::new(&candidate).is_absolute() && Path::new(&candidate).exists() {
+            return launch_resolved(&candidate, &words[k..]);
+        }
+    }
+    // 单个词按 Win+R 规则解析命令名（App Paths 注册表 → PATH + PATHEXT）
+    let first = words[0];
+    match resolve_command(first) {
+        Some(resolved) => launch_resolved(&resolved, &words[1..]),
+        None => Err(format!("找不到命令、路径或程序：{first}")),
+    }
+}
+
+/// 启动已解析的目标：exe / 批处理直接拉起；其余类型（.msc、文档、文件夹等）交给 explorer 按文件关联打开
+#[cfg(windows)]
+fn launch_resolved(path: &str, args: &[&str]) -> Result<(), String> {
+    let ext = Path::new(path).extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd") {
+        // 不隐藏控制台：用户输入 cmd / ping 等命令时预期看到窗口
+        Command::new(path).args(args).spawn().map(|_| ()).map_err(|e| format!("无法运行：{e}"))
+    } else if args.is_empty() {
+        explorer_open(path)
+    } else {
+        // 非可执行文件带参数：经 PowerShell Start-Process 走 ShellExecute，按文件关联启动并透传参数
+        let arg_list = args.iter().map(ps_quote).collect::<Vec<_>>().join(",");
+        let script = format!("try {{ Start-Process -FilePath {} -ArgumentList @({arg_list}) -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}", ps_quote(path));
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", &script]);
+        hide_console(&mut command);
+        let output = command.output().map_err(|e| format!("无法运行：{e}"))?;
+        if output.status.success() { Ok(()) } else {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if detail.is_empty() { "无法打开目标".into() } else { format!("无法打开目标：{detail}") })
+        }
+    }
+}
+
+/// 按 Win+R 的规则解析命令名：1) 自身即存在的路径 2) App Paths 注册表 3) PATH + PATHEXT 搜索
+#[cfg(windows)]
+fn resolve_command(name: &str) -> Option<String> {
+    if Path::new(name).exists() && (Path::new(name).is_absolute() || name.contains(['\\', '/'])) { return Some(name.to_string()); }
+    let has_ext = Path::new(name).extension().is_some();
+    // App Paths：chrome / winword 等注册的执行别名（HKLM 优先，HKCU 兜底）
+    for root in [winreg::enums::HKEY_LOCAL_MACHINE, winreg::enums::HKEY_CURRENT_USER] {
+        let base = winreg::RegKey::predef(root);
+        let key_names = if has_ext { vec![name.to_string()] } else { vec![format!("{name}.exe"), name.to_string()] };
+        for key_name in key_names {
+            if let Ok(key) = base.open_subkey(format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{key_name}")) {
+                if let Ok(value) = key.get_value::<String, _>("") {
+                    if Path::new(&value).exists() { return Some(value); }
+                }
+            }
+        }
+    }
+    // PATH 搜索：无扩展名时按 PATHEXT 依次补全（NTFS 不区分大小写，无需枚举大小写组合）
+    let path_var = std::env::var_os("PATH")?;
+    let pathext: Vec<String> = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+    for dir in std::env::split_paths(&path_var) {
+        let candidates: Vec<PathBuf> = if has_ext { vec![dir.join(name)] } else { pathext.iter().map(|ext| dir.join(format!("{name}{ext}"))).collect() };
+        for candidate in candidates {
+            if candidate.is_file() { return Some(display_path(candidate.display().to_string())); }
+        }
+    }
+    None
+}
+
+/// macOS 兜底：路径 / URL 交给 open，其余按命令直接执行（Command 会走 PATH 查找）
+#[cfg(not(windows))]
+fn run_target_fallback(input: &str) -> Result<(), String> {
+    if input.starts_with('/') || input.starts_with('~') || input.to_lowercase().contains("://") {
+        let output = Command::new("open").arg(input).output().map_err(|e| format!("无法打开：{e}"))?;
+        if output.status.success() { return Ok(()); }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() { "无法打开目标".into() } else { format!("无法打开目标：{detail}") });
+    }
+    let words: Vec<&str> = input.split_whitespace().collect();
+    Command::new(words[0]).args(&words[1..]).spawn().map(|_| ()).map_err(|_| format!("找不到命令：{}", words[0]))
+}
+
 fn password_hash(password: &str, salt: &str) -> String {
     let mut hasher = Sha256::new(); hasher.update(salt.as_bytes()); hasher.update(password.as_bytes()); hex::encode(hasher.finalize())
 }
@@ -971,19 +1114,143 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
     Ok(entries)
 }
 
-/// 扫描结果排序：快捷方式在前，其余类型按名称排序
+/// 扫描结果排序：快捷方式在前，其次是系统图标（此电脑 / 回收站等），其余类型按名称排序
 fn sort_scan_entries(entries: &mut [DesktopEntry]) {
     entries.sort_by(|a, b| {
-        let rank = |e: &DesktopEntry| if e.is_shortcut { 0 } else { 1 };
+        let rank = |e: &DesktopEntry| if e.is_shortcut { 0 } else if e.entry_type == "system" { 1 } else { 2 };
         rank(a).cmp(&rank(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
+}
+
+// ---------- 桌面系统图标（此电脑 / 回收站等） ----------
+
+/// 桌面「系统图标」是外壳虚拟对象而非文件，目录扫描读不到；按注册表配置单独补充进桌面扫描结果
+#[cfg(windows)]
+struct ShellIconSpec { clsid: &'static str, target: &'static str, fallback_name: &'static str, default_shown: bool, prefer_fallback_name: bool }
+
+/// 「桌面图标设置」对话框中的五个系统图标：CLSID 即注册表 HideDesktopIcons 下的值名
+#[cfg(windows)]
+const SHELL_ICON_SPECS: &[ShellIconSpec] = &[
+    ShellIconSpec { clsid: "{20D04FE0-3AEA-1069-A2D8-08002B30309D}", target: "shell:MyComputerFolder", fallback_name: "此电脑", default_shown: false, prefer_fallback_name: false },
+    ShellIconSpec { clsid: "{645FF040-5081-101B-9F08-00AA002F954E}", target: "shell:RecycleBinFolder", fallback_name: "回收站", default_shown: true, prefer_fallback_name: false },
+    // 命名空间显示名是「所有控制面板项」，与桌面图标标签「控制面板」不一致，这里以桌面标签为准
+    ShellIconSpec { clsid: "{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}", target: "shell:ControlPanelFolder", fallback_name: "控制面板", default_shown: false, prefer_fallback_name: true },
+    ShellIconSpec { clsid: "{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", target: "shell:NetworkPlacesFolder", fallback_name: "网络", default_shown: false, prefer_fallback_name: false },
+    ShellIconSpec { clsid: "{59031A47-3F72-44A7-89C5-5595FE6B30EE}", target: "shell:::{59031A47-3F72-44A7-89C5-5595FE6B30EE}", fallback_name: "用户的文件", default_shown: false, prefer_fallback_name: false },
+];
+
+/// 读注册表判断某系统图标当前是否显示在桌面：HideDesktopIcons 下值 0 显示、1 隐藏；
+/// 两个面板配置都未写过该项时用默认值（全新系统默认只显示回收站）
+#[cfg(windows)]
+fn shell_icon_shown(clsid: &str, default_shown: bool) -> bool {
+    let base = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    for subkey in [
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel",
+        r"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\ClassicStartMenu",
+    ] {
+        if let Ok(key) = base.open_subkey(subkey) {
+            if let Ok(value) = key.get_value::<u32, _>(clsid) { return value == 0; }
+        }
+    }
+    default_shown
+}
+
+/// 提取外壳虚拟对象（shell: 目标）的图标与系统显示名：SHGetFileInfo 不认这类字符串路径，
+/// 需先 SHParseDisplayName 解析成 PIDL 再取图标（SHGFI_PIDL）。
+/// 返回与 pairs 等长的显示名列表（取不到为空串），图标写入对应输出文件；脚本写临时文件执行，理由同 extract_icons
+#[cfg(windows)]
+fn extract_shell_icons(pairs: &[(String, PathBuf)]) -> Vec<String> {
+    if pairs.is_empty() { return Vec::new(); }
+    const TYPE_DEF: &str = r#"Add-Type -AssemblyName System.Drawing
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public static class SuqiShellIcon {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)]
+  public struct SHFILEINFO { public IntPtr hIcon; public int iIcon; public uint dwAttributes; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szDisplayName; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=80)] public string szTypeName; }
+  [DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SHGetFileInfo(IntPtr pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+  [DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+  [DllImport("ole32.dll")] public static extern void CoTaskMemFree(IntPtr pv);
+  [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+  public static void Save(string name, string output) {
+    IntPtr pidl; uint attr;
+    if (SHParseDisplayName(name, IntPtr.Zero, out pidl, 0, out attr) != 0) { WriteName(""); return; }
+    SHFILEINFO info = new SHFILEINFO();
+    IntPtr res = SHGetFileInfo(pidl, 0, ref info, (uint)Marshal.SizeOf(info), 0x308);
+    CoTaskMemFree(pidl);
+    if (res == IntPtr.Zero || info.hIcon == IntPtr.Zero) { WriteName(""); return; }
+    try { using (Icon icon = Icon.FromHandle(info.hIcon)) using (Bitmap bmp = icon.ToBitmap()) { bmp.Save(output, System.Drawing.Imaging.ImageFormat.Png); } } catch {}
+    DestroyIcon(info.hIcon);
+    WriteName(info.szDisplayName ?? "");
+  }
+  // 直接往标准输出写 UTF-8 原始字节：绕开控制台编码，中文显示名不会乱码
+  static void WriteName(string value) {
+    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(value + "\n");
+    using (System.IO.Stream stdout = System.Console.OpenStandardOutput()) { stdout.Write(bytes, 0, bytes.Length); }
+  }
+}
+'@
+"#;
+    let values = pairs.iter().flat_map(|(input, output)| [ps_quote(input), ps_quote(output.display().to_string())]).collect::<Vec<_>>().join(",");
+    let script = format!("{TYPE_DEF}$p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ [SuqiShellIcon]::Save($p[$i],$p[$i+1]) }}");
+    let script_file = std::env::temp_dir().join(format!("suqi-shell-icons-{}-{}.ps1", std::process::id(), now()));
+    // PowerShell 5.1 默认按 ANSI 读取脚本文件，必须带 UTF-8 BOM（同 extract_icons）
+    let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
+    bytes.extend_from_slice(script.as_bytes());
+    if fs::write(&script_file, bytes).is_err() { return vec![String::new(); pairs.len()]; }
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script_file);
+    hide_console(&mut command);
+    let output = command.output();
+    let _ = fs::remove_file(&script_file);
+    let mut names: Vec<String> = match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).lines().map(|line| line.trim().to_string()).collect(),
+        Err(_) => Vec::new(),
+    };
+    names.resize(pairs.len(), String::new());
+    names
+}
+
+/// 把当前显示在桌面的系统图标并入扫描结果：条目类型为 system，启动目标用 shell: 命名空间字符串，
+/// 导入后经 normalize_target 的 shell: 分支原样保存，open_item 里由 explorer 解析打开
+#[cfg(windows)]
+fn append_desktop_shell_entries(entries: &mut Vec<DesktopEntry>) {
+    let icon_dir = default_data_dir().join("scan-icons");
+    let _ = fs::create_dir_all(&icon_dir);
+    let specs: Vec<&ShellIconSpec> = SHELL_ICON_SPECS.iter().filter(|spec| shell_icon_shown(spec.clsid, spec.default_shown)).collect();
+    if specs.is_empty() { return; }
+    // 图标文件名规则与 scan_dir 一致（来源字符串的 sha256）；每次扫描都重新提取，回收站空/满等图标变化能跟进，同时拿到系统本地化显示名
+    let pairs: Vec<(String, PathBuf)> = specs.iter().map(|spec| {
+        let mut hasher = Sha256::new(); hasher.update(spec.target.as_bytes());
+        (spec.target.to_string(), icon_dir.join(format!("{}.png", hex::encode(hasher.finalize()))))
+    }).collect();
+    let names = extract_shell_icons(&pairs);
+    for ((spec, (_, icon_file)), display_name) in specs.iter().zip(pairs.iter()).zip(names) {
+        let name = if display_name.is_empty() || spec.prefer_fallback_name { spec.fallback_name.to_string() } else { display_name };
+        entries.push(DesktopEntry {
+            name: name.clone(),
+            source_path: spec.target.to_string(),
+            target: spec.target.to_string(),
+            is_shortcut: false,
+            entry_type: "system".into(),
+            scan_icon_path: icon_file.exists().then(|| display_path(icon_file.display().to_string())),
+            folder_name: None,
+            rel_path: vec![name],
+        });
+    }
 }
 
 /// 扫描桌面（默认入口）。声明为 async 以脱离主线程执行，避免耗时扫描阻塞界面（macOS 上曾表现为「点击扫描没反应」）
 #[tauri::command]
 async fn scan_desktop(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
-    scan_dir(&desktop, recursive.unwrap_or(false))
+    let mut entries = scan_dir(&desktop, recursive.unwrap_or(false))?;
+    // Windows 下把显示在桌面的系统图标（此电脑 / 回收站等虚拟对象）一并并入，再统一排序
+    #[cfg(windows)]
+    append_desktop_shell_entries(&mut entries);
+    sort_scan_entries(&mut entries);
+    Ok(entries)
 }
 
 /// 扫描用户手动选择的文件夹（与桌面扫描同规则）
@@ -2154,7 +2421,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
-            import_scanned, delete_shortcut_files, export_items, item_icons, get_config, save_config, get_db_info,
+            import_scanned, delete_shortcut_files, export_items, item_icons, get_config, save_config, get_db_info, run_target,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,

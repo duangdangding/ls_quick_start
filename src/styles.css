@@ -20,7 +20,7 @@ button.link:hover { background: transparent; filter: brightness(1.15); }.menu { 
 .scan-items.card input { grid-row: 1; width: auto; margin: 0; accent-color: var(--blue); }
 .scan-items.card .scan-icon { grid-row: 1; width: 26px; height: 26px; flex: none; font-size: 16px; }
 .scan-items.card .scan-name { grid-row: 1; color: var(--text); display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; min-width: 0; font-size: 13px; }
-.scan-items.card small { grid-column: 1 / -1; overflow: hidden; color: var(--muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }.scan-icon { width: 20px; height: 20px; display: inline-grid; place-items: center; flex: 0 0 20px; border-radius: 5px; background: #1e1e2e; color: var(--blue); font-style: normal; font-size: 13px; overflow: hidden; }.scan-icon img { width: 100%; height: 100%; object-fit: cover; }.scan-icon.folder { color: #f9e2af; }.scan-icon.shortcut { color: var(--green); }.scan-items em { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--muted); font-style: normal; font-size: 10px; }
+.scan-items.card small { grid-column: 1 / -1; overflow: hidden; color: var(--muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; }.scan-icon { width: 20px; height: 20px; display: inline-grid; place-items: center; flex: 0 0 20px; border-radius: 5px; background: #1e1e2e; color: var(--blue); font-style: normal; font-size: 13px; overflow: hidden; }.scan-icon img { width: 100%; height: 100%; object-fit: cover; }.scan-icon.folder { color: #f9e2af; }.scan-icon.shortcut { color: var(--green); }.scan-icon.system { color: #cba6f7; }.scan-items em { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--muted); font-style: normal; font-size: 10px; }
 .scan-items.list .scan-name em { margin-left: auto; }
 /* 所在文件夹小标签 */
 .scan-folder { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: #f9e2af; font-style: normal; font-size: 10px; }
@@ -141,8 +141,9 @@ button.primary { background: var(--hl-color); border-color: var(--hl-color); col
 .grid.list .card { padding: 8px 12px; border-radius: 9px; box-shadow: none; }
 .grid.list .card:hover, .grid.list .card.selected { transform: none; box-shadow: 0 4px 12px rgba(0,0,0,.14); }
 .grid.list .icon { flex: 0 0 30px; height: 30px; font-size: 17px; border-radius: 7px; }
-.grid.list .card-text { flex: 1; flex-direction: row; align-items: center; gap: 10px; }
-.grid.list .card-text span { flex: 1; max-width: none; text-align: right; }
+.grid.list .card-text { flex: 1; min-width: 0; flex-direction: row; align-items: center; gap: 10px; }
+.grid.list .card-text b { flex: 0 1 auto; min-width: 0; }
+.grid.list .card-text span { flex: 1; min-width: 0; max-width: none; text-align: right; }
 .grid.list .more { position: static; }
 
 /* ---------- 卡片视图：紧凑布局 + 关键字标签 ---------- */
@@ -177,6 +178,7 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .tip { position: fixed; z-index: 20; display: flex; flex-direction: column; gap: 3px; max-width: 320px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 6px 18px rgba(0,0,0,.18); color: var(--text); font-size: 12px; line-height: 1.45; pointer-events: none; word-break: break-word; }
 .tip b { font-size: 13px; font-weight: 600; }
 .tip span { color: var(--muted); white-space: pre-wrap; }
+.tip small { color: var(--muted); font-size: 11px; opacity: .85; word-break: break-all; }
 
 /* ---------- 搜索命中高亮 ---------- */
 /* 命中字符用 <mark> 标出；颜色取「高亮颜色」（空 = 跟随主题强调色） */
@@ -324,3 +326,7 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .export-overlay #export-tree { flex: 1; min-height: 140px; max-height: none; overflow: auto; }
 #export-tree .scan-row input:disabled { opacity: .5; }
 .export-unlock { margin-left: auto; padding: 3px 9px; font-size: 11px; flex: none; }
+
+/* 「直接运行」条目（仿 Win+R）：虚线边框与普通启动项区分 */
+.card.run { border-style: dashed; }
+.card.run .icon { color: var(--green); }

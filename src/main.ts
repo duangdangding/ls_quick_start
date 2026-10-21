@@ -8,7 +8,7 @@ import "./styles.css";
 type SearchCache = { kw: string; kwPy: string; kwIn: string; nm: string; nmPy: string; nmIn: string };
 type Item = { id: string; name: string; keyword: string; description: string; target: string; lnkPath: string | null; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number; search?: SearchCache };
 type Group = { id: string; name: string; sortOrder: number };
-type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
+type DesktopEntry = { name: string; sourcePath: string; target: string; isShortcut: boolean; entryType: "shortcut" | "file" | "folder" | "system"; scanIconPath: string | null; folderName: string | null; relPath: string[] };
 type SortBy = "relevance" | "name" | "created" | "type";
 type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
@@ -177,6 +177,23 @@ function itemIcon(item: Item) {
   if (/\\[^\\]+$/.test(item.target)) return "▰";
   return "▤";
 }
+/** 搜索词可当作「运行」输入时返回原文（仿 Win+R：UNC 路径 / URL / 盘符路径 / shell: / 命令名，可带参数），否则返回 null */
+function runCandidate(): string | null {
+  const q = query.trim();
+  if (!q || selectMode) return null;
+  // 设置里关掉了「直接运行」：搜索框仅匹配启动项（appConfig 未加载时按默认开启处理）
+  if (appConfig && !appConfig.runTargetEnabled) return null;
+  // 加密分组未解锁时不提供运行入口，避免锁定界面残留可操作项
+  if (activeGroup === encryptedId && !unlocked) return null;
+  if (isMac) return /^([/~]|\w+:\/\/)/.test(q) || /^[a-zA-Z0-9_.+-]+(\s|$)/.test(q) ? q : null;
+  return /^(\\\\|[a-zA-Z]:[\\/]|%[^%]+%|\w+:\/\/|shell:)/i.test(q) || /^[a-zA-Z0-9_.+-]+(\s|$)/.test(q) ? q : null;
+}
+/** 「直接运行」卡片：固定列在搜索结果最后，Enter / 双击执行搜索框内容 */
+function runCardHtml(target: string | null, isSelected: boolean) {
+  if (!target) return "";
+  const label = /^\\\\/.test(target) ? "打开网络位置" : /^\w+:\/\//.test(target) ? "打开链接" : /^(shell:|[a-zA-Z]:[\\/]|%[^%]+%)/i.test(target) || /^[~/]/.test(target) ? "打开路径" : "运行命令";
+  return `<article class="card run ${isSelected ? "selected" : ""}" data-run="1"><div class="icon">⏎</div><div class="card-text"><b>${label}</b><span>${escape(target)}</span></div></article>`;
+}
 /** 方向键上下移动的“列数”：列表视图单列，卡片视图按容器宽度估算 */
 function arrowColumns() {
   if (viewMode === "list") return 1;
@@ -197,14 +214,14 @@ function setViewMode(mode: ViewMode) {
 function render(keepScroll = false) {
   hideTip();
   const scrollTop = keepScroll ? document.querySelector<HTMLElement>("#grid")?.scrollTop ?? 0 : 0;
-  const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
+  const shown = displayItems(); const run = runCandidate(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length + (run ? 1 : 0) - 1)));
   app.innerHTML = `<section class="shell">
     <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="export" title="把启动项还原为文件夹中的快捷方式 / 批处理 / 网址文件">还原</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="relevance">匹配度</option><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `${unlocked ? `<button data-action="lock" title="立即锁定加密分组，再次查看需输入密码">加密</button>` : ""}<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
-    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，并参与「全部」搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${itemIcon(item)}${selectMode && picked ? `<i class="pick-mark">✓</i>` : ""}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}${activeGroup === "all" ? `<i class="group-tag" title="所属分组">${escape(groupLabel(item.groupId))}</i>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") : `<div class="empty"><i class="empty-icon">🗂️</i><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
-    <footer>右键空白处即可添加 · Enter 打开 · 方向键切换</footer>
+    <section id="grid" class="grid ${viewMode === "list" ? "list" : ""}">${activeGroup === encryptedId && !unlocked ? `<div class="locked"><b>🔒 加密分组</b><p>解锁后才会显示其中的启动项，并参与「全部」搜索。</p><button class="primary" data-action="password">${passwordSet ? "输入密码解锁" : "设置访问密码"}</button></div>` : shown.length || run ? shown.map((item, index) => { const needle = query.trim().toLowerCase(); const picked = selectedIds.has(item.id); return `<article class="card ${!selectMode && index === selected ? "selected" : ""} ${picked ? "picked" : ""}" data-id="${item.id}"><div class="icon${selectMode ? " pick" : ""}">${itemIcon(item)}${selectMode && picked ? `<i class="pick-mark">✓</i>` : ""}</div><div class="card-text"><b>${renderName(item.name, needle)}</b>${item.keyword ? `<em class="keyword" title="关键字">${renderName(item.keyword, needle)}</em>` : ""}${activeGroup === "all" ? `<i class="group-tag" title="所属分组">${escape(groupLabel(item.groupId))}</i>` : ""}<span>${escape(item.isCmd ? cmdLabel : item.target)}</span></div>${selectMode ? "" : `<button class="more" data-menu="${item.id}" title="更多">⋯</button>`}</article>`; }).join("") + runCardHtml(run, !selectMode && selected === shown.length) : `<div class="empty"><i class="empty-icon">🗂️</i><b>这里还没有启动项</b><p>点击“添加”，或使用扫描导入批量添加。</p></div>`}</section>
+    <footer>${run ? `Enter 运行「${escape(run)}」 · 方向键切换` : "右键空白处即可添加 · Enter 打开 · 方向键切换"}</footer>
   </section>`;
   const input = document.querySelector<HTMLInputElement>("#search")!;
   input.addEventListener("compositionstart", () => { composingSearch = true; });
@@ -214,12 +231,17 @@ function render(keepScroll = false) {
     if (composingSearch) return;
     const shownItems = displayItems();
     // 多选模式下 Enter 不启动条目，避免与勾选操作冲突
-    if (!selectMode && event.key === "Enter" && shownItems[selected]) { event.preventDefault(); void openItem(shownItems[selected].id); }
-    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shownItems.length) {
+    if (!selectMode && event.key === "Enter") {
+      const target = shownItems[selected];
+      if (target) { event.preventDefault(); void openItem(target.id); }
+      else if (selected === shownItems.length && runCandidate()) { event.preventDefault(); void runCommand(); }
+    }
+    const total = shownItems.length + (runCandidate() ? 1 : 0);
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && total) {
       event.preventDefault();
       const width = arrowColumns();
       const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width;
-      selected = (selected + delta + shownItems.length) % shownItems.length;
+      selected = (selected + delta + total) % total;
       render(true);
     }
   });
@@ -242,7 +264,7 @@ function showTip(card: HTMLElement, item: Item) {
   hideTip();
   const node = document.createElement("div");
   node.className = "tip";
-  node.innerHTML = `<b>${escape(item.name)}</b>${item.description ? `<span>${escape(item.description)}</span>` : ""}`;
+  node.innerHTML = `<b>${escape(item.name)}</b>${item.description ? `<span>${escape(item.description)}</span>` : ""}<small>${escape(item.target)}</small>`;
   document.body.append(node);
   tipNode = node;
   const box = card.getBoundingClientRect();
@@ -257,6 +279,12 @@ function bindInteractions(shown: Item[]) {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((button) => button.onclick = () => void action(button.dataset.action!));
   document.querySelectorAll<HTMLElement>("[data-group]").forEach((tab) => { tab.onclick = () => { activeGroup = tab.dataset.group!; selected = 0; selectedIds.clear(); render(); }; tab.ondragstart = (event) => event.dataTransfer?.setData("group", tab.dataset.group!); tab.ondragover = (event) => event.preventDefault(); tab.ondrop = (event) => void reorderGroups(event, tab.dataset.group!); });
   document.querySelectorAll<HTMLElement>(".card").forEach((card) => {
+    // 「直接运行」卡片：单击选中，双击执行
+    if (card.dataset.run) {
+      card.onclick = () => { selected = shown.length; render(true); };
+      card.ondblclick = () => void runCommand();
+      return;
+    }
     card.onclick = (event) => {
       if ((event.target as HTMLElement).closest(".more")) return;
       // 多选模式下点击卡片切换勾选，不移动键盘光标
@@ -309,6 +337,15 @@ async function openItem(id: string) {
   opening = true; render(true);
   // 启动成功后隐藏面板，回到之前的窗口（双击 / Enter / 菜单「打开」共用此入口）
   try { await invoke("open_item", { id, unlocked }); void invoke("hide_panel"); }
+  catch (error) { message(error); }
+  finally { opening = false; render(true); }
+}
+/** 直接运行搜索框内容（仿 Win+R）：成功后隐藏面板，失败保留面板并提示原因 */
+async function runCommand() {
+  const target = runCandidate();
+  if (!target || opening) return;
+  opening = true; render(true);
+  try { await invoke("run_target", { raw: target }); void invoke("hide_panel"); }
   catch (error) { message(error); }
   finally { opening = false; render(true); }
 }
@@ -430,7 +467,7 @@ function openClearEncryptedConfirm(parent: HTMLElement) {
     try { await invoke("clear_encrypted"); parent.remove(); node.remove(); unlocked = false; activeGroup = encryptedId; await load(); } catch (error) { message(error); }
   };
 }
-const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: shortcutLabel, icon: "↗" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
+const scanMeta = (entry: DesktopEntry) => entry.entryType === "shortcut" ? { label: shortcutLabel, icon: "↗" } : entry.entryType === "system" ? { label: "系统", icon: "🖥" } : entry.entryType === "folder" ? { label: "文件夹", icon: "▰" } : { label: "文件", icon: "▤" };
 function scanIcon(entry: DesktopEntry) { return entry.scanIconPath ? `<img src="${escape(convertFileSrc(entry.scanIconPath))}" alt="" />` : scanMeta(entry).icon; }
 function updateScanSelection(node: HTMLElement) {
   const checked = node.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked").length;
@@ -479,7 +516,7 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
     const hasChildren = children.length > 0 || treeNode.files.length > 0;
     const files = sortByName(treeNode.files).map((index) => {
       const file = entries[index];
-      return `<label class="scan-file"><input type="checkbox" class="scan-entry" value="${index}" data-type="${file.entryType}" ${chosen.has(index) ? "checked" : ""}/><i class="scan-icon ${file.entryType}">${scanIcon(file)}</i><span class="scan-name">${escape(file.name)}<em>${scanMeta(file).label}</em></span><small>${escape(file.target)}</small></label>`;
+      return `<label class="scan-file"><span class="scan-toggle-spacer"></span><input type="checkbox" class="scan-entry" value="${index}" data-type="${file.entryType}" ${chosen.has(index) ? "checked" : ""}/><i class="scan-icon ${file.entryType}">${scanIcon(file)}</i><span class="scan-name">${escape(file.name)}<em>${scanMeta(file).label}</em></span><small>${escape(file.target)}</small></label>`;
     }).join("");
     return `<div class="scan-node${hasChildren ? " has-children" : ""}">
       <div class="scan-row">
@@ -531,7 +568,7 @@ async function openScan() {
   const defaultSourceLabel = isMac ? startMenuLabel : "桌面";
   const hintText = isMac
     ? `默认扫描${startMenuLabel}目录（/Applications），也可以选择其他文件夹；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`
-    : `默认扫描桌面，也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`;
+    : `默认扫描桌面（含此电脑、回收站等系统图标），也可以选择其他文件夹或${startMenuLabel}；仅在导入所选快捷方式时解析真实目标，重复项会自动忽略。`;
   const node = modal(`<h2>扫描导入<button type="button" class="scan-max" id="scan-max" title="最大化 / 还原">⛶</button></h2><p class="hint">${hintText}</p>
     <div class="scan-bulk"><span id="scan-source">来源：${defaultSourceLabel}</span><div><label class="scan-check"><input type="checkbox" id="scan-recursive" />扫描子文件夹</label><label class="scan-check"><input type="checkbox" id="group-by-folder" />按文件夹名称分组</label><button type="button" id="pick-start-menu">${startMenuLabel}</button><button type="button" id="pick-folder">选择文件夹…</button></div></div>
     <div id="scan-body"></div>
@@ -559,7 +596,7 @@ async function openScan() {
     catch (error) { body.innerHTML = ""; importButton.disabled = false; message(error); return; }
     sourceText.textContent = `来源：${describe(source)}${recursive ? "（含子文件夹）" : ""}`;
     // 默认勾选全部快捷方式
-    chosen = new Set(scanning.map((entry, index) => entry.isShortcut ? index : -1).filter((index) => index >= 0));
+    chosen = new Set(scanning.map((entry, index) => entry.isShortcut || entry.entryType === "system" ? index : -1).filter((index) => index >= 0));
     const countByType = (type: DesktopEntry["entryType"]) => scanning.filter((entry) => entry.entryType === type).length;
     const rootLabel = source.kind === "folder" ? (source.dir.split(/[\\/]/).filter(Boolean).pop() ?? source.dir) : describe(source);
     const syncChosen = () => { chosen = new Set([...body.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry:checked")].map((input) => Number(input.value))); };
@@ -580,7 +617,7 @@ async function openScan() {
       container.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => input.onchange = () => { syncChosen(); updateScanSelection(node); });
     };
     const renderList = () => {
-      body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div class="scan-view-toggle"><button type="button" data-scan-view="tree" class="${scanView === "tree" ? "active" : ""}" title="树状布局">🌲</button><button type="button" data-scan-view="card" class="${scanView === "card" ? "active" : ""}" title="卡片布局">▦</button><button type="button" data-scan-view="list" class="${scanView === "list" ? "active" : ""}" title="列表布局">☰</button></div><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button><button type="button" data-select="all">全选</button><button type="button" data-select="none">取消全选</button></div></div>
+      body.innerHTML = `<div class="scan-bulk"><span id="scan-count"></span><div class="scan-view-toggle"><button type="button" data-scan-view="tree" class="${scanView === "tree" ? "active" : ""}" title="树状布局">🌲</button><button type="button" data-scan-view="card" class="${scanView === "card" ? "active" : ""}" title="卡片布局">▦</button><button type="button" data-scan-view="list" class="${scanView === "list" ? "active" : ""}" title="列表布局">☰</button></div><div><button type="button" data-select="shortcut">全选快捷方式 (${countByType("shortcut")})</button><button type="button" data-select="file">全选文件 (${countByType("file")})</button><button type="button" data-select="folder">全选文件夹 (${countByType("folder")})</button>${countByType("system") ? `<button type="button" data-select="system">全选系统 (${countByType("system")})</button>` : ""}<button type="button" data-select="all">全选</button><button type="button" data-select="none">取消全选</button></div></div>
         <div class="scan-items ${scanView}">${scanView === "tree" ? renderScanTree(scanning, chosen, rootLabel) : renderScanEntries(scanning, chosen)}</div>`;
       const toggle = (type: string) => {
         body.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => {
@@ -801,6 +838,8 @@ loadConfig().then(async (cfg) => {
 });
 listen<AppConfig>("config-changed", async (event) => {
   const cfg = event.payload;
+  const runChanged = appConfig !== null && appConfig.runTargetEnabled !== cfg.runTargetEnabled;
+  appConfig = cfg;
   appConfig = cfg;
   applyAppearance(cfg);
   applyWindowEffect(cfg.windowEffect);
@@ -808,8 +847,8 @@ listen<AppConfig>("config-changed", async (event) => {
   const mode: ViewMode = cfg.viewMode === "list" ? "list" : "card";
   const viewChanged = mode !== viewMode;
   viewMode = mode;
-  // 钉住状态可能来自托盘菜单、显示方式可能来自设置页，需实时反映到面板
-  if (cfg.alwaysOnTop !== pinned || viewChanged) {
+  // 钉住状态可能来自托盘菜单，显示方式 / 直接运行开关可能来自设置页，需实时反映到面板
+  if (cfg.alwaysOnTop !== pinned || viewChanged || runChanged) {
     pinned = cfg.alwaysOnTop;
     render();
   }
