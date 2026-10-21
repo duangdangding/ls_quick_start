@@ -13,7 +13,8 @@ type SortBy = "relevance" | "name" | "created" | "type";
 type ScanSource = { kind: "desktop" } | { kind: "start-menu" } | { kind: "folder"; dir: string };
 type ViewMode = "card" | "list";
 type ImportSkip = { name: string; target: string; groupName: string | null; reason: string | null };
-type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number; duplicates: ImportSkip[]; invalids: ImportSkip[] };
+type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number; duplicates: ImportSkip[]; invalids: ImportSkip[]; importedShortcuts: string[] };
+type DeleteShortcutsResult = { deleted: number; failures: ImportSkip[] };
 type ItemIcon = { id: string; iconPath: string | null };
 
 const encryptedId = "__encrypted__";
@@ -491,7 +492,8 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
   };
   return renderNode(buildScanTree(entries), true);
 }
-/** 导入结果弹窗：汇总导入数量，并列出重复项（含已有条目的所在分组）与失败项（含失败原因） */
+/** 导入结果弹窗：汇总导入数量，并列出重复项（含已有条目的所在分组）与失败项（含失败原因）；
+ *  若成功导入的条目含 .lnk 快捷方式，额外提供「删除源快捷方式」选项（只删快捷方式文件本身，不动其指向的程序 / 文件） */
 function showImportResult(result: ImportResult) {
   const row = (skip: ImportSkip, tag: string) => `<li><span class="skip-name">${escape(skip.name)}<em>${escape(tag)}</em></span><small>${escape(skip.target)}</small></li>`;
   const skipped = result.skippedDuplicates + result.skippedInvalid;
@@ -499,7 +501,25 @@ function showImportResult(result: ImportResult) {
     ? `<h3>重复已跳过（${result.skippedDuplicates}）</h3><ul class="skip-list">${result.duplicates.map((skip) => row(skip, `已存在于「${skip.groupName ?? "未分组"}」`)).join("")}</ul>` : "";
   const invalids = result.invalids.length
     ? `<h3>导入失败（${result.skippedInvalid}）</h3><ul class="skip-list">${result.invalids.map((skip) => row(skip, skip.reason ?? "未知原因")).join("")}</ul>` : "";
-  modal(`<h2>导入完成</h2><p class="hint">已导入 ${result.added} 项${skipped ? `；跳过重复 ${result.skippedDuplicates} 项、失败 ${result.skippedInvalid} 项，明细如下。` : "。"}</p>${duplicates}${invalids}<div class="modal-actions"><button class="primary" data-close>知道了</button></div>`);
+  const shortcuts = result.importedShortcuts;
+  const cleanup = shortcuts.length
+    ? `<div id="shortcut-cleanup"><h3>清理源快捷方式</h3><p class="hint">本次导入包含 ${shortcuts.length} 个快捷方式，已从原位置记录到启动器。如不再需要，可删除原位置的快捷方式文件——只删除 .lnk 快捷方式本身，其指向的程序 / 文件不受影响。</p><div class="modal-actions"><button type="button" class="danger" id="delete-shortcuts">删除这 ${shortcuts.length} 个快捷方式</button></div></div>` : "";
+  const node = modal(`<h2>导入完成</h2><p class="hint">已导入 ${result.added} 项${skipped ? `；跳过重复 ${result.skippedDuplicates} 项、失败 ${result.skippedInvalid} 项，明细如下。` : "。"}</p>${duplicates}${invalids}${cleanup}<div class="modal-actions"><button class="primary" data-close>知道了</button></div>`);
+  const deleteButton = node.querySelector<HTMLButtonElement>("#delete-shortcuts");
+  deleteButton?.addEventListener("click", async () => {
+    deleteButton.disabled = true;
+    deleteButton.innerHTML = `<i class="loading-dot"></i>正在删除…`;
+    try {
+      const deleted = await invoke<DeleteShortcutsResult>("delete_shortcut_files", { paths: shortcuts });
+      const failures = deleted.failures.length
+        ? `<h3>删除失败（${deleted.failures.length}）</h3><ul class="skip-list">${deleted.failures.map((skip) => row(skip, skip.reason ?? "未知原因")).join("")}</ul>` : "";
+      node.querySelector<HTMLElement>("#shortcut-cleanup")!.innerHTML = `<p class="hint">已删除 ${deleted.deleted} 个快捷方式文件${failures ? "，以下删除失败：" : "。"}</p>${failures}`;
+    } catch (error) {
+      deleteButton.disabled = false;
+      deleteButton.textContent = `删除这 ${shortcuts.length} 个快捷方式`;
+      message(error);
+    }
+  });
 }
 async function openScan() {
   let scanView: "tree" | "card" | "list" = "tree";

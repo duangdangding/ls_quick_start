@@ -893,11 +893,16 @@ struct ImportSkip { name: String, target: String, group_name: Option<String>, re
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize, duplicates: Vec<ImportSkip>, invalids: Vec<ImportSkip> }
+struct ImportResult { added: usize, skipped_duplicates: usize, skipped_invalid: usize, duplicates: Vec<ImportSkip>, invalids: Vec<ImportSkip>, imported_shortcuts: Vec<String> }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ItemIcon { id: String, icon_path: Option<String> }
+
+/// 删除源快捷方式的结果：deleted 为成功数，failures 复用 ImportSkip 记录失败明细
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteShortcutsResult { deleted: usize, failures: Vec<ImportSkip> }
 
 /// 扫描一个目录下的文件 / 文件夹 / 快捷方式，生成可导入条目；recursive 为真时同时扫描子文件夹
 fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
@@ -1072,6 +1077,8 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
     let mut added = 0;
     // 重复明细：记录与哪个已有条目冲突及其所在分组（同批次先入组的条目也能取到分组名）
     let mut duplicates: Vec<ImportSkip> = Vec::new();
+    // 成功导入的快捷方式原始路径（仅 .lnk；macOS 的「快捷方式」是 .app 应用包本体，绝不收集）：供导入完成后可选删除
+    let mut imported_shortcuts: Vec<String> = Vec::new();
     let mut order = store.items.iter().map(|item| item.sort_order).max().unwrap_or(-1) + 1;
     for (name, target, folder, lnk_path) in prepared {
         if !known.insert(target.to_lowercase()) {
@@ -1089,11 +1096,45 @@ fn import_scanned(data: State<'_, AppData>, entries: Vec<DesktopEntry>, group_id
         let target_group = if group_by_folder {
             folder.filter(|name| !name.trim().is_empty()).map(|name| group_id_by_name(&mut store, &name)).or_else(|| group_id.clone())
         } else { group_id.clone() };
+        if let Some(lnk) = &lnk_path {
+            // 只收集真正的 .lnk 文件：macOS 的「快捷方式」是 .app 应用包本体，绝不能删
+            if Path::new(lnk).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk")) { imported_shortcuts.push(lnk.clone()); }
+        }
         store.items.push(LauncherItem { id: new_id(), name: name.clone(), keyword: name, target, lnk_path, group_id: target_group, is_encrypted: false, is_cmd: false, icon_path: None, sort_order: order, created_at: now(), description: String::new() });
         order += 1; added += 1;
     }
     persist(&data, &store)?;
-    Ok(ImportResult { added, skipped_duplicates: duplicates.len(), skipped_invalid: invalids.len(), duplicates, invalids })
+    Ok(ImportResult { added, skipped_duplicates: duplicates.len(), skipped_invalid: invalids.len(), duplicates, invalids, imported_shortcuts })
+}
+
+/// 导入成功后删除源快捷方式：仅限 .lnk 文件本身，绝不触碰其指向的目标文件；
+/// 同时清掉对应条目的 lnk_path，之后启动直接打开已解析的真实目标（open_item 本就有 lnk 缺失回退）
+#[tauri::command]
+fn delete_shortcut_files(data: State<'_, AppData>, paths: Vec<String>) -> Result<DeleteShortcutsResult, String> {
+    let mut deleted_paths: Vec<String> = Vec::new();
+    let mut failures: Vec<ImportSkip> = Vec::new();
+    for raw in paths {
+        let path = PathBuf::from(&raw);
+        let name = || path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().to_string();
+        // 安全闸：不是 .lnk 快捷方式文件的一律拒绝删除，避免误删目标程序 / 文件
+        if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk")) || !path.is_file() {
+            failures.push(ImportSkip { name: name(), target: raw.clone(), group_name: None, reason: Some("不是有效的快捷方式文件".into()) });
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(_) => deleted_paths.push(raw),
+            Err(error) => failures.push(ImportSkip { name: name(), target: raw.clone(), group_name: None, reason: Some(error.to_string()) }),
+        }
+    }
+    if !deleted_paths.is_empty() {
+        let deleted: HashSet<String> = deleted_paths.iter().map(|p| p.to_lowercase()).collect();
+        let mut store = data.store.lock().unwrap();
+        for item in &mut store.items {
+            if item.lnk_path.as_ref().is_some_and(|lnk| deleted.contains(&lnk.to_lowercase())) { item.lnk_path = None; }
+        }
+        persist(&data, &store)?;
+    }
+    Ok(DeleteShortcutsResult { deleted: deleted_paths.len(), failures })
 }
 
 /// 补齐缺失的条目图标。声明为 async + spawn_blocking：图标提取要调用外部命令
@@ -1849,7 +1890,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
-            import_scanned, item_icons, get_config, save_config, get_db_info,
+            import_scanned, delete_shortcut_files, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
