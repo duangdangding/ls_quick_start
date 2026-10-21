@@ -26,15 +26,16 @@ button.link:hover { background: transparent; filter: brightness(1.15); }.menu { 
 .scan-folder { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: #f9e2af; font-style: normal; font-size: 10px; }
 /* 树状布局：按目录层级缩进，节点默认展开 */
 .scan-items.tree { padding: 6px; }
-.scan-items.tree .scan-node > .scan-children { margin-left: 15px; padding-left: 5px; border-left: 1px dashed rgba(69,71,90,.7); }
+.scan-items.tree .scan-node > .scan-children { margin-left: 16px; padding-left: 8px; border-left: 1px solid color-mix(in srgb, var(--muted) 45%, transparent); }
 .scan-items.tree .scan-node.collapsed > .scan-children { display: none; }
 .scan-items.tree .scan-row, .scan-items.tree .scan-file { display: flex; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 6px; }
 .scan-items.tree .scan-file { cursor: pointer; }
 .scan-items.tree .scan-row:hover, .scan-items.tree .scan-file:hover { background: rgba(69,71,90,.35); }
 .scan-items.tree .scan-row input, .scan-items.tree .scan-file input { flex: none; width: auto; margin: 0; accent-color: var(--blue); }
-.scan-items.tree .scan-toggle { flex: none; width: 16px; height: 16px; padding: 0; border: 0; background: transparent; color: var(--muted); font-size: 10px; line-height: 1; }
-.scan-items.tree .scan-toggle:hover { background: transparent; border-color: transparent; color: var(--text); }
-.scan-items.tree .scan-toggle-spacer { flex: none; width: 16px; }
+.scan-items.tree .scan-toggle { flex: none; width: 18px; height: 18px; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); font-size: 11px; line-height: 1; display: inline-grid; place-items: center; }
+.scan-items.tree .scan-toggle:hover { background: var(--surface-hi); border-color: var(--blue); color: var(--blue); }
+.scan-items.tree .scan-toggle-spacer { flex: none; width: 18px; }
+.scan-items.tree .has-children > .scan-row .scan-name { font-weight: 600; }
 .scan-items.tree .scan-name { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .scan-items.tree .has-children > .scan-row .scan-name { cursor: pointer; }
 .scan-items.tree .scan-row small, .scan-items.tree .scan-file small { margin-left: auto; padding-left: 10px; max-width: 45%; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
