@@ -307,7 +307,7 @@ button.small { padding: 3px 8px; font-size: 12px; }
 .empty-icon { display: block; font-size: 42px; margin-bottom: 10px; opacity: .8; font-style: normal; }
 
 /* 还原到文件夹对话框 */
-.export-option { display: flex; flex-direction: row; align-items: center; gap: 7px; color: var(--text); font-size: 13px; cursor: pointer; }
+.modal label.export-option { display: flex; flex-direction: row; align-items: center; gap: 7px; color: var(--text); font-size: 13px; cursor: pointer; }
 .export-option input { width: auto; padding: 0; margin: 0; accent-color: var(--blue); cursor: pointer; }
 #export-tree { max-height: 300px; }
 #export-tree .scan-row input:disabled { opacity: .5; }
