@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -1137,6 +1137,256 @@ fn delete_shortcut_files(data: State<'_, AppData>, paths: Vec<String>) -> Result
     Ok(DeleteShortcutsResult { deleted: deleted_paths.len(), failures })
 }
 
+// ---------- 还原启动项到文件夹 ----------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    /// 导出目标文件夹
+    dir: String,
+    /// 是否按分组创建子文件夹（「未分组」始终直接放在根目录）
+    group_folders: bool,
+    /// 勾选的启动项 id
+    item_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportResult {
+    exported: usize,
+    /// 文件 / 文件夹类型的启动项不导出，逐条列出
+    skipped: Vec<ImportSkip>,
+    failures: Vec<ImportSkip>,
+    /// 导出目标文件夹（结果页「打开文件夹查看」用）
+    dir: String,
+}
+
+/// 清洗为合法的文件 / 文件夹名：替换 Windows 保留字符与控制字符，去掉首尾空格与点
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == ' ' || c == '.').to_string();
+    if cleaned.is_empty() { "未命名".into() } else { cleaned }
+}
+
+/// 同目录下重名时追加序号：name.ext、name (2).ext …（同时避开磁盘上已存在的同名文件）
+fn unique_dest(used: &mut HashMap<PathBuf, HashSet<String>>, folder: &Path, name: &str, ext: &str) -> PathBuf {
+    let occupied = used.entry(folder.to_path_buf()).or_default();
+    let mut candidate = if ext.is_empty() { name.to_string() } else { format!("{name}.{ext}") };
+    let mut counter = 2;
+    while !occupied.insert(candidate.to_lowercase()) || folder.join(&candidate).exists() {
+        candidate = if ext.is_empty() { format!("{name} ({counter})") } else { format!("{name} ({counter}).{ext}") };
+        counter += 1;
+    }
+    folder.join(candidate)
+}
+
+/// 条目导出时所在的子文件夹名：未分组返回 None（放根目录）；加密分组固定为「加密」
+fn export_subfolder(item: &LauncherItem, groups: &[Group], group_folders: bool) -> Option<String> {
+    if !group_folders { return None; }
+    let id = item.group_id.as_deref()?;
+    if id == ENCRYPTED_GROUP { return Some("加密".into()); }
+    groups.iter().find(|group| group.id == id).map(|group| sanitize_filename(&group.name))
+}
+
+fn export_skip(item: &LauncherItem, reason: &str) -> ImportSkip {
+    ImportSkip { name: item.name.clone(), target: item.target.clone(), group_name: None, reason: Some(reason.into()) }
+}
+
+/// 写入一个导出文件（自动创建所属分组文件夹）
+fn write_export_file(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建文件夹失败：{e}"))?; }
+    fs::write(dest, bytes).map_err(|e| format!("写入文件失败：{e}"))
+}
+
+/// 复制现成文件（原始 .lnk / .url）到导出目录
+fn copy_export_file(source: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建文件夹失败：{e}"))?; }
+    fs::copy(source, dest).map_err(|e| format!("复制文件失败：{e}"))?;
+    Ok(())
+}
+
+/// Windows 批量创建 .lnk 快捷方式：经 PowerShell WScript.Shell，返回值与 jobs 按序对齐。
+/// 脚本写入临时文件执行：避免命令行长度上限与中文路径乱码（同 extract_icons 的做法）
+#[cfg(windows)]
+fn create_shortcuts(jobs: &[(PathBuf, String)]) -> Vec<bool> {
+    if jobs.is_empty() { return Vec::new(); }
+    let values = jobs.iter().flat_map(|(lnk, target)| [ps_quote(lnk.display().to_string()), ps_quote(target)]).collect::<Vec<_>>().join(",");
+    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $w=New-Object -ComObject WScript.Shell; $p=@({values}); for($i=0;$i -lt $p.Count;$i+=2){{ try {{ $s=$w.CreateShortcut($p[$i]); $s.TargetPath=$p[$i+1]; $s.Save(); '1' }} catch {{ '0' }} }}");
+    let script_file = std::env::temp_dir().join(format!("suqi-links-{}-{}.ps1", std::process::id(), now()));
+    // PowerShell 5.1 默认按 ANSI 读取脚本文件，含中文路径时必须带 UTF-8 BOM 才不会乱码
+    let mut bytes = vec![0xEFu8, 0xBB, 0xBF];
+    bytes.extend_from_slice(script.as_bytes());
+    if fs::write(&script_file, bytes).is_err() { return jobs.iter().map(|_| false).collect(); }
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script_file);
+    hide_console(&mut command);
+    let output = command.output();
+    let _ = fs::remove_file(&script_file);
+    match output {
+        Ok(output) => {
+            let lines: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(|line| line.trim().to_string()).collect();
+            jobs.iter().enumerate().map(|(index, _)| lines.get(index).map(String::as_str) == Some("1")).collect()
+        }
+        Err(_) => jobs.iter().map(|_| false).collect(),
+    }
+}
+
+/// macOS / Linux 下用符号链接代替 .lnk
+#[cfg(all(not(windows), unix))]
+fn create_link(target: &str, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() { fs::create_dir_all(parent).map_err(|e| format!("创建文件夹失败：{e}"))?; }
+    std::os::unix::fs::symlink(target, dest).map_err(|e| format!("创建链接失败：{e}"))
+}
+
+/// XML 转义（macOS .webloc 用）
+#[cfg(target_os = "macos")]
+fn xml_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// 导出执行体。Windows 创建 .lnk 要调 PowerShell，整体放进 spawn_blocking 避免阻塞主线程
+fn export_items_inner(dir: &Path, items: &[LauncherItem], groups: &[Group], group_folders: bool) -> Result<ExportResult, String> {
+    let mut used: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    let mut skipped: Vec<ImportSkip> = Vec::new();
+    let mut failures: Vec<ImportSkip> = Vec::new();
+    let mut exported = 0;
+    // Windows 待创建的 .lnk：(快捷方式路径, 真实目标, 条目名)，最后批量交给 PowerShell
+    #[cfg(windows)]
+    let mut link_jobs: Vec<(PathBuf, String, String)> = Vec::new();
+
+    for item in items {
+        let folder = match export_subfolder(item, groups, group_folders) {
+            Some(name) => dir.join(name),
+            None => dir.to_path_buf(),
+        };
+        let name = sanitize_filename(&item.name);
+        // 1) CMD 命令 → .bat（macOS / Linux → 可执行的 .command）
+        if item.is_cmd {
+            #[cfg(windows)]
+            let (ext, content) = ("bat", format!("@echo off\r\nchcp 65001>nul\r\n{}\r\n", item.target));
+            #[cfg(not(windows))]
+            let (ext, content) = ("command", format!("#!/bin/sh\n{}\n", item.target));
+            let dest = unique_dest(&mut used, &folder, &name, ext);
+            match write_export_file(&dest, content.as_bytes()) {
+                Ok(_) => {
+                    #[cfg(all(not(windows), unix))]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = fs::metadata(&dest) { let mut perm = meta.permissions(); perm.set_mode(perm.mode() | 0o755); let _ = fs::set_permissions(&dest, perm); }
+                    }
+                    exported += 1;
+                }
+                Err(error) => failures.push(ImportSkip { reason: Some(error), ..export_skip(item, "") }),
+            }
+            continue;
+        }
+        // 2) 网址 → .url（Windows Internet Shortcut；macOS → .webloc）
+        if is_url(&item.target) {
+            #[cfg(target_os = "macos")]
+            let (ext, content) = ("webloc", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>URL</key><string>{}</string></dict></plist>\n", xml_escape(&item.target)));
+            #[cfg(not(target_os = "macos"))]
+            let (ext, content) = ("url", format!("[InternetShortcut]\r\nURL={}\r\n", item.target));
+            let dest = unique_dest(&mut used, &folder, &name, ext);
+            match write_export_file(&dest, content.as_bytes()) {
+                Ok(_) => exported += 1,
+                Err(error) => failures.push(ImportSkip { reason: Some(error), ..export_skip(item, "") }),
+            }
+            continue;
+        }
+        let path = Path::new(&item.target);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
+        // macOS 的 .app 是目录形态的应用包，按程序处理
+        let is_app = cfg!(target_os = "macos") && ext == "app";
+        // 3) 原始 .lnk 还在 → 直接复制（保留参数 / 工作目录）
+        if let Some(lnk) = item.lnk_path.as_deref().filter(|p| Path::new(p).is_file()) {
+            let dest = unique_dest(&mut used, &folder, &name, "lnk");
+            match copy_export_file(Path::new(lnk), &dest) {
+                Ok(_) => exported += 1,
+                Err(error) => failures.push(ImportSkip { reason: Some(error), ..export_skip(item, "") }),
+            }
+            continue;
+        }
+        // 4) 文件夹不导出（macOS .app 应用包除外）
+        if path.is_dir() && !is_app {
+            skipped.push(export_skip(item, "文件夹不导出"));
+            continue;
+        }
+        // 5) 目标本身是 .lnk / .url 文件 → 直接复制即可使用
+        if matches!(ext.as_str(), "lnk" | "url") && path.is_file() {
+            let dest = unique_dest(&mut used, &folder, &name, &ext);
+            match copy_export_file(path, &dest) {
+                Ok(_) => exported += 1,
+                Err(error) => failures.push(ImportSkip { reason: Some(error), ..export_skip(item, "") }),
+            }
+            continue;
+        }
+        // 6) 可执行程序 → 创建 .lnk 快捷方式（macOS / Linux → 符号链接）
+        let is_executable = matches!(ext.as_str(), "exe" | "com" | "bat" | "cmd" | "ps1" | "msi") || is_app;
+        if is_executable && (path.is_file() || is_app) {
+            #[cfg(windows)]
+            {
+                let dest = unique_dest(&mut used, &folder, &name, "lnk");
+                link_jobs.push((dest, item.target.clone(), item.name.clone()));
+            }
+            #[cfg(all(not(windows), unix))]
+            {
+                let dest = unique_dest(&mut used, &folder, &name, "");
+                match create_link(&item.target, &dest) {
+                    Ok(_) => exported += 1,
+                    Err(error) => failures.push(ImportSkip { reason: Some(error), ..export_skip(item, "") }),
+                }
+            }
+            continue;
+        }
+        // 7) 其余普通文件不导出
+        skipped.push(export_skip(item, "文件不导出"));
+    }
+
+    #[cfg(windows)]
+    if !link_jobs.is_empty() {
+        for (lnk, _, _) in &link_jobs {
+            if let Some(parent) = lnk.parent() { let _ = fs::create_dir_all(parent); }
+        }
+        let jobs: Vec<(PathBuf, String)> = link_jobs.iter().map(|(lnk, target, _)| (lnk.clone(), target.clone())).collect();
+        let results = create_shortcuts(&jobs);
+        for ((_, target, name), ok) in link_jobs.iter().zip(results) {
+            if ok { exported += 1; }
+            else { failures.push(ImportSkip { name: name.clone(), target: target.clone(), group_name: None, reason: Some("创建快捷方式失败".into()) }); }
+        }
+    }
+
+    Ok(ExportResult { exported, skipped, failures, dir: String::new() })
+}
+
+/// 把勾选的启动项还原到指定文件夹：
+/// 程序 / 快捷方式 → .lnk（原始 .lnk 还在时直接复制，保留参数与工作目录）；CMD 命令 → .bat；网址 → .url；
+/// 文件 / 文件夹不生成任何内容，逐条记入 skipped。声明为 async：导出在后台线程执行，不阻塞界面。
+#[tauri::command]
+async fn export_items(data: State<'_, AppData>, request: ExportRequest) -> Result<ExportResult, String> {
+    let dir = PathBuf::from(request.dir.trim());
+    if !dir.is_dir() { return Err("请选择一个有效的导出文件夹".into()); }
+    let (selected, groups) = {
+        let store = data.store.lock().unwrap();
+        let wanted: HashSet<&str> = request.item_ids.iter().map(String::as_str).collect();
+        let mut selected: Vec<LauncherItem> = store.items.iter().filter(|item| wanted.contains(item.id.as_str())).cloned().collect();
+        if selected.is_empty() { return Err("请至少选择一个启动项".into()); }
+        // 加密条目必须先解锁才允许导出（前端会引导解锁，这里兜底校验）
+        if !data.unlocked.load(Ordering::SeqCst) && selected.iter().any(encrypted) { return Err("加密分组请先解锁后再导出".into()); }
+        selected.sort_by_key(|item| item.sort_order);
+        (selected, store.groups.clone())
+    };
+    let group_folders = request.group_folders;
+    let display = display_path(dir.display().to_string());
+    let mut result = tauri::async_runtime::spawn_blocking(move || export_items_inner(&dir, &selected, &groups, group_folders))
+        .await
+        .map_err(|e| e.to_string())??;
+    result.dir = display;
+    Ok(result)
+}
+
 /// 补齐缺失的条目图标。声明为 async + spawn_blocking：图标提取要调用外部命令
 /// （Windows PowerShell / macOS sips），同步命令会在主线程执行导致界面卡死（导入后刷新图标时尤其明显）。
 #[tauri::command]
@@ -1890,7 +2140,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
-            import_scanned, delete_shortcut_files, item_icons, get_config, save_config, get_db_info,
+            import_scanned, delete_shortcut_files, export_items, item_icons, get_config, save_config, get_db_info,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,

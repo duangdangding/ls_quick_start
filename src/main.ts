@@ -15,6 +15,7 @@ type ViewMode = "card" | "list";
 type ImportSkip = { name: string; target: string; groupName: string | null; reason: string | null };
 type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: number; duplicates: ImportSkip[]; invalids: ImportSkip[]; importedShortcuts: string[] };
 type DeleteShortcutsResult = { deleted: number; failures: ImportSkip[] };
+type ExportResult = { exported: number; skipped: ImportSkip[]; failures: ImportSkip[]; dir: string };
 type ItemIcon = { id: string; iconPath: string | null };
 
 const encryptedId = "__encrypted__";
@@ -198,7 +199,7 @@ function render(keepScroll = false) {
   const scrollTop = keepScroll ? document.querySelector<HTMLElement>("#grid")?.scrollTop ?? 0 : 0;
   const shown = displayItems(); selected = Math.max(0, Math.min(selected, Math.max(0, shown.length - 1)));
   app.innerHTML = `<section class="shell">
-    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
+    <header><div class="brand">速启 <small>Quick Launch</small></div><label class="search"><span>⌕</span><input id="search" autofocus placeholder="搜索关键字、名称或拼音" value="${escape(query)}" />${query ? `<button type="button" class="search-clear" data-action="clear-search" title="清空搜索" tabindex="-1">✕</button>` : ""}</label><button data-action="add" class="primary">＋ 添加</button><button data-action="scan">扫描导入</button><button data-action="export" title="把启动项还原为文件夹中的快捷方式 / 批处理 / 网址文件">还原</button><button data-action="groups">管理</button><button data-action="settings" title="设置">⚙</button><button data-action="pin" title="钉住面板">${pinned ? "📌" : "📍"}</button></header>
     <nav id="tabs">${fixedGroups().map((group) => `<button class="tab ${group.id === activeGroup ? "active" : ""} ${group.id === encryptedId ? "lock" : ""}" data-group="${group.id}" draggable="${groups.some((normal) => normal.id === group.id)}">${group.id === encryptedId ? (unlocked ? "🔓" : "🔒") : ""}${escape(group.name)}</button>`).join("")}<button class="add-group" data-action="new-group" title="新建分组">＋</button></nav>
     <section class="toolbar"><span>${opening ? `<i class="loading-dot"></i>正在打开…` : activeGroup === encryptedId && !unlocked ? "加密分组已锁定" : `共 ${shown.length} 项`}</span><label>排序 <select id="sort"><option value="relevance">匹配度</option><option value="name">名称</option><option value="created">添加时间</option><option value="type">类型</option></select></label><div class="view-toggle"><button data-view="card" class="${viewMode === "card" ? "active" : ""}" title="卡片视图">▦</button><button data-view="list" class="${viewMode === "list" ? "active" : ""}" title="列表视图">☰</button></div><button data-action="select-mode" class="${selectMode ? "active" : ""}" title="多选条目">${selectMode ? "退出多选" : "多选"}</button>${activeGroup === encryptedId ? `${unlocked ? `<button data-action="lock" title="立即锁定加密分组，再次查看需输入密码">加密</button>` : ""}<button data-action="password">${unlocked ? "重置密码" : passwordSet ? "解锁" : "设置密码"}</button>` : ""}</section>
     ${selectMode ? `<section class="bulk-bar"><span>已选 ${selectedIds.size} 项</span><div class="bulk-actions"><button data-action="select-all">全选</button><button data-action="select-invert">反选</button><button data-action="select-none">清空</button><button data-action="move-items" ${selectedIds.size ? "" : "disabled"}>移动到分组</button><button class="danger" data-action="delete-items" ${selectedIds.size ? "" : "disabled"}>删除</button></div></section>` : ""}
@@ -277,6 +278,7 @@ async function action(type: string) {
   if (type === "add") openItemDialog();
   if (type === "clear-search") { query = ""; searchSelection = null; selected = 0; render(); }
   if (type === "scan") await openScan();
+  if (type === "export") openExportDialog();
   if (type === "groups") openGroupManager();
   if (type === "new-group") openGroupDialog();
   if (type === "password") openPasswordDialog();
@@ -622,6 +624,144 @@ async function openScan() {
     }
   });
   await refresh(currentSource);
+}
+/** 导出形态提示（与后端分类规则一致，后端最终以文件系统状态为准） */
+function exportKindLabel(item: Item) {
+  if (item.isCmd) return "BAT";
+  if (/^https?:\/\//.test(item.target)) return "URL";
+  if (item.lnkPath || /\.(exe|com|bat|cmd|ps1|msi|app|lnk|url)$/i.test(item.target)) return "快捷方式";
+  return "不导出";
+}
+/** 就地解锁加密分组（不切换标签页）：导出加密条目前的密码校验；取消 / 关闭返回 false */
+function promptUnlock() {
+  return new Promise<boolean>((resolve) => {
+    const node = modal(`<h2>解锁加密分组</h2><form id="unlock-form"><label>密码<input name="password" type="password" required autofocus /></label><p class="hint">导出加密分组的启动项前需要先解锁。</p><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">解锁</button></div></form>`);
+    const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); resolve(false); } });
+    observer.observe(document.body, { childList: true });
+    node.querySelector<HTMLFormElement>("#unlock-form")!.onsubmit = async (event) => {
+      event.preventDefault();
+      const password = String(new FormData(event.currentTarget as HTMLFormElement).get("password"));
+      try {
+        if (!await invoke<boolean>("unlock_encrypted", { password })) throw "密码不正确";
+        unlocked = true;
+        observer.disconnect();
+        node.remove();
+        resolve(true);
+      } catch (error) { message(error); }
+    };
+  });
+}
+/** 导出结果弹窗：成功数量 + 未导出 / 失败明细，可一键打开目标文件夹查看 */
+function showExportResult(result: ExportResult) {
+  const row = (skip: ImportSkip, tag: string) => `<li><span class="skip-name">${escape(skip.name)}<em>${escape(tag)}</em></span><small>${escape(skip.target)}</small></li>`;
+  const skipped = result.skipped.length
+    ? `<h3>未导出（${result.skipped.length}）</h3><ul class="skip-list">${result.skipped.map((skip) => row(skip, skip.reason ?? "不导出")).join("")}</ul>` : "";
+  const failures = result.failures.length
+    ? `<h3>导出失败（${result.failures.length}）</h3><ul class="skip-list">${result.failures.map((skip) => row(skip, skip.reason ?? "未知原因")).join("")}</ul>` : "";
+  const detail = result.skipped.length || result.failures.length ? `；未导出 ${result.skipped.length} 项、失败 ${result.failures.length} 项，明细如下。` : "。";
+  const node = modal(`<h2>导出完成</h2><p class="hint">已导出 ${result.exported} 项到「${escape(result.dir)}」${detail}</p>${skipped}${failures}<div class="modal-actions"><button data-close>完成</button><button class="primary" id="export-open-folder">打开文件夹查看</button></div>`);
+  node.querySelector<HTMLButtonElement>("#export-open-folder")!.onclick = async () => {
+    try { await invoke("reveal_path", { path: result.dir }); } catch (error) { message(error); }
+  };
+}
+/** 还原启动项到文件夹：选择目标文件夹，按分组树勾选要导出的条目（默认全选），加密分组需先解锁 */
+function openExportDialog() {
+  let dir = "";
+  const chosen = new Set<string>();
+  const seen = new Set<string>();
+  const node = modal(`<h2>还原到文件夹</h2><form id="export-form"><p class="hint">把启动项还原为文件夹中的快捷方式、${cmdLabel}（.bat）或网址文件（.url）；文件和文件夹类型的启动项不会导出。</p><label>导出到<div class="with-button"><input id="export-dir" readonly placeholder="点击「选择…」指定文件夹" /><button type="button" id="export-pick">选择…</button></div></label><label class="export-option"><input type="checkbox" id="export-group-folders" checked />按分组创建文件夹（「未分组」的条目直接放在根目录）</label><div class="scan-bulk"><span id="export-count"></span><div><button type="button" data-export-select="all">全选</button><button type="button" data-export-select="none">取消全选</button></div></div><div class="scan-items tree" id="export-tree"></div><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary" id="export-run">导出</button></div></form>`);
+  const tree = node.querySelector<HTMLElement>("#export-tree")!;
+  const dirInput = node.querySelector<HTMLInputElement>("#export-dir")!;
+  const groupFoldersInput = node.querySelector<HTMLInputElement>("#export-group-folders")!;
+  type Section = { id: string; name: string; locked: boolean; entries: Item[] };
+  let currentSections: Section[] = [];
+  let currentTotal = 0;
+  const computeSections = (): Section[] => {
+    const sections: Section[] = [];
+    const ungrouped = items.filter((item) => !item.groupId && !item.isEncrypted);
+    if (ungrouped.length) sections.push({ id: "", name: "未分组", locked: false, entries: ungrouped });
+    for (const group of [...groups].sort((a, b) => a.sortOrder - b.sortOrder)) {
+      const entries = items.filter((item) => item.groupId === group.id && !item.isEncrypted);
+      if (entries.length) sections.push({ id: group.id, name: group.name, locked: false, entries });
+    }
+    const encryptedItems = items.filter((item) => item.isEncrypted || item.groupId === encryptedId);
+    // 已解锁且有加密条目 → 正常展示勾选；未解锁但设有密码 → 显示锁定行（未解锁时加密条目不会返回前端）
+    if (unlocked ? encryptedItems.length > 0 : passwordSet) sections.push({ id: encryptedId, name: "加密", locked: !unlocked, entries: encryptedItems });
+    return sections;
+  };
+  const syncGroupBoxStates = () => {
+    tree.querySelectorAll<HTMLInputElement>("input.export-group").forEach((box) => {
+      const section = currentSections.find((item) => item.id === box.dataset.section);
+      if (!section) return;
+      const count = section.entries.filter((entry) => chosen.has(entry.id)).length;
+      box.checked = count > 0 && count === section.entries.length;
+      box.indeterminate = count > 0 && count < section.entries.length;
+    });
+    node.querySelector<HTMLElement>("#export-count")!.textContent = `已选 ${chosen.size} / ${currentTotal}`;
+  };
+  const renderTree = () => {
+    currentSections = computeSections();
+    currentTotal = currentSections.reduce((sum, section) => sum + section.entries.length, 0);
+    // 新出现的条目默认勾选（首次渲染 = 全选；解锁后新载入的加密条目同样默认勾选）
+    for (const section of currentSections) for (const entry of section.entries) if (!seen.has(entry.id)) { seen.add(entry.id); chosen.add(entry.id); }
+    tree.innerHTML = currentSections.map((section) => {
+      if (section.locked) return `<div class="scan-node"><div class="scan-row"><span class="scan-toggle-spacer"></span><input type="checkbox" disabled /><i class="scan-icon folder">🔒</i><span class="scan-name">${escape(section.name)}<em>已锁定</em></span><button type="button" class="export-unlock">解锁后导出</button></div></div>`;
+      return `<div class="scan-node has-children"><div class="scan-row"><button type="button" class="scan-toggle" title="展开 / 折叠">▾</button><input type="checkbox" class="export-group" data-section="${escape(section.id)}" /><i class="scan-icon folder">▰</i><span class="scan-name">${escape(section.name)}<em>${section.entries.length} 项</em></span></div><div class="scan-children">${section.entries.map((entry) => `<label class="scan-file"><input type="checkbox" class="export-entry" data-section="${escape(section.id)}" value="${entry.id}" ${chosen.has(entry.id) ? "checked" : ""} /><i class="scan-icon">${itemIcon(entry)}</i><span class="scan-name">${escape(entry.name)}<em>${exportKindLabel(entry)}</em></span><small>${escape(entry.isCmd ? cmdLabel : entry.target)}</small></label>`).join("")}</div></div>`;
+    }).join("") || "<p class=muted>还没有可导出的启动项</p>";
+    tree.querySelectorAll<HTMLInputElement>("input.export-group").forEach((box) => box.onchange = () => {
+      const section = currentSections.find((item) => item.id === box.dataset.section);
+      if (!section) return;
+      section.entries.forEach((entry) => { if (box.checked) chosen.add(entry.id); else chosen.delete(entry.id); });
+      tree.querySelectorAll<HTMLInputElement>(`input.export-entry[data-section="${CSS.escape(box.dataset.section!)}"]`).forEach((input) => { input.checked = box.checked; });
+      syncGroupBoxStates();
+    });
+    tree.querySelectorAll<HTMLInputElement>("input.export-entry").forEach((box) => box.onchange = () => {
+      if (box.checked) chosen.add(box.value); else chosen.delete(box.value);
+      syncGroupBoxStates();
+    });
+    // 分组展开 / 折叠：直接切换 class，不重建列表，保留勾选状态
+    tree.querySelectorAll<HTMLElement>(".scan-node").forEach((treeNode) => {
+      const toggle = treeNode.querySelector<HTMLButtonElement>(":scope > .scan-row > .scan-toggle");
+      toggle?.addEventListener("click", (event) => {
+        event.preventDefault();
+        treeNode.classList.toggle("collapsed");
+        toggle.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾";
+      });
+    });
+    tree.querySelector<HTMLButtonElement>(".export-unlock")?.addEventListener("click", async () => {
+      if (await promptUnlock()) { await load(); renderTree(); }
+    });
+    syncGroupBoxStates();
+  };
+  node.querySelectorAll<HTMLButtonElement>("[data-export-select]").forEach((button) => button.onclick = () => {
+    const all = button.dataset.exportSelect === "all";
+    chosen.clear();
+    if (all) for (const section of currentSections) for (const entry of section.entries) chosen.add(entry.id);
+    tree.querySelectorAll<HTMLInputElement>("input.export-entry").forEach((input) => { input.checked = all; });
+    syncGroupBoxStates();
+  });
+  node.querySelector<HTMLButtonElement>("#export-pick")!.onclick = async () => {
+    const picked = await chooseFile({ directory: true, multiple: false });
+    if (typeof picked === "string") { dir = picked; dirInput.value = picked; }
+  };
+  const runButton = node.querySelector<HTMLButtonElement>("#export-run")!;
+  node.querySelector<HTMLFormElement>("#export-form")!.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!dir) { message("请先选择导出文件夹"); return; }
+    if (!chosen.size) { message("请至少选择一个启动项"); return; }
+    runButton.disabled = true;
+    runButton.innerHTML = `<i class="loading-dot"></i>正在导出…`;
+    try {
+      const result = await invoke<ExportResult>("export_items", { request: { dir, groupFolders: groupFoldersInput.checked, itemIds: [...chosen] } });
+      node.remove();
+      showExportResult(result);
+    } catch (error) {
+      runButton.disabled = false;
+      runButton.textContent = "导出";
+      message(error);
+    }
+  };
+  renderTree();
 }
 async function reorderGroups(event: DragEvent, targetId: string) { event.preventDefault(); const sourceId = event.dataTransfer?.getData("group"); if (!sourceId || sourceId === targetId) return; const reordered = groups.sort((a,b) => a.sortOrder-b.sortOrder); const from = reordered.findIndex((group) => group.id === sourceId); const to = reordered.findIndex((group) => group.id === targetId); if (from < 0 || to < 0) return; reordered.splice(to, 0, reordered.splice(from, 1)[0]); try { await invoke("save_group_order", { ids: reordered.map((group) => group.id) }); await load(); } catch (error) { message(error); } }
 window.addEventListener("keydown", (event) => { const target = event.target as HTMLElement; if (target.matches("input, textarea, select")) { if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); return; } const shown = displayItems(); if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); } if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); } if (event.key === "Escape") document.querySelector<HTMLElement>(".overlay")?.remove(); });
