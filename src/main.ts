@@ -486,7 +486,7 @@ function renderScanTree(entries: DesktopEntry[], chosen: Set<number>, rootLabel:
         ${hasChildren ? `<button type="button" class="scan-toggle" title="展开 / 折叠">▾</button>` : `<span class="scan-toggle-spacer"></span>`}
         ${box}
         <i class="scan-icon ${entry ? entry.entryType : "folder"}">${entry ? scanIcon(entry) : "▰"}</i>
-        <span class="scan-name">${escape(isRoot ? rootLabel : treeNode.name)}${entry ? `<em>${scanMeta(entry).label}</em>` : ""}</span>
+        <span class="scan-name">${escape(isRoot ? rootLabel : treeNode.name)}${entry ? `<em>${scanMeta(entry).label}</em>` : ""}${hasChildren ? `<em>${children.length + treeNode.files.length} 项</em>` : ""}</span>
         <small>${escape(entry ? entry.target : "")}</small>
       </div>
       <div class="scan-children">${children.map((child) => renderNode(child)).join("")}${files}</div>
@@ -570,11 +570,12 @@ async function openScan() {
         return;
       }
       // 父子勾选不关联：勾文件夹不等于勾选其内容，选快捷方式也不会带上父目录
-      container.querySelectorAll<HTMLElement>(".scan-node").forEach((treeNode) => {
+      // 父级整行（名称、图标、空白处）点击均可展开 / 折叠，勾选框与展开按钮除外
+      container.querySelectorAll<HTMLElement>(".scan-node.has-children").forEach((treeNode) => {
         const row = treeNode.querySelector<HTMLElement>(":scope > .scan-row")!;
         const toggle = () => { treeNode.classList.toggle("collapsed"); row.querySelector<HTMLElement>(".scan-toggle")!.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾"; };
         row.querySelector<HTMLButtonElement>(".scan-toggle")?.addEventListener("click", (event) => { event.preventDefault(); toggle(); });
-        row.querySelector<HTMLElement>(".scan-name")?.addEventListener("click", () => { if (treeNode.classList.contains("has-children")) toggle(); });
+        row.addEventListener("click", (event) => { if (!(event.target as HTMLElement).closest("input, button")) toggle(); });
       });
       container.querySelectorAll<HTMLInputElement>(".scan-items input.scan-entry").forEach((input) => input.onchange = () => { syncChosen(); updateScanSelection(node); });
     };
@@ -670,6 +671,7 @@ function openExportDialog() {
   const chosen = new Set<string>();
   const seen = new Set<string>();
   const node = modal(`<h2>还原到文件夹</h2><form id="export-form"><p class="hint">把启动项还原为文件夹中的快捷方式、${cmdLabel}（.bat）或网址文件（.url）；文件和文件夹类型的启动项不会导出。</p><label>导出到<div class="with-button"><input id="export-dir" readonly placeholder="点击「选择…」指定文件夹" /><button type="button" id="export-pick">选择…</button></div></label><label class="export-option"><input type="checkbox" id="export-group-folders" checked />按分组创建文件夹（「未分组」的条目直接放在根目录）</label><div class="scan-bulk"><span id="export-count"></span><div><button type="button" data-export-select="all">全选</button><button type="button" data-export-select="none">取消全选</button></div></div><div class="scan-items tree" id="export-tree"></div><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary" id="export-run">导出</button></div></form>`);
+  node.classList.add("export-overlay");
   const tree = node.querySelector<HTMLElement>("#export-tree")!;
   const dirInput = node.querySelector<HTMLInputElement>("#export-dir")!;
   const groupFoldersInput = node.querySelector<HTMLInputElement>("#export-group-folders")!;
@@ -719,14 +721,13 @@ function openExportDialog() {
       if (box.checked) chosen.add(box.value); else chosen.delete(box.value);
       syncGroupBoxStates();
     });
-    // 分组展开 / 折叠：直接切换 class，不重建列表，保留勾选状态
-    tree.querySelectorAll<HTMLElement>(".scan-node").forEach((treeNode) => {
-      const toggle = treeNode.querySelector<HTMLButtonElement>(":scope > .scan-row > .scan-toggle");
-      toggle?.addEventListener("click", (event) => {
-        event.preventDefault();
-        treeNode.classList.toggle("collapsed");
-        toggle.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾";
-      });
+    // 分组展开 / 折叠：直接切换 class，不重建列表，保留勾选状态；点击父级整行（勾选框与按钮除外）也可切换
+    tree.querySelectorAll<HTMLElement>(".scan-node.has-children").forEach((treeNode) => {
+      const row = treeNode.querySelector<HTMLElement>(":scope > .scan-row")!;
+      const toggleButton = row.querySelector<HTMLButtonElement>(":scope > .scan-toggle");
+      const toggle = () => { treeNode.classList.toggle("collapsed"); if (toggleButton) toggleButton.textContent = treeNode.classList.contains("collapsed") ? "▸" : "▾"; };
+      toggleButton?.addEventListener("click", (event) => { event.preventDefault(); toggle(); });
+      row.addEventListener("click", (event) => { if (!(event.target as HTMLElement).closest("input, button")) toggle(); });
     });
     tree.querySelector<HTMLButtonElement>(".export-unlock")?.addEventListener("click", async () => {
       if (await promptUnlock()) { await load(); renderTree(); }
