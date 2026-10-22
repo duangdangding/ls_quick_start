@@ -138,7 +138,8 @@ button.primary { background: var(--hl-color); border-color: var(--hl-color); col
 
 /* 列表视图：单列、行式排布；任何宽度下都不出横向滚动条 */
 .grid.list { grid-template-columns: 1fr; grid-auto-rows: auto; gap: 6px; overflow-x: hidden; }
-.grid.list .card { padding: 8px 12px; border-radius: 9px; box-shadow: none; }
+/* 卡片是 grid 项目，min-width 默认 auto（= min-content），长名称/长路径会把整行撑出容器；必须显式 min-width: 0 让卡片收缩到 1fr 轨道宽度 */
+.grid.list .card { min-width: 0; padding: 8px 12px; border-radius: 9px; box-shadow: none; }
 .grid.list .card:hover, .grid.list .card.selected { transform: none; box-shadow: 0 4px 12px rgba(0,0,0,.14); }
 .grid.list .icon { flex: 0 0 30px; height: 30px; font-size: 17px; border-radius: 7px; }
 .grid.list .card-text { flex: 1; min-width: 0; flex-direction: row; align-items: center; gap: 10px; }
