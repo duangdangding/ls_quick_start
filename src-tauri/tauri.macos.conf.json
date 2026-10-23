@@ -10,6 +10,7 @@
         "minWidth": 700,
         "minHeight": 500,
         "resizable": true,
+        "visible": false,
         "transparent": true
       },
       {

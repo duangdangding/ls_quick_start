@@ -1733,7 +1733,12 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if !win.is_visible().unwrap_or(false) { let _ = win.show(); let _ = win.set_focus(); }
+        if !win.is_visible().unwrap_or(false) {
+            // 先通知前端再显示窗口：前端可在面板可见前清空搜索并重绘，避免先闪出旧内容
+            let _ = app.emit("panel-shown", ());
+            let _ = win.show(); let _ = win.set_focus();
+            return;
+        }
     }
     let _ = app.emit("panel-shown", ());
 }
@@ -2329,7 +2334,7 @@ fn toggle_window(app: &tauri::AppHandle) {
             if !focused && behavior != "hide" { let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); }
             else { hide_panel_internal(app); }
         }
-        else { let _ = win.show(); let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); }
+        else { let _ = app.emit("panel-shown", ()); let _ = win.show(); let _ = win.set_focus(); }
     }
 }
 

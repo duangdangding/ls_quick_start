@@ -828,6 +828,8 @@ listen("panel-shown", () => {
     query = "";
     searchSelection = null;
     selected = 0;
+    // 立即用现有数据重绘：不等 load() 的 IPC 往返，避免面板显示后仍残留旧搜索词（感知延迟）
+    render();
   }
   void load();
 });
