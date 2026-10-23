@@ -869,6 +869,7 @@ $("#btn-save").addEventListener("click", async () => {
   bindCheck("always-on-top", "alwaysOnTop");
   bindCheck("remember-size", "rememberSize");
   bindCheck("run-target-enabled", "runTargetEnabled");
+  bindCheck("clear-search-on-reopen", "clearSearchOnReopen");
 
   encryptUnlockSel.value = config.encryptUnlockMode === "always" ? "always" : "session";
   hotkeyUnfocusedSel.value = config.hotkeyUnfocusedBehavior === "hide" ? "hide" : "front";

@@ -33,6 +33,7 @@ export interface AppConfig {
   encryptUnlockMode: string; // 加密解锁策略："always" 每次打开面板都需密码 | "session" 仅重启应用才需密码
   hotkeyUnfocusedBehavior: string; // 面板已显示但未聚焦时按快捷键："front" 置前显示 | "hide" 隐藏面板
   runTargetEnabled: boolean; // 搜索框「直接运行」（仿 Win+R）：默认开启；关闭后仅搜索启动项
+  clearSearchOnReopen: boolean; // 重新打开面板时清空搜索框：默认开启，回到全部条目重新开始
   configDir: string | null;
   dbDir: string | null;
   background: BackgroundConfig;

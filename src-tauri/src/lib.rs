@@ -94,6 +94,9 @@ struct AppConfig {
     /// 搜索框「直接运行」（仿 Win+R）开关：默认开启，搜索启动项的同时可当运行框用；关闭后仅搜索启动项
     #[serde(default = "default_run_target_enabled")]
     run_target_enabled: bool,
+    /// 重新打开面板时是否清空搜索框：默认清空，回到全部条目重新开始
+    #[serde(default = "default_clear_search_on_reopen")]
+    clear_search_on_reopen: bool,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
@@ -110,6 +113,9 @@ fn default_hotkey_unfocused_behavior() -> String { "front".into() }
 
 /// 「直接运行」功能默认开启
 fn default_run_target_enabled() -> bool { true }
+
+/// 重新打开面板清空搜索框：默认开启
+fn default_clear_search_on_reopen() -> bool { true }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -167,6 +173,7 @@ impl Default for AppConfig {
             encrypt_unlock_mode: "session".into(),
             hotkey_unfocused_behavior: "front".into(),
             run_target_enabled: true,
+            clear_search_on_reopen: true,
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),

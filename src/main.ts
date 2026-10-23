@@ -822,11 +822,13 @@ window.addEventListener("keydown", (event) => {
 });
 void load();
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
-// 每次打开面板都清空上次的搜索词，从全部条目重新开始
+// 「重新打开面板时清空搜索框」开启时（默认），清空上次的搜索词，从全部条目重新开始；关闭则保留
 listen("panel-shown", () => {
-  query = "";
-  searchSelection = null;
-  selected = 0;
+  if (appConfig?.clearSearchOnReopen !== false) {
+    query = "";
+    searchSelection = null;
+    selected = 0;
+  }
   void load();
 });
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
