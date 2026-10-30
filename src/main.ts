@@ -280,6 +280,8 @@ function showTip(card: HTMLElement, item: Item) {
 function bindInteractions(shown: Item[]) {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((button) => button.onclick = () => void action(button.dataset.action!));
   document.querySelectorAll<HTMLElement>("[data-group]").forEach((tab) => { tab.onclick = () => { activeGroup = tab.dataset.group!; selected = 0; selectedIds.clear(); render(); }; tab.ondragstart = (event) => event.dataTransfer?.setData("group", tab.dataset.group!); tab.ondragover = (event) => event.preventDefault(); tab.ondrop = (event) => void reorderGroups(event, tab.dataset.group!); });
+  // 切换分组后让激活标签滚动到可视区域（换行布局下通常无滚动，单行溢出场景兜底）
+  document.querySelector<HTMLElement>("#tabs .tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   document.querySelectorAll<HTMLElement>(".card").forEach((card) => {
     // 「直接运行」卡片：单击选中，双击执行
     if (card.dataset.run) {
