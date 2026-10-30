@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { open as chooseFile } from "@tauri-apps/plugin-dialog";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, isMac, loadConfig, saveConfig } from "./config";
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
@@ -17,6 +18,7 @@ type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: 
 type DeleteShortcutsResult = { deleted: number; failures: ImportSkip[] };
 type ExportResult = { exported: number; skipped: ImportSkip[]; failures: ImportSkip[]; dir: string };
 type ItemIcon = { id: string; iconPath: string | null };
+type DropDraft = { name: string; target: string; iconPath: string | null };
 
 const encryptedId = "__encrypted__";
 let items: Item[] = [];
@@ -385,11 +387,13 @@ function confirmDialog(text: string, okLabel = "删除") {
   });
 }
 function selectedGroup() { return activeGroup === "all" || activeGroup === "none" ? null : activeGroup; }
-function openItemDialog(item?: Item) {
-  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(item?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>说明（可选）<input name="description" value="${escape(item?.description ?? "")}" placeholder="备注信息，鼠标悬停条目时显示" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(item?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(item?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
+function openItemDialog(item?: Item, draft?: DropDraft) { const prefill = item ?? draft;
+  const isCmd = item?.isCmd ?? false; const node = modal(`<h2>${item ? "编辑启动项" : "添加启动项"}</h2><form id="item-form"><label>名称<input name="name" required value="${escape(prefill?.name ?? "")}" placeholder="例如：工作资料" /></label><label>关键字<input name="keyword" value="${escape(item?.keyword ?? "")}" placeholder="用于搜索，留空则使用名称" /></label><label>说明（可选）<input name="description" value="${escape(item?.description ?? "")}" placeholder="备注信息，鼠标悬停条目时显示" /></label><label>类型<select name="kind"><option value="target">文件、目录、快捷方式或 URL</option><option value="cmd">${cmdLabel}</option></select></label><label>启动目标<div class="with-button"><input name="target" required value="${escape(prefill?.target ?? "")}" placeholder="绝对路径、https:// 或命令" /><button type="button" id="pick">选择…</button></div></label><label>分组<select name="group"><option value="">未分组</option>${groups.sort((a,b) => a.sortOrder-b.sortOrder).map((group) => `<option value="${group.id}">${escape(group.name)}</option>`).join("")}<option value="${encryptedId}">🔒 加密</option></select></label><label>自定义图标（可选）<div class="with-button"><input name="icon" value="${escape(prefill?.iconPath ?? "")}" placeholder="图标文件路径" /><button type="button" id="pick-icon">选择…</button></div></label><div class="modal-actions"><button type="button" data-close>取消</button><button class="primary">保存</button></div></form>`); const form = node.querySelector<HTMLFormElement>("#item-form")!; const kind = form.elements.namedItem("kind") as HTMLSelectElement; kind.value = isCmd ? "cmd" : "target"; (form.elements.namedItem("group") as HTMLSelectElement).value = item?.groupId ?? selectedGroup() ?? "";
   node.querySelector<HTMLButtonElement>("#pick")!.onclick = async () => { const path = await chooseFile({ directory: false, multiple: false }); if (typeof path === "string") (form.elements.namedItem("target") as HTMLInputElement).value = path; };
   node.querySelector<HTMLButtonElement>("#pick-icon")!.onclick = async () => { const path = await chooseFile({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "ico", "svg"] }] }); if (typeof path === "string") (form.elements.namedItem("icon") as HTMLInputElement).value = path; };
   form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", description: values.get("description") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, lnkPath: item?.lnkPath ?? null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
+  // 拖拽批量添加：弹窗关闭（保存或取消）后自动打开下一个草稿
+  if (draft) { const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); openNextDropDraft(); } }); observer.observe(document.body, { childList: true }); }
 }
 /** 启动项 ⋯ 菜单：webview 无法渲染到窗口之外，只能收进视口内；优先与按钮右对齐、向下展开，贴近左/右/下边缘时自动翻转或回收，保证四个边缘的条目菜单都完整可见；滚动 / 调整窗口时关闭以免菜单与按钮脱节 */
 function showItemMenu(id: string, anchor: HTMLElement) { document.querySelector(".menu")?.remove(); const menu = document.createElement("div"); menu.className = "menu"; menu.innerHTML = `<button data-edit>编辑</button><button data-open>打开</button><button data-move>移动到分组</button><button class="danger" data-delete>删除</button>`; document.body.append(menu); const box = anchor.getBoundingClientRect(); const margin = 6; const mw = menu.offsetWidth, mh = menu.offsetHeight; let left = box.right - mw; if (left < margin) left = box.left; left = Math.min(Math.max(margin, left), window.innerWidth - mw - margin); let top = box.bottom + 4; if (top + mh > window.innerHeight - margin) top = box.top - mh - 4; top = Math.max(margin, top); menu.style.left = `${left}px`; menu.style.top = `${top}px`; const closeMenu = () => menu.remove(); document.querySelector("#grid")?.addEventListener("scroll", closeMenu, { once: true }); window.addEventListener("resize", closeMenu, { once: true }); menu.querySelector("[data-edit]")!.addEventListener("click", () => { menu.remove(); openItemDialog(items.find((item) => item.id === id)); }); menu.querySelector("[data-open]")!.addEventListener("click", () => { menu.remove(); void openItem(id); }); menu.querySelector("[data-move]")!.addEventListener("click", () => { menu.remove(); const item = items.find((target) => target.id === id); if (item) openMoveDialog([id], item.groupId); }); menu.querySelector("[data-delete]")!.addEventListener("click", async () => { menu.remove(); if (!await confirmDialog("确认删除这个启动项？")) return; try { await invoke("delete_item", { id }); await load(); } catch (error) { message(error); } }); }
@@ -877,6 +881,28 @@ listen<AppConfig>("config-changed", async (event) => {
     pinned = cfg.alwaysOnTop;
     render();
   }
+});
+
+// ---------- 拖拽添加：把文件 / 文件夹 / 快捷方式 / .url 网址文件拖到面板上，逐个弹出「添加启动项」 ----------
+let dropQueue: DropDraft[] = [];
+function openNextDropDraft() {
+  const draft = dropQueue.shift();
+  if (draft) openItemDialog(undefined, draft);
+}
+getCurrentWebview().onDragDropEvent((event) => {
+  const payload = event.payload;
+  if (payload.type === "over") { app.classList.add("drag-over"); return; }
+  app.classList.remove("drag-over");
+  if (payload.type !== "drop") return;
+  void (async () => {
+    try {
+      const drafts = await invoke<DropDraft[]>("prepare_dropped", { paths: payload.paths });
+      if (!drafts.length) { message("没有可添加的内容：支持文件、文件夹、快捷方式和 .url 网址文件"); return; }
+      dropQueue.push(...drafts);
+      // 已有弹窗打开时由关闭回调接续，这里只在空闲时开启第一个
+      if (!document.querySelector(".overlay")) openNextDropDraft();
+    } catch (error) { message(error); }
+  })();
 });
 
 // ---------- 应用内更新：启动自动检查，发现新版在面板顶部显示横幅 ----------

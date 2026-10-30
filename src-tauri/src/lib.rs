@@ -1417,6 +1417,52 @@ fn delete_shortcut_files(data: State<'_, AppData>, paths: Vec<String>) -> Result
     Ok(DeleteShortcutsResult { deleted: deleted_paths.len(), failures })
 }
 
+// ---------- 拖拽添加 ----------
+
+/// 拖拽到面板的文件 / 文件夹 / 快捷方式 / 网址文件，解析为「添加启动项」弹窗的草稿
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DropDraft { name: String, target: String, icon_path: Option<String> }
+
+/// 解析 .url 网址文件（INI 格式，取 URL= 行）
+fn read_url_shortcut(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    content.lines().map(str::trim).find(|line| line.len() > 4 && line[..4].eq_ignore_ascii_case("url=")).map(|line| line[4..].trim().to_string()).filter(|url| is_url(url))
+}
+
+#[tauri::command]
+fn prepare_dropped(paths: Vec<String>) -> Vec<DropDraft> {
+    let icon_dir = default_data_dir().join("scan-icons");
+    let _ = fs::create_dir_all(&icon_dir);
+    let mut drafts: Vec<(DropDraft, PathBuf)> = Vec::new();
+    let mut icon_pairs = Vec::new();
+    for raw in paths {
+        let path = PathBuf::from(&raw);
+        if !path.exists() { continue; }
+        // macOS 的 .app 应用包是目录，名称取 stem；普通目录取完整目录名，避免目录名中的 . 被当作扩展名截断
+        let is_app_bundle = cfg!(target_os = "macos") && path.extension().is_some_and(|x| x.eq_ignore_ascii_case("app"));
+        let name = if path.is_dir() && !is_app_bundle { path.file_name() } else { path.file_stem() }
+            .map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| raw.clone());
+        // .url 网址文件解析出真实 URL；其余以路径本身为目标——.lnk 交给 save_item 的
+        // normalize_target / resolve_lnk_path 处理，从而保留快捷方式来源（目标+参数+工作目录）
+        let target = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("url")) {
+            match read_url_shortcut(&path) { Some(url) => url, None => continue }
+        } else {
+            display_path(path.display().to_string())
+        };
+        // 图标文件名规则与 scan_dir 一致（来源路径的 sha256），已缓存则复用
+        let mut hasher = Sha256::new(); hasher.update(raw.as_bytes());
+        let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
+        if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
+        drafts.push((DropDraft { name, target, icon_path: None }, icon_file));
+    }
+    extract_icons(&icon_pairs);
+    drafts.into_iter().map(|(mut draft, icon_file)| {
+        draft.icon_path = icon_file.exists().then(|| display_path(icon_file.display().to_string()));
+        draft
+    }).collect()
+}
+
 // ---------- 还原启动项到文件夹 ----------
 
 #[derive(Deserialize)]
@@ -2433,7 +2479,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
-            import_scanned, delete_shortcut_files, export_items, item_icons, get_config, save_config, get_db_info, run_target,
+            import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
             show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
