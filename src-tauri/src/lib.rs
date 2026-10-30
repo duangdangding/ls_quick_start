@@ -2070,10 +2070,51 @@ fn portable_update_begin(target_dir: Option<String>) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-/// 构建 ureq Agent：优先尝试系统/环境代理，代理不可用时回退直连
+/// 读取 Windows 系统代理设置（注册表），返回 http://host:port 形式的代理 URL；未开启或不可用时返回 None
+#[cfg(windows)]
+fn windows_system_proxy() -> Option<String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings").ok()?;
+    let enable: u32 = hkcu.get_value("ProxyEnable").unwrap_or(0);
+    let server: String = hkcu.get_value("ProxyServer").unwrap_or_default();
+    if enable == 0 || server.is_empty() { return None; }
+    // ProxyServer 格式可能是 "http=host:port;https=host:port" 或 "host:port"
+    let server = if server.contains('=') {
+        let pick = |proto: &str| server.split(';').find_map(|entry| {
+            let mut kv = entry.splitn(2, '=');
+            match (kv.next().map(str::trim), kv.next()) {
+                (Some(k), Some(v)) if k == proto => Some(v.trim().to_string()),
+                _ => None,
+            }
+        });
+        pick("https").or_else(|| pick("http"))
+    } else {
+        Some(server.trim().to_string())
+    };
+    server.filter(|s| !s.is_empty()).map(|s| format!("http://{s}"))
+}
+
+/// 把系统代理写入进程环境变量（用户已手动配置代理环境变量时不覆盖）：
+/// updater 插件（reqwest）与 ureq 都会读取 HTTPS_PROXY / HTTP_PROXY，
+/// 统一在启动时显式设置——系统开了代理就走代理，没开就是直连
+fn apply_system_proxy_env() {
+    if std::env::var("HTTPS_PROXY").is_ok() || std::env::var("https_proxy").is_ok()
+        || std::env::var("HTTP_PROXY").is_ok() || std::env::var("http_proxy").is_ok()
+    {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(url) = windows_system_proxy() {
+        std::env::set_var("HTTPS_PROXY", &url);
+        std::env::set_var("HTTP_PROXY", &url);
+    }
+}
+
+/// 构建 ureq Agent：优先尝试环境变量 / 系统代理，代理不可用时回退直连
 fn ureq_agent() -> ureq::Agent {
     let builder = ureq::AgentBuilder::new();
-    // 优先读环境变量（Clash/V2Ray 等命令行代理会写 HTTPS_PROXY）
+    // 环境变量优先（含 apply_system_proxy_env 从系统代理写入的）
     if let Ok(proxy) = std::env::var("HTTPS_PROXY")
         .or_else(|_| std::env::var("https_proxy"))
         .or_else(|_| std::env::var("HTTP_PROXY"))
@@ -2083,35 +2124,10 @@ fn ureq_agent() -> ureq::Agent {
             return builder.proxy(proxy).build();
         }
     }
-    // Windows 下尝试读注册表系统代理
+    // 兜底再直接读一次系统代理（未经过 run() 初始化的场景）
     #[cfg(windows)]
-    {
-        use winreg::enums::*;
-        use winreg::RegKey;
-        if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings") {
-            let enable: u32 = hkcu.get_value("ProxyEnable").unwrap_or(0);
-            let server: String = hkcu.get_value("ProxyServer").unwrap_or_default();
-            if enable != 0 && !server.is_empty() {
-                // ProxyServer 格式可能是 "http=host:port;https=host:port" 或 "host:port"
-                let server = if server.contains('=') {
-                    server.split(';').find_map(|s| {
-                        let mut kv = s.splitn(2, '=');
-                        match (kv.next(), kv.next()) {
-                            (Some("https"), Some(v)) => Some(v.to_string()),
-                            _ => None,
-                        }
-                    })
-                } else {
-                    Some(server)
-                };
-                if let Some(server) = server {
-                    let proxy_url = format!("http://{}", server);
-                    if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
-                        return builder.proxy(proxy).build();
-                    }
-                }
-            }
-        }
+    if let Some(proxy) = windows_system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()) {
+        return builder.proxy(proxy).build();
     }
     builder.build()
 }
@@ -2420,6 +2436,7 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
 // ---------- 入口 ----------
 
 pub fn run() {
+    apply_system_proxy_env();
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
