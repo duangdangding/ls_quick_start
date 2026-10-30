@@ -71,11 +71,11 @@ function typeRank(item: Item) {
   return (target.split(/[\\/]/).pop() ?? "").includes(".") ? 2 : 3;
 }
 /**
- * 搜索匹配打分（越大越靠前）：关键字（含拼音）优先于名称（含拼音）。
- * 关键字命中统一加上大偏移，保证任何关键字命中都排在名称命中之前；同组内按匹配质量分档：
- * 3 以关键字开头 > 2 拼音以关键字开头 > 1 中间包含 > 0 子序列命中；未命中返回 -1（调用方据此过滤）。
+ * 搜索匹配打分（越大越靠前）：名称与关键字（各含拼音）分别打分取最高，关键字命中仅加小偏移，
+ * 使同等匹配质量下关键字略优先，但拼音弱子序列命中不会压过名称/关键字的精确命中；
+ * 同字段内按匹配质量分档：3 开头命中 > 2 拼音开头命中 > 1 中间包含 > 0 子序列命中；未命中返回 -1（调用方据此过滤）。
  */
-const KEYWORD_BONUS = 10000;
+const KEYWORD_BONUS = 200;
 /** 预计算小写搜索字段：加载时算一次，避免每次按键对全部条目重复 toLowerCase */
 const buildSearchCache = (item: Item): SearchCache => {
   const extra = item as Item & { fullPinyin?: string; initials?: string; keywordFullPinyin?: string; keywordInitials?: string };
@@ -95,12 +95,14 @@ function fuzzyScore(item: Item, needle: string) {
     { value: cache?.kwPy ?? "", tier: 2 },
     { value: cache?.kwIn ?? "", tier: 2 },
   ], needle);
-  if (keywordScore > -1) return KEYWORD_BONUS + keywordScore;
-  return bestFieldScore([
+  const nameScore = bestFieldScore([
     { value: cache?.nm ?? item.name.toLowerCase(), tier: 3 },
     { value: cache?.nmPy ?? "", tier: 2 },
     { value: cache?.nmIn ?? "", tier: 2 },
   ], needle);
+  if (keywordScore < 0 && nameScore < 0) return -1;
+  // 关键字命中加小偏移：同质量下关键字优先，但弱命中（如拼音子序列）不能压过名称的强命中
+  return Math.max(keywordScore < 0 ? -1 : keywordScore + KEYWORD_BONUS, nameScore);
 }
 /** 取多个字段中的最高匹配分：完全包含时按「是否开头 + 分档」计分，否则退回子序列匹配 */
 function bestFieldScore(fields: { value: string; tier: number }[], needle: string) {
