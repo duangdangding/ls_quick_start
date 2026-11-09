@@ -89,6 +89,36 @@ jobs:
         if: env.TAURI_SIGNING_PRIVATE_KEY == ''
         run: node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));if(j.plugins&&j.plugins.updater&&'pubkey' in j.plugins.updater){delete j.plugins.updater.pubkey;fs.writeFileSync(p,JSON.stringify(j,null,2));console.log('已移除 updater.pubkey');}"
 
+      # 预置 Tauri 的 NSIS 工具链缓存：CI 上下载 nsis_tauri_utils.dll 偶发 504，
+      # bundler 自身没有重试；这里手动带重试下载并校验 SHA1。
+      # 目录齐全且 DLL 哈希匹配时，bundler 会跳过全部下载直接打包。
+      - name: Pre-seed NSIS toolchain cache
+        if: matrix.id == 'win'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nsisDir = "$env:LOCALAPPDATA\tauri\NSIS"
+          New-Item -ItemType Directory -Force $nsisDir | Out-Null
+
+          function Get-WithRetry($url, $out, $sha1) {
+            for ($i = 1; $i -le 8; $i++) {
+              curl.exe -sSL --retry 3 --retry-all-errors --connect-timeout 30 -o $out $url
+              if ($LASTEXITCODE -eq 0 -and (Get-FileHash $out -Algorithm SHA1).Hash -ieq $sha1) { return }
+              Write-Host "下载失败或校验不符（第 $i 次），5 秒后重试：$url"
+              Start-Sleep -Seconds 5
+            }
+            throw "多次重试后仍无法下载：$url"
+          }
+
+          $zip = "$env:RUNNER_TEMP\nsis-3.11.zip"
+          Get-WithRetry 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' $zip 'EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D'
+          Expand-Archive $zip "$env:RUNNER_TEMP\nsis-extract" -Force
+          Move-Item "$env:RUNNER_TEMP\nsis-extract\nsis-3.11\*" $nsisDir -Force
+
+          $dllDir = "$nsisDir\Plugins\x86-unicode\additional"
+          New-Item -ItemType Directory -Force $dllDir | Out-Null
+          Get-WithRetry 'https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll' "$dllDir\nsis_tauri_utils.dll" '75197FEE3C6A814FE035788D1C34EAD39349B860'
+
       - name: Build release
         env:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
