@@ -3,7 +3,7 @@
 /* 弹窗按钮不参与压缩：空间不足时整体换行，避免文字被挤变形 */
 .modal-actions button { flex: none; white-space: nowrap; }.hint, .muted { color: var(--muted); font-size: 12px; line-height: 1.6; }
 button.link { border: 0; background: transparent; padding: 0; color: var(--blue); font-size: 12px; text-decoration: underline; }
-button.link:hover { background: transparent; filter: brightness(1.15); }.menu { position: fixed; z-index: 12; width: 116px; padding: 5px; border: 1px solid #585b70; border-radius: 9px; background: #313244; box-shadow: 0 10px 25px rgba(0,0,0,.35); }.menu button { width: 100%; border: 0; text-align: left; background: transparent; border-radius: 5px; padding: 7px 9px; }.menu button:hover { background: var(--surface-hi); }.group-list { display: grid; gap: 8px; }.group-list > div { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 8px; background: var(--surface); }.group-list span { flex: 1; }.group-list button { padding: 5px 8px; font-size: 12px; }.scan-bulk { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 13px; color: var(--muted); font-size: 12px; }.scan-bulk > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }.scan-bulk button { padding: 4px 7px; font-size: 11px; }.scan-items { max-height: 310px; overflow: auto; margin-top: 9px; border: 1px solid var(--border); border-radius: 8px; }
+button.link:hover { background: transparent; filter: brightness(1.15); }.menu { position: fixed; z-index: 30; width: 148px; padding: 5px; border: 1px solid #585b70; border-radius: 9px; background: var(--bg); box-shadow: 0 10px 25px rgba(0,0,0,.35); }.menu button { width: 100%; border: 0; text-align: left; background: transparent; border-radius: 5px; padding: 6px 9px; font-size: 12px; }.menu button:hover { background: color-mix(in srgb, var(--blue) 26%, transparent); }.group-list { display: grid; gap: 8px; }.group-list > div { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 8px; background: var(--surface); }.group-list span { flex: 1; }.group-list button { padding: 5px 8px; font-size: 12px; }.scan-bulk { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 13px; color: var(--muted); font-size: 12px; }.scan-bulk > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }.scan-bulk button { padding: 4px 7px; font-size: 11px; }.scan-items { max-height: 310px; overflow: auto; margin-top: 9px; border: 1px solid var(--border); border-radius: 8px; }
 /* 列表布局：每行一条 */
 .scan-items.list label { display: grid; grid-template-columns: 20px 22px 1fr; gap: 0 8px; padding: 8px 9px; border-bottom: 1px solid rgba(69,71,90,.65); cursor: pointer; }
 .scan-items.list label:last-child { border-bottom: 0; }
@@ -122,7 +122,7 @@ button.primary { background: var(--hl-color); border-color: var(--hl-color); col
 :root[data-bg="on"] footer { color: color-mix(in srgb, var(--muted) 85%, transparent); }
 :root[data-bg="on"] .search { background: color-mix(in srgb, var(--surface) 65%, transparent); }
 :root[data-bg="on"] .modal { background: color-mix(in srgb, #242436 88%, transparent); }
-:root[data-bg="on"] .menu { background: color-mix(in srgb, var(--surface) 85%, transparent); }
+:root[data-bg="on"] .menu { background: color-mix(in srgb, var(--bg) 90%, transparent); }
 :root[data-bg="on"] .locked { background: color-mix(in srgb, var(--surface) 55%, transparent); }
 /* 背景图开启时移除 html/body 自带渐变底色，避免与背景图叠加 */
 :root[data-bg="on"], :root[data-bg="on"] body { background-image: none; }
