@@ -803,6 +803,18 @@ fn open_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(),
     Ok(())
 }
 
+/// 在系统文件管理器中打开启动项所在文件夹：文件 → 定位并选中；文件夹 → 直接打开。
+/// CMD 命令 / URL / shell: 虚拟目标没有本地文件夹，前端已隐藏该菜单项，这里兜底校验
+#[tauri::command]
+fn reveal_item(data: State<'_, AppData>, id: String, unlocked: bool) -> Result<(), String> {
+    let item = data.store.lock().unwrap().items.iter().find(|x| x.id == id).cloned().ok_or("启动项不存在")?;
+    if encrypted(&item) && !unlocked && !data.unlocked.load(Ordering::SeqCst) { return Err("请先解锁加密分组".into()); }
+    if item.is_cmd || is_url(&item.target) { return Err("该启动项没有本地路径".into()); }
+    #[cfg(windows)]
+    if item.target.len() > 6 && item.target[..6].eq_ignore_ascii_case("shell:") { return Err("系统虚拟项目没有本地文件夹".into()); }
+    reveal_path(item.target)
+}
+
 #[tauri::command]
 fn create_group(data: State<'_, AppData>, name: String) -> Result<Group, String> {
     check_name(&name)?;
@@ -2502,7 +2514,7 @@ pub fn run() {
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
             update_install_kind, portable_update_begin, portable_update_download, http_get_text,
-            portable_update_verify, portable_update_apply, installer_update_path, installer_update_run, reveal_path,
+            portable_update_verify, portable_update_apply, installer_update_path, installer_update_run, reveal_path, reveal_item,
             open_settings_window, set_always_on_top
         ])
         .setup(move |app| {
