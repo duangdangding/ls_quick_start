@@ -628,6 +628,13 @@ async function refreshIconsThenRack() {
   newRack();
 }
 
+/** 启动时异步拉取图标，就绪后贴到当前球上（不重新摆球，避免打断首局） */
+async function loadIconsAsync() {
+  if (!opts.icons) return;
+  iconPool = await fetchIconPool();
+  assignIcons();
+}
+
 window.addEventListener("resize", resize);
 
 // ---------- 启动 ----------
@@ -635,5 +642,8 @@ loadConfig()
   .then((cfg) => { applyAppearance(cfg); applyWindowEffect(cfg.windowEffect); })
   .catch(() => {});
 resize();
-void refreshIconsThenRack();
+// 先同步摆球：图标是异步加载的，若等它回来再摆球，首帧渲染时场上为空，
+// draw() 里取不到白球会直接抛错，渲染循环在第一帧就永久停掉（只剩台面，没有球也没有球杆）
+newRack();
+void loadIconsAsync();
 requestAnimationFrame(tick);
