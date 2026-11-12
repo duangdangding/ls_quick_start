@@ -10,8 +10,9 @@ const PLAY_W = 1000; // 台面（库边内）宽
 const PLAY_H = 500; // 台面高
 const RAIL = 36; // 库边宽度（仅绘制）
 const BALL_R = 13;
-const POCKET_R = 20;
-const BALL_COUNTS = [10, 15, 21, 28]; // 可选目标球数量（三角行数 4/5/6/7）
+const POCKET_R_CORNER = 18; // 角袋半径
+const POCKET_R_SIDE = 14; // 中袋半径（真实球台中袋比角袋小）
+const BALL_COUNTS = [10, 15, 21, 28, 36]; // 可选目标球数量（三角行数 4/5/6/7/8）
 const DEFAULT_BALL_COUNT = 15;
 const MAX_DRAG = 260; // 满力度所需的拖拽距离
 const MAX_SPEED = 1500; // 满力度出杆速度 px/s
@@ -27,15 +28,16 @@ const LOGIC_H = PLAY_H + RAIL * 2;
 // 默认球色（无图标时的台球配色，超出后循环使用）
 const BALL_COLORS = ["#f6c344", "#2f6fd0", "#e0492f", "#7b4fc0", "#ef7d1a", "#2e9e5b", "#8e2f38", "#2a2c38", "#d0729b", "#2fb6b6", "#c94f7c", "#5b8def", "#9b59d0", "#e0a030", "#3fbf8f", "#b8b42f"];
 
-// 袋口：四角 + 上下中袋（台面坐标）
-const POCKETS: Array<[number, number]> = [
-  [0, 0], [PLAY_W / 2, 0], [PLAY_W, 0],
-  [0, PLAY_H], [PLAY_W / 2, PLAY_H], [PLAY_W, PLAY_H],
+// 袋口：四角（大）+ 上下中袋（小）（台面坐标）
+const POCKETS: Array<{ x: number; y: number; r: number }> = [
+  { x: 0, y: 0, r: POCKET_R_CORNER }, { x: PLAY_W / 2, y: 0, r: POCKET_R_SIDE }, { x: PLAY_W, y: 0, r: POCKET_R_CORNER },
+  { x: 0, y: PLAY_H, r: POCKET_R_CORNER }, { x: PLAY_W / 2, y: PLAY_H, r: POCKET_R_SIDE }, { x: PLAY_W, y: PLAY_H, r: POCKET_R_CORNER },
 ];
 
 interface Ball {
   x: number; y: number;
   vx: number; vy: number;
+  rot: number; // 滚动旋转角（俯视下球面在屏幕平面内转动）
   alive: boolean;
   cue: boolean;
   num: number; // 球号（0 = 白球）
@@ -122,7 +124,7 @@ function newRack() {
   aiming = false;
   banner.hidden = true;
   // 白球在左侧开球点
-  balls.push({ x: PLAY_W * 0.25, y: PLAY_H / 2, vx: 0, vy: 0, alive: true, cue: true, num: 0, color: "#f5f5f0", icon: null });
+  balls.push({ x: PLAY_W * 0.25, y: PLAY_H / 2, vx: 0, vy: 0, rot: 0, alive: true, cue: true, num: 0, color: "#f5f5f0", icon: null });
   // 目标球三角：顶点朝左，按球数自动排 1+2+…+n 行
   const order = [...Array(opts.count).keys()];
   for (let i = order.length - 1; i > 0; i--) {
@@ -139,7 +141,7 @@ function newRack() {
       balls.push({
         x: apexX + row * gap * 0.866,
         y: apexY + (col - row / 2) * gap,
-        vx: 0, vy: 0, alive: true, cue: false,
+        vx: 0, vy: 0, rot: Math.random() * Math.PI * 2, alive: true, cue: false,
         num, color: BALL_COLORS[(num - 1) % BALL_COLORS.length], icon: null,
       });
     }
@@ -155,7 +157,7 @@ function respotCue() {
   const baseY = PLAY_H / 2;
   const free = (x: number, y: number) =>
     x > BALL_R && x < PLAY_W - BALL_R && y > BALL_R && y < PLAY_H - BALL_R &&
-    POCKETS.every(([px, py]) => Math.hypot(px - x, py - y) > POCKET_R + BALL_R) &&
+    POCKETS.every((p) => Math.hypot(p.x - x, p.y - y) > p.r + BALL_R) &&
     balls.every((b) => b.cue || !b.alive || Math.hypot(b.x - x, b.y - y) >= BALL_R * 2 + 1);
   outer:
   for (let ring = 0; ring <= 200; ring += 6) {
@@ -191,9 +193,9 @@ function step(dt: number) {
       ball.x += ball.vx * h;
       ball.y += ball.vy * h;
       // 进袋判定：袋口附近不再反弹，让球落入
-      const nearPocket = POCKETS.some(([px, py]) => Math.hypot(px - ball.x, py - ball.y) < POCKET_R + BALL_R * 0.55);
+      const nearPocket = POCKETS.some((p) => Math.hypot(p.x - ball.x, p.y - ball.y) < p.r + BALL_R * 0.55);
       if (nearPocket) {
-        if (POCKETS.some(([px, py]) => Math.hypot(px - ball.x, py - ball.y) < POCKET_R * 0.78)) { pot(ball); continue; }
+        if (POCKETS.some((p) => Math.hypot(p.x - ball.x, p.y - ball.y) < p.r * 0.72)) { pot(ball); continue; }
       } else {
         if (ball.x < BALL_R) { ball.x = BALL_R; ball.vx = Math.abs(ball.vx) * REST_WALL; }
         if (ball.x > PLAY_W - BALL_R) { ball.x = PLAY_W - BALL_R; ball.vx = -Math.abs(ball.vx) * REST_WALL; }
@@ -203,6 +205,8 @@ function step(dt: number) {
       // 摩擦：比例衰减 + 线性滚动减速
       const sp = Math.hypot(ball.vx, ball.vy);
       if (sp > 0) {
+        // 纯滚动：旋转角 = 滚过弧长 / 半径（俯视图下球面在屏幕平面内转动）
+        ball.rot += (sp * h) / BALL_R;
         const next = Math.max(0, sp * Math.exp(-DRAG * h) - ROLL * h);
         const k = next < STOP_SPEED * 0.5 ? 0 : next / sp;
         ball.vx *= k;
@@ -293,7 +297,11 @@ function updateHud() {
 // ---------- 渲染 ----------
 function resize() {
   const dpr = window.devicePixelRatio || 1;
-  const scale = Math.min(wrap.clientWidth / LOGIC_W, wrap.clientHeight / LOGIC_H);
+  // clientWidth 含内边距，须扣除，否则画布超出内容盒被裁掉边缘
+  const cs = getComputedStyle(wrap);
+  const availW = wrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const availH = wrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  const scale = Math.min(availW / LOGIC_W, availH / LOGIC_H);
   canvas.style.width = `${Math.floor(LOGIC_W * scale)}px`;
   canvas.style.height = `${Math.floor(LOGIC_H * scale)}px`;
   canvas.width = Math.floor(LOGIC_W * scale * dpr);
@@ -313,32 +321,39 @@ function drawBall(ball: Ball) {
   ctx.beginPath();
   ctx.arc(x, y, BALL_R, 0, Math.PI * 2);
   ctx.clip();
+  // 球体底色（高光渐变固定方向，不随球旋转）
+  const grad = ctx.createRadialGradient(x - BALL_R * 0.4, y - BALL_R * 0.45, BALL_R * 0.15, x, y, BALL_R);
+  grad.addColorStop(0, "#ffffff");
+  grad.addColorStop(0.25, ball.color);
+  grad.addColorStop(1, ball.cue ? "#d8d8cf" : ball.color);
+  ctx.fillStyle = grad;
+  ctx.fillRect(x - BALL_R, y - BALL_R, BALL_R * 2, BALL_R * 2);
+  // 球面图案（图标 / 号码圈 / 白球红点）随滚动旋转
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(ball.rot);
   if (ball.icon) {
-    // 启动列表图标：覆盖式填充圆形区域
-    ctx.fillStyle = "#1e1e2e";
-    ctx.fillRect(x - BALL_R, y - BALL_R, BALL_R * 2, BALL_R * 2);
-    const size = BALL_R * 2;
-    ctx.drawImage(ball.icon, x - size / 2, y - size / 2, size, size);
+    const size = BALL_R * 1.7;
+    ctx.drawImage(ball.icon, -size / 2, -size / 2, size, size);
+  } else if (!ball.cue) {
+    // 号码圈
+    ctx.beginPath();
+    ctx.arc(0, 0, BALL_R * 0.52, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,.92)";
+    ctx.fill();
+    ctx.fillStyle = "#26283a";
+    ctx.font = `700 ${BALL_R * 0.62}px system-ui`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(ball.num), 0, 0.5);
   } else {
-    const grad = ctx.createRadialGradient(x - BALL_R * 0.4, y - BALL_R * 0.45, BALL_R * 0.15, x, y, BALL_R);
-    grad.addColorStop(0, ball.cue ? "#ffffff" : "#ffffff");
-    grad.addColorStop(0.25, ball.color);
-    grad.addColorStop(1, ball.cue ? "#d8d8cf" : ball.color);
-    ctx.fillStyle = grad;
-    ctx.fillRect(x - BALL_R, y - BALL_R, BALL_R * 2, BALL_R * 2);
-    if (!ball.cue) {
-      // 号码圈
-      ctx.beginPath();
-      ctx.arc(x, y, BALL_R * 0.52, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255,255,255,.92)";
-      ctx.fill();
-      ctx.fillStyle = "#26283a";
-      ctx.font = `700 ${BALL_R * 0.62}px system-ui`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(String(ball.num), x, y + 0.5);
-    }
+    // 白球上的红点：让滚动可见
+    ctx.beginPath();
+    ctx.arc(BALL_R * 0.55, 0, BALL_R * 0.14, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(224,73,47,.85)";
+    ctx.fill();
   }
+  ctx.restore();
   // 顶部高光
   ctx.beginPath();
   ctx.ellipse(x - BALL_R * 0.3, y - BALL_R * 0.42, BALL_R * 0.34, BALL_R * 0.2, -0.6, 0, Math.PI * 2);
@@ -441,6 +456,7 @@ function drawCueStick(backX: number, backY: number, power: number) {
   ctx.beginPath();
   ctx.moveTo(sx, sy);
   ctx.lineTo(ex, ey);
+  ctx.stroke();
   // 杆头（皮头）：贴白球的一端
   ctx.strokeStyle = "#89b4fa";
   ctx.lineWidth = 5;
@@ -468,13 +484,13 @@ function drawTable() {
   ctx.fillStyle = felt;
   ctx.fillRect(RAIL, RAIL, PLAY_W, PLAY_H);
   // 袋口
-  for (const [px, py] of POCKETS) {
+  for (const p of POCKETS) {
     ctx.beginPath();
-    ctx.arc(RAIL + px, RAIL + py, POCKET_R, 0, Math.PI * 2);
+    ctx.arc(RAIL + p.x, RAIL + p.y, p.r, 0, Math.PI * 2);
     ctx.fillStyle = "#0c0f0a";
     ctx.fill();
     ctx.beginPath();
-    ctx.arc(RAIL + px, RAIL + py, POCKET_R, 0, Math.PI * 2);
+    ctx.arc(RAIL + p.x, RAIL + p.y, p.r, 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(0,0,0,.6)";
     ctx.lineWidth = 3;
     ctx.stroke();
@@ -547,18 +563,21 @@ function toPlayCoords(event: MouseEvent): [number, number] {
   ];
 }
 
-canvas.addEventListener("mousedown", (event) => {
+canvas.addEventListener("pointerdown", (event) => {
   if (event.button !== 0 || !allStopped() || gameOver || !cueBall().alive) return;
+  // 指针捕获：按住后即使光标拖出窗口，移动/松开事件仍持续派发到画布，瞄准与蓄力不会中断
+  canvas.setPointerCapture(event.pointerId);
   aiming = true;
   [aimX, aimY] = toPlayCoords(event);
 });
-canvas.addEventListener("mousemove", (event) => {
+canvas.addEventListener("pointermove", (event) => {
   if (!aiming) return;
   [aimX, aimY] = toPlayCoords(event);
 });
-window.addEventListener("mouseup", (event) => {
+canvas.addEventListener("pointerup", (event) => {
   if (!aiming) return;
   aiming = false;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
   if (!allStopped() || gameOver) return;
   const cue = cueBall();
   const dx = aimX - cue.x;
@@ -572,8 +591,9 @@ window.addEventListener("mouseup", (event) => {
   shotCount++;
   wasMoving = true;
   updateHud();
-  void event;
 });
+// 指针被系统打断（如切窗、触摸取消）时结束本次瞄准，避免卡在瞄准态
+canvas.addEventListener("pointercancel", () => { aiming = false; });
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 
 // ---------- 选项与按钮 ----------
