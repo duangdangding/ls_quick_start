@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "速启主窗口权限",
-  "windows": ["main", "settings"],
+  "windows": ["main", "settings", "game"],
   "permissions": [
     "core:default",
     "core:window:allow-maximize",

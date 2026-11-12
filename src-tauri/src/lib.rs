@@ -2327,6 +2327,30 @@ fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 打开台球娱乐窗口（重复打开时聚焦已有窗口）
+#[tauri::command]
+fn open_game_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("game") { let _ = w.show(); let _ = w.set_focus(); }
+    Ok(())
+}
+
+/// 台球游戏用的启动列表图标：返回已存在的图标文件路径（自定义图标优先，否则取图标缓存），
+/// 未解锁时不包含加密分组条目；只读已有文件，不触发图标提取
+#[tauri::command]
+fn launcher_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Vec<String> {
+    let unlocked = data.unlocked.load(Ordering::SeqCst);
+    let cache_dir = state.data_dir.join("icons");
+    data.store.lock().unwrap().items.iter()
+        .filter(|item| unlocked || !encrypted(item))
+        .filter_map(|item| {
+            item.icon_path.clone().filter(|p| Path::new(p).is_file()).or_else(|| {
+                let cached = cache_dir.join(format!("{}.png", item.id));
+                cached.is_file().then(|| display_path(cached.display().to_string()))
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn set_always_on_top(state: State<'_, ConfigState>, app: tauri::AppHandle, enable: bool) -> Result<(), String> {
     set_panel_pinned(state, app, enable)
@@ -2419,7 +2443,7 @@ fn toggle_window(app: &tauri::AppHandle) {
 }
 
 fn apply_window_effect_all(app: &tauri::AppHandle, effect: &str, dark: bool) {
-    for label in ["main", "settings"] {
+    for label in ["main", "settings", "game"] {
         if let Some(win) = app.get_webview_window(label) { apply_window_effect(&win, effect, dark); }
     }
 }
@@ -2529,7 +2553,7 @@ pub fn run() {
             get_background_cache, set_background_config, clear_background_image,
             update_install_kind, portable_update_begin, portable_update_download, http_get_text,
             portable_update_verify, portable_update_apply, installer_update_path, installer_update_run, reveal_path, reveal_item,
-            open_settings_window, set_always_on_top
+            open_settings_window, set_always_on_top, open_game_window, launcher_icons
         ])
         .setup(move |app| {
             let show = MenuItem::with_id(app, "show", "显示/隐藏面板", true, None::<&str>)?;
@@ -2584,6 +2608,16 @@ pub fn run() {
                 });
             }
             if let Some(win) = app.get_webview_window("settings") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+            // 台球窗口同设置窗口：关闭按钮改为隐藏，下次打开时保留当局进度
+            if let Some(win) = app.get_webview_window("game") {
                 let w = win.clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {

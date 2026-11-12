@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>速启台球</title>
+    <!-- 首屏底色：JS/CSS 加载前先铺主题背景色，避免 WebView 默认白底闪烁（与默认深色主题一致，跟随系统浅色偏好） -->
+    <style>
+      html, body { background: #1e1e2e; }
+      @media (prefers-color-scheme: light) { html, body { background: #f4f4f8; } }
+    </style>
+  </head>
+  <body>
+    <main id="game">
+      <header class="game-bar">
+        <div class="brand">🎱 速启台球</div>
+        <label class="check" title="瞄准时显示击球路线"><input type="checkbox" id="opt-guide" />辅助线</label>
+        <label class="check" title="用启动列表里的图标做台球；图标不足时复用，多于球数时随机选取"><input type="checkbox" id="opt-icons" />启动列表图标</label>
+        <label class="check" title="双人轮流击球：进球继续，未进换人；清台后进球多者获胜"><input type="checkbox" id="opt-duo" />双人</label>
+        <span class="spacer"></span>
+        <button id="new-game" class="primary">新开局</button>
+      </header>
+      <section class="game-score" id="score"></section>
+      <section class="game-table" id="table-wrap"><canvas id="table"></canvas></section>
+      <footer class="game-tip">按住鼠标瞄准，拖得越远力度越大，松开击球 · 白球进袋会重置回开球点</footer>
+    </main>
+    <div class="banner" id="banner" hidden>
+      <div class="box">
+        <h2 id="banner-title">清台！</h2>
+        <p id="banner-detail"></p>
+        <button class="primary" id="banner-again">再来一局</button>
+      </div>
+    </div>
+    <script type="module" src="/src/game.ts"></script>
+  </body>
+</html>
