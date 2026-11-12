@@ -10,8 +10,9 @@ const PLAY_W = 1000; // 台面（库边内）宽
 const PLAY_H = 500; // 台面高
 const RAIL = 36; // 库边宽度（仅绘制）
 const BALL_R = 13;
-const POCKET_R = 26;
-const BALL_COUNT = 10; // 目标球数量：1+2+3+4 三角
+const POCKET_R = 20;
+const BALL_COUNTS = [10, 15, 21, 28]; // 可选目标球数量（三角行数 4/5/6/7）
+const DEFAULT_BALL_COUNT = 15;
 const MAX_DRAG = 260; // 满力度所需的拖拽距离
 const MAX_SPEED = 1500; // 满力度出杆速度 px/s
 const DRAG = 0.35; // 速度比例衰减 /s
@@ -23,8 +24,8 @@ const REST_BALL = 0.96; // 球间弹性
 const LOGIC_W = PLAY_W + RAIL * 2;
 const LOGIC_H = PLAY_H + RAIL * 2;
 
-// 默认球色（无图标时的台球配色）
-const BALL_COLORS = ["#f6c344", "#2f6fd0", "#e0492f", "#7b4fc0", "#ef7d1a", "#2e9e5b", "#8e2f38", "#2a2c38", "#d0729b", "#2fb6b6"];
+// 默认球色（无图标时的台球配色，超出后循环使用）
+const BALL_COLORS = ["#f6c344", "#2f6fd0", "#e0492f", "#7b4fc0", "#ef7d1a", "#2e9e5b", "#8e2f38", "#2a2c38", "#d0729b", "#2fb6b6", "#c94f7c", "#5b8def", "#9b59d0", "#e0a030", "#3fbf8f", "#b8b42f"];
 
 // 袋口：四角 + 上下中袋（台面坐标）
 const POCKETS: Array<[number, number]> = [
@@ -42,15 +43,20 @@ interface Ball {
   icon: HTMLImageElement | null;
 }
 
-interface GameOptions { guide: boolean; icons: boolean; duo: boolean }
+interface GameOptions { guide: boolean; icons: boolean; duo: boolean; count: number }
 
 // ---------- 选项持久化（本窗口 localStorage） ----------
 const OPT_KEY = "suqi-game-options";
 function loadOptions(): GameOptions {
   try {
     const raw = JSON.parse(localStorage.getItem(OPT_KEY) ?? "{}");
-    return { guide: raw.guide !== false, icons: !!raw.icons, duo: !!raw.duo };
-  } catch { return { guide: true, icons: false, duo: false }; }
+    return {
+      guide: raw.guide !== false,
+      icons: !!raw.icons,
+      duo: !!raw.duo,
+      count: BALL_COUNTS.includes(raw.count) ? raw.count : DEFAULT_BALL_COUNT,
+    };
+  } catch { return { guide: true, icons: false, duo: false, count: DEFAULT_BALL_COUNT }; }
 }
 function saveOptions() { localStorage.setItem(OPT_KEY, JSON.stringify(opts)); }
 const opts = loadOptions();
@@ -117,8 +123,8 @@ function newRack() {
   banner.hidden = true;
   // 白球在左侧开球点
   balls.push({ x: PLAY_W * 0.25, y: PLAY_H / 2, vx: 0, vy: 0, alive: true, cue: true, num: 0, color: "#f5f5f0", icon: null });
-  // 目标球三角：顶点朝左，1+2+3+4
-  const order = [...Array(BALL_COUNT).keys()];
+  // 目标球三角：顶点朝左，按球数自动排 1+2+…+n 行
+  const order = [...Array(opts.count).keys()];
   for (let i = order.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [order[i], order[j]] = [order[j], order[i]];
@@ -127,8 +133,8 @@ function newRack() {
   const apexX = PLAY_W * 0.68;
   const apexY = PLAY_H / 2;
   let index = 0;
-  for (let row = 0; row < 4 && index < BALL_COUNT; row++) {
-    for (let col = 0; col <= row && index < BALL_COUNT; col++) {
+  for (let row = 0; index < opts.count; row++) {
+    for (let col = 0; col <= row && index < opts.count; col++) {
       const num = order[index++] + 1;
       balls.push({
         x: apexX + row * gap * 0.866,
@@ -174,15 +180,14 @@ function pot(ball: Ball) {
 }
 
 function step(dt: number) {
-  const moving = balls.filter((b) => b.alive && (b.vx !== 0 || b.vy !== 0));
-  if (moving.length === 0) return;
-  const maxV = Math.max(...moving.map((b) => Math.hypot(b.vx, b.vy)));
+  if (allStopped()) return;
+  const maxV = Math.max(...balls.filter((b) => b.alive).map((b) => Math.hypot(b.vx, b.vy)), 0);
   // 高速时拆子步，避免穿球 / 穿库
   const n = Math.min(10, Math.max(1, Math.ceil((maxV * dt) / (BALL_R * 0.5))));
   const h = dt / n;
   for (let s = 0; s < n; s++) {
-    for (const ball of moving) {
-      if (!ball.alive) continue;
+    for (const ball of balls) {
+      if (!ball.alive || (ball.vx === 0 && ball.vy === 0)) continue;
       ball.x += ball.vx * h;
       ball.y += ball.vy * h;
       // 进袋判定：袋口附近不再反弹，让球落入
@@ -204,13 +209,12 @@ function step(dt: number) {
         ball.vy *= k;
       }
     }
-    // 球间碰撞（等质量弹性）
-    for (let i = 0; i < moving.length; i++) {
-      const a = moving[i];
-      if (!a.alive) continue;
-      for (let j = i + 1; j < moving.length; j++) {
-        const b = moving[j];
-        if (!b.alive) continue;
+    // 球间碰撞（等质量弹性）：全体存活球两两检测，静止的球也会被撞动
+    const alive = balls.filter((b) => b.alive);
+    for (let i = 0; i < alive.length; i++) {
+      const a = alive[i];
+      for (let j = i + 1; j < alive.length; j++) {
+        const b = alive[j];
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const dist = Math.hypot(dx, dy);
@@ -235,7 +239,7 @@ function step(dt: number) {
   }
   // 全场静止的瞬间结算这一杆
   if (allStopped()) {
-    moving.forEach((b) => { b.vx = 0; b.vy = 0; });
+    balls.forEach((b) => { b.vx = 0; b.vy = 0; });
     if (wasMoving) { wasMoving = false; resolveTurn(); }
   } else {
     wasMoving = true;
@@ -269,7 +273,7 @@ function endGame() {
     }
   } else {
     bannerTitle.textContent = "全部清台！";
-    bannerDetail.textContent = `${BALL_COUNT} 个球 · 共 ${shotCount} 杆`;
+    bannerDetail.textContent = `${balls.length - 1} 个球 · 共 ${shotCount} 杆`;
   }
   banner.hidden = false;
 }
@@ -282,7 +286,7 @@ function updateHud() {
       `<span class="${current === 1 && !gameOver ? "turn" : ""}">玩家 2：<b>${scores[1]}</b></span>` +
       `<span>第 ${shotCount + (gameOver ? 0 : 1)} 杆</span>`;
   } else {
-    scoreEl.innerHTML = `<span>已进 <b>${potted}</b> / ${BALL_COUNT}</span><span>第 ${shotCount + (gameOver ? 0 : 1)} 杆</span>`;
+    scoreEl.innerHTML = `<span>已进 <b>${potted}</b> / ${balls.length - 1}</span><span>第 ${shotCount + (gameOver ? 0 : 1)} 杆</span>`;
   }
 }
 
@@ -422,14 +426,14 @@ function drawGuide(dirX: number, dirY: number) {
   ctx.restore();
 }
 
-/** 球杆：瞄准时画在白球后方，拖拽越远回拉越多 */
-function drawCueStick(dirX: number, dirY: number, power: number) {
+/** 球杆：画在白球朝向光标的一侧（拉杆手位），杆头靠近白球，拖拽越远回拉越多 */
+function drawCueStick(backX: number, backY: number, power: number) {
   const cue = cueBall();
   const pull = 14 + power * 90;
-  const sx = cue.x - dirX * (BALL_R + pull);
-  const sy = cue.y - dirY * (BALL_R + pull);
-  const ex = cue.x - dirX * (BALL_R + pull + 260);
-  const ey = cue.y - dirY * (BALL_R + pull + 260);
+  const sx = cue.x + backX * (BALL_R + pull);
+  const sy = cue.y + backY * (BALL_R + pull);
+  const ex = cue.x + backX * (BALL_R + pull + 260);
+  const ey = cue.y + backY * (BALL_R + pull + 260);
   ctx.save();
   ctx.lineCap = "round";
   ctx.strokeStyle = "#c89b6a";
@@ -437,12 +441,12 @@ function drawCueStick(dirX: number, dirY: number, power: number) {
   ctx.beginPath();
   ctx.moveTo(sx, sy);
   ctx.lineTo(ex, ey);
-  ctx.stroke();
+  // 杆头（皮头）：贴白球的一端
   ctx.strokeStyle = "#89b4fa";
   ctx.lineWidth = 5;
   ctx.beginPath();
   ctx.moveTo(sx, sy);
-  ctx.lineTo(sx - dirX * 10, sy - dirY * 10);
+  ctx.lineTo(sx + backX * 10, sy + backY * 10);
   ctx.stroke();
   ctx.restore();
 }
@@ -489,11 +493,12 @@ function draw() {
     const dy = aimY - cue.y;
     const len = Math.hypot(dx, dy);
     if (len > 2) {
-      const dirX = dx / len;
-      const dirY = dy / len;
+      // 拉杆式瞄准：光标在白球后方（球杆头部贴着光标一侧），球朝远离光标的方向击出
+      const backX = dx / len;
+      const backY = dy / len;
       const power = Math.min(1, len / MAX_DRAG);
-      if (opts.guide) drawGuide(dirX, dirY);
-      drawCueStick(dirX, dirY, power);
+      if (opts.guide) drawGuide(-backX, -backY);
+      drawCueStick(backX, backY, power);
     }
   }
   for (const ball of balls) if (ball.alive) drawBall(ball);
@@ -561,8 +566,9 @@ window.addEventListener("mouseup", (event) => {
   const len = Math.hypot(dx, dy);
   if (len < 8) return; // 视为误触
   const power = Math.min(1, len / MAX_DRAG);
-  cue.vx = (dx / len) * power * MAX_SPEED;
-  cue.vy = (dy / len) * power * MAX_SPEED;
+  // 击球方向 = 白球指向远离光标的一侧
+  cue.vx = (-dx / len) * power * MAX_SPEED;
+  cue.vy = (-dy / len) * power * MAX_SPEED;
   shotCount++;
   wasMoving = true;
   updateHud();
@@ -574,9 +580,11 @@ canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 const optGuide = document.querySelector<HTMLInputElement>("#opt-guide")!;
 const optIcons = document.querySelector<HTMLInputElement>("#opt-icons")!;
 const optDuo = document.querySelector<HTMLInputElement>("#opt-duo")!;
+const optCount = document.querySelector<HTMLSelectElement>("#opt-count")!;
 optGuide.checked = opts.guide;
 optIcons.checked = opts.icons;
 optDuo.checked = opts.duo;
+optCount.value = String(opts.count);
 
 optGuide.onchange = () => { opts.guide = optGuide.checked; saveOptions(); };
 optIcons.onchange = () => {
@@ -585,6 +593,12 @@ optIcons.onchange = () => {
   void refreshIconsThenRack();
 };
 optDuo.onchange = () => { opts.duo = optDuo.checked; saveOptions(); newRack(); };
+optCount.onchange = () => {
+  const count = Number(optCount.value);
+  opts.count = BALL_COUNTS.includes(count) ? count : DEFAULT_BALL_COUNT;
+  saveOptions();
+  newRack();
+};
 document.querySelector<HTMLButtonElement>("#new-game")!.onclick = () => void refreshIconsThenRack();
 document.querySelector<HTMLButtonElement>("#banner-again")!.onclick = () => newRack();
 
