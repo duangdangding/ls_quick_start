@@ -24,6 +24,11 @@ const ENCRYPTED_GROUP: &str = "__encrypted__";
 const DB_FILE: &str = "suqi.db";
 const POINTER_FILE: &str = "suqi-data-dir.txt";
 
+/// 主窗口前端就绪标记：前端首次拉取数据（list_data）时置位。
+/// 开机自启时系统组件（WebView2 等）可能尚未就绪，页面加载失败会停在 WebView2 错误页且刷新无效，
+/// 启动看门狗依据该标记判断页面是否真的加载成功。
+static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
+
 /// 默认全局快捷键：Windows 用 Win+`；macOS 的 Cmd+` 与系统「切换窗口」冲突，改用 Alt+Space
 #[cfg(target_os = "windows")]
 const DEFAULT_HOTKEY: &str = "Win+`";
@@ -692,6 +697,7 @@ fn persist(data: &AppData, store: &Store) -> Result<(), String> {
 
 #[tauri::command]
 fn list_data(data: State<'_, AppData>, include_encrypted: bool) -> ListResult {
+    MAIN_FRONTEND_READY.store(true, Ordering::SeqCst);
     let store = data.store.lock().unwrap();
     let unlocked = data.unlocked.load(Ordering::SeqCst);
     ListResult {
@@ -2463,6 +2469,13 @@ pub fn run() {
 
     migrate_json_if_needed();
 
+    // 开机自启（自启项带 --autostart 参数）时，系统组件（WebView2、DWM 等）可能尚未就绪，
+    // 过早创建窗口会让页面导航失败、停在 WebView2 错误页且刷新无效。先等待几秒再初始化。
+    let boot_launch = std::env::args().any(|arg| arg == "--autostart");
+    if boot_launch {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
     let conn = open_db().expect("无法打开数据库");
     let store = load_store_from_db(&conn).expect("无法加载数据");
     let config = load_config();
@@ -2496,7 +2509,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![])))
+        // 自启参数带 --autostart 标记：开机自启时进程先等待几秒再创建窗口，避免系统组件未就绪导致页面加载失败
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec!["--autostart"])))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, _shortcut, event| {
@@ -2575,6 +2589,31 @@ pub fn run() {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = w.hide();
+                    }
+                });
+            }
+            // 启动看门狗：页面若因开机时系统组件未就绪而加载失败（停在 WebView2 错误页，前端永远跑不起来，
+            // 手动刷新也无效），检测到前端未就绪就重新导航；多次重载仍失败且为开机自启启动时，重启进程自救一次。
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    // 与 tauri.conf.json 的 devUrl 保持一致
+                    #[cfg(dev)]
+                    let app_url = "http://localhost:1420/";
+                    #[cfg(not(dev))]
+                    let app_url = "http://tauri.localhost/";
+                    let mut attempts = 0u8;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(if attempts == 0 { 8 } else { 10 }));
+                        if MAIN_FRONTEND_READY.load(Ordering::SeqCst) { break; }
+                        attempts += 1;
+                        if attempts > 3 {
+                            if boot_launch { handle.restart(); }
+                            break;
+                        }
+                        if let Some(win) = handle.get_webview_window("main") {
+                            if let Ok(url) = app_url.parse() { let _ = win.navigate(url); }
+                        }
                     }
                 });
             }
