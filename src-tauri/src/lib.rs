@@ -2685,29 +2685,24 @@ fn reveal_path(path: String) -> Result<(), String> {
     if !p.exists() {
         return Err("文件不存在（可能已被移动或删除）".to_string());
     }
-    let is_dir = p.is_dir();
-    #[cfg(target_family = "windows")]
-    {
-        let mut cmd = Command::new("explorer");
-        if is_dir {
-            cmd.arg(&path);
-        } else {
-            cmd.arg(format!("/select,{path}"));
+    if p.is_dir() {
+        // 目录：直接打开该目录
+        #[cfg(target_family = "windows")]
+        {
+            Command::new("explorer").arg(&path).spawn().map_err(|e| e.to_string())?;
+            return Ok(());
         }
-        cmd.spawn().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = Command::new("open");
-        if !is_dir {
-            cmd.arg("-R");
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+            return Ok(());
         }
-        cmd.arg(&path).spawn().map_err(|e| e.to_string())?;
-        return Ok(());
+        #[allow(unreachable_code)]
+        return Err("当前平台不支持".to_string());
     }
-    #[allow(unreachable_code)]
-    Err("当前平台不支持".to_string())
+    // 文件：走 opener 插件（Windows 内部用 SHOpenFolderAndSelectItems 选中文件）。
+    // 之前的 explorer /select,路径 写法对含空格的路径解析失败，会退回打开「文档」
+    tauri_plugin_opener::reveal_item_in_dir(&p).map_err(|e| e.to_string())
 }
 
 // ---------- 窗口控制 ----------
@@ -2868,6 +2863,34 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
     }
 }
 
+/// WebView2 已知问题：窗口最小化一段时间再恢复时，渲染器偶尔不恢复绘制（整窗白屏）。
+/// 跟踪最小化状态，从最小化恢复（尺寸由 0 变为非 0）时做 1px 尺寸抖动，强制 WebView2 控制器重排重绘。
+#[cfg(target_os = "windows")]
+fn attach_minimize_repaint_fix(win: &tauri::WebviewWindow) {
+    let minimized = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = minimized.clone();
+    let w = win.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::Resized(size) = event {
+            if size.width == 0 || size.height == 0 {
+                flag.store(true, Ordering::SeqCst);
+            } else if flag.swap(false, Ordering::SeqCst) {
+                if let Ok(cur) = w.inner_size() {
+                    let _ = w.set_size(tauri::PhysicalSize::new(cur.width + 1, cur.height));
+                    let w2 = w.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                        let _ = w2.set_size(cur);
+                    });
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_minimize_repaint_fix(_win: &tauri::WebviewWindow) {}
+
 // ---------- 入口 ----------
 
 pub fn run() {
@@ -2999,6 +3022,7 @@ pub fn run() {
                         hide_panel_internal(w.app_handle());
                     }
                 });
+                attach_minimize_repaint_fix(&win);
             }
             if let Some(win) = app.get_webview_window("settings") {
                 let w = win.clone();
@@ -3008,6 +3032,7 @@ pub fn run() {
                         let _ = w.hide();
                     }
                 });
+                attach_minimize_repaint_fix(&win);
             }
             // 台球窗口同设置窗口：关闭按钮改为隐藏，下次打开时保留当局进度
             if let Some(win) = app.get_webview_window("game") {
@@ -3018,6 +3043,7 @@ pub fn run() {
                         let _ = w.hide();
                     }
                 });
+                attach_minimize_repaint_fix(&win);
             }
             // 启动看门狗：页面若因开机时系统组件未就绪而加载失败（停在 WebView2 错误页，前端永远跑不起来，
             // 手动刷新也无效），检测到前端未就绪就重新导航；多次重载仍失败且为开机自启启动时，重启进程自救一次。
