@@ -69,6 +69,17 @@
           </div>
           <small id="config-dir-hint">默认在程序目录下，可自定义到其他位置</small>
         </div>
+        <div class="field">
+          <label>网络代理</label>
+          <select id="proxy-mode">
+            <option value="system">跟随系统</option>
+            <option value="custom">自定义</option>
+          </select>
+          <div class="row" id="proxy-url-row" hidden>
+            <input type="text" id="proxy-url" placeholder="http://127.0.0.1:7897" style="flex:1" />
+          </div>
+          <small>自定义代理优先于系统代理；检查更新、获取网站信息等网络请求都会使用</small>
+        </div>
       </section>
 
       <section class="tab-page" id="tab-appearance">

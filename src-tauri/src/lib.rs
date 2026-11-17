@@ -102,6 +102,12 @@ struct AppConfig {
     /// 重新打开面板时是否清空搜索框：默认清空，回到全部条目重新开始
     #[serde(default = "default_clear_search_on_reopen")]
     clear_search_on_reopen: bool,
+    /// 代理模式："system" 跟随系统（环境变量 / Windows 系统代理） | "custom" 自定义代理
+    #[serde(default = "default_proxy_mode")]
+    proxy_mode: String,
+    /// 自定义代理地址（proxy_mode 为 "custom" 时生效），如 http://127.0.0.1:7897
+    #[serde(default)]
+    proxy_url: String,
     config_dir: Option<String>,
     db_dir: Option<String>,
     background: BackgroundConfig,
@@ -121,6 +127,9 @@ fn default_run_target_enabled() -> bool { true }
 
 /// 重新打开面板清空搜索框：默认开启
 fn default_clear_search_on_reopen() -> bool { true }
+
+/// 代理模式默认值："system" 跟随系统（环境变量 / Windows 系统代理）
+fn default_proxy_mode() -> String { "system".into() }
 
 /// 面板背景图设置：选区 / 旋转在设置页用 canvas 烘焙进缓存图（suqi-bg.png），
 /// 运行时主面板只按 mode + opacity + scale 用 CSS 应用缓存图
@@ -179,6 +188,8 @@ impl Default for AppConfig {
             hotkey_unfocused_behavior: "front".into(),
             run_target_enabled: true,
             clear_search_on_reopen: true,
+            proxy_mode: "system".into(),
+            proxy_url: String::new(),
             config_dir: None,
             db_dir: None,
             background: BackgroundConfig::default(),
@@ -1771,6 +1782,7 @@ fn get_config(state: State<'_, ConfigState>) -> AppConfig { state.config.lock().
 fn save_config(state: State<'_, ConfigState>, app: tauri::AppHandle, config: AppConfig) -> Result<(), String> {
     *state.config.lock().unwrap() = config.clone();
     save_config_file(&config)?;
+    apply_proxy_env(&config); // 代理设置变更即时生效（影响 updater 插件等读取进程环境变量的网络请求）
     register_hotkey(&app, &config.hotkey)?;
     apply_autostart(&app, config.autostart);
     if let Some(win) = app.get_webview_window("main") { let _ = win.set_always_on_top(config.always_on_top); }
@@ -2041,6 +2053,354 @@ fn clear_background_image(state: State<'_, ConfigState>, app: tauri::AppHandle) 
     Ok(())
 }
 
+// ---------- 网址信息获取 ----------
+// 添加 / 编辑网址启动项时，抓取网页标题、描述、图标回填表单。
+// 抓取走与更新一致的代理（自定义优先，系统回退）；单字段失败不报错，整体失败才返回 Err。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UrlMeta {
+    title: Option<String>,
+    description: Option<String>,
+    icon_path: Option<String>,
+}
+
+/// 抓取网址的标题 / 描述 / 图标
+#[tauri::command]
+async fn fetch_url_meta(url: String) -> Result<UrlMeta, String> {
+    let url = normalize_url(&url)?;
+    tauri::async_runtime::spawn_blocking(move || fetch_url_meta_inner(&url))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 网页抓取专用 UA（部分站点对非浏览器 UA 直接拒绝）
+const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+
+fn fetch_url_meta_inner(url: &str) -> Result<UrlMeta, String> {
+    // 抓取是短请求，加整体超时避免慢站点卡住界面；更新下载通道不加（大文件慢速会被掐断）
+    let agent = proxy_agent_builder()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let resp = agent
+        .get(url)
+        .set("User-Agent", WEB_UA)
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .call()
+        .map_err(|e| format!("请求失败：{e}"))?;
+    let content_type = resp.header("content-type").map(|v| v.to_string());
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(2 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let html = decode_web_html(&bytes, content_type.as_deref());
+    // <title> 是浏览器标签页显示的站点名，最权威；og:title 是社交分享卡片标题，
+    // 部分站点会放动态内容（如 Bing 首页的每日图片标题），只作回退
+    let title = extract_title(&html)
+        .or_else(|| extract_meta_content(&html, "property", "og:title"))
+        .and_then(|t| sanitize_fetched_name(&t));
+    let description = extract_meta_content(&html, "name", "description")
+        .or_else(|| extract_meta_content(&html, "property", "og:description"))
+        .map(|d| truncate_chars(&d, 200));
+    let icon_path = extract_icon_href(&html)
+        .and_then(|href| resolve_url(url, &href))
+        .or_else(|| resolve_url(url, "/favicon.ico"))
+        .and_then(|icon_url| download_web_icon(&icon_url, url));
+    Ok(UrlMeta { title, description, icon_path })
+}
+
+/// 解码网页 HTML：优先按 HTTP content-type 声明的 charset，其次嗅探页面头部的
+/// <meta charset> 声明，默认 UTF-8。GBK 编码站点（如 Discuz 论坛）按 UTF-8 解会
+/// 全是乱码，必须按声明解码
+fn decode_web_html(bytes: &[u8], content_type: Option<&str>) -> String {
+    let label = content_type.and_then(charset_from_content_type).or_else(|| sniff_meta_charset(bytes));
+    if let Some(encoding) = label.as_deref().and_then(|v| encoding_rs::Encoding::for_label(v.as_bytes())) {
+        let (text, _, _) = encoding.decode(bytes);
+        return text.into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// 从 content-type（如 "text/html; charset=gbk"）提取 charset 标签
+fn charset_from_content_type(value: &str) -> Option<String> {
+    for part in value.split(';') {
+        let part = part.trim();
+        if part.len() > 8 && part[..8].eq_ignore_ascii_case("charset=") {
+            let label = part[8..].trim().trim_matches(|c| c == '"' || c == '\'');
+            if !label.is_empty() { return Some(label.to_string()); }
+        }
+    }
+    None
+}
+
+/// 嗅探 HTML 头部的 charset 声明（<meta charset="gbk"> 或 content-type meta 里的
+/// charset=...），只看前 4KB，与浏览器行为一致
+fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(4096)];
+    let start = find_ci(head, b"charset", 0)?;
+    let mut i = start + 7;
+    while i < head.len() && (head[i].is_ascii_whitespace() || head[i] == b'=') { i += 1; }
+    if i >= head.len() { return None; }
+    let (quote, value_start) = if head[i] == b'"' || head[i] == b'\'' { (head[i], i + 1) } else { (b' ', i) };
+    let mut j = value_start;
+    while j < head.len() && head[j] != quote && !head[j].is_ascii_whitespace() && head[j] != b'>' && head[j] != b';' { j += 1; }
+    let label = std::str::from_utf8(&head[value_start..j]).ok()?.trim();
+    if label.is_empty() { None } else { Some(label.to_string()) }
+}
+
+/// 字节级大小写不敏感查找（ASCII 折叠），返回匹配起点。标签定界符都是 ASCII，
+/// 返回的偏移落在 ASCII 边界上，用于切片原字符串是安全的
+fn find_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() { return None; }
+    let last = haystack.len() - needle.len();
+    let mut i = from;
+    while i <= last {
+        if haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) { return Some(i); }
+        i += 1;
+    }
+    None
+}
+
+/// 提取 <title> 标签文本（实体已解码）
+fn extract_title(html: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let start = find_ci(bytes, b"<title", 0)?;
+    let open_end = find_ci(bytes, b">", start)? + 1;
+    let end = find_ci(bytes, b"</title", open_end)?;
+    let raw = html.get(open_end..end)?.trim();
+    if raw.is_empty() { None } else { Some(decode_entities(raw)) }
+}
+
+/// 解析 HTML 标签属性：键统一小写，值支持双引号 / 单引号 / 无引号，实体已解码
+fn parse_attrs(tag: &str) -> Vec<(String, String)> {
+    let bytes = tag.as_bytes();
+    let mut attrs = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') { i += 1; }
+        let key_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' && bytes[i] != b'/' { i += 1; }
+        if i == key_start { break; }
+        let key = tag[key_start..i].to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            attrs.push((key, String::new()));
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+        if i >= bytes.len() {
+            attrs.push((key, String::new()));
+            break;
+        }
+        let value = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            let value_start = i + 1;
+            let mut j = value_start;
+            while j < bytes.len() && bytes[j] != quote { j += 1; }
+            let v = tag[value_start..j].to_string();
+            i = (j + 1).min(bytes.len());
+            v
+        } else {
+            let value_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() { i += 1; }
+            tag[value_start..i].to_string()
+        };
+        attrs.push((key, decode_entities(&value)));
+    }
+    attrs
+}
+
+/// 在 <meta> 标签中找 property / name 等于指定值（大小写不敏感）的 content
+fn extract_meta_content(html: &str, key: &str, name: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let mut from = 0;
+    while let Some(start) = find_ci(bytes, b"<meta", from) {
+        let end = find_ci(bytes, b">", start)? + 1;
+        let attrs = parse_attrs(html.get(start..end)?);
+        let matched = attrs.iter().any(|(k, v)| k == key && v.eq_ignore_ascii_case(name));
+        if matched {
+            if let Some((_, content)) = attrs.iter().find(|(k, _)| k == "content") {
+                let content = collapse_whitespace(content);
+                if !content.is_empty() { return Some(content); }
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+/// 从 <link> 标签找网站图标：apple-touch-icon 优先，其次普通 icon；跳过 mask-icon（SVG 单色蒙版不适合做列表图标）
+fn extract_icon_href(html: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let mut from = 0;
+    let mut fallback: Option<String> = None;
+    while let Some(start) = find_ci(bytes, b"<link", from) {
+        let end = find_ci(bytes, b">", start)? + 1;
+        let attrs = parse_attrs(html.get(start..end)?);
+        let rel = attrs.iter().find(|(k, _)| k == "rel").map(|(_, v)| v.to_ascii_lowercase()).unwrap_or_default();
+        let href = attrs.iter().find(|(k, _)| k == "href").map(|(_, v)| v.clone());
+        if let Some(href) = href.filter(|h| !h.is_empty()) {
+            if rel.contains("apple-touch-icon") { return Some(href); }
+            if rel.contains("icon") && !rel.contains("mask-icon") && fallback.is_none() { fallback = Some(href); }
+        }
+        from = end;
+    }
+    fallback
+}
+
+/// 把 href 解析为绝对 URL：绝对 URL 原样；// 开头补协议；/ 开头拼站点根；其余按页面所在目录解析
+fn resolve_url(base: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with("data:") || href.starts_with("javascript:") { return None; }
+    if href.starts_with("http://") || href.starts_with("https://") { return Some(href.to_string()); }
+    let (scheme, rest) = base.split_once("://")?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    if let Some(path) = href.strip_prefix("//") { return Some(format!("{scheme}://{path}")); }
+    if href.starts_with('/') { return Some(format!("{scheme}://{host}{href}")); }
+    match rest.rfind('/') {
+        Some(pos) => Some(format!("{scheme}://{}{href}", &rest[..=pos])),
+        None => Some(format!("{scheme}://{host}/{href}")),
+    }
+}
+
+/// 解码常见 HTML 实体：命名实体 + &#NNN; / &#xNN; 数字实体
+fn decode_entities(value: &str) -> String {
+    if !value.contains('&') { return value.to_string(); }
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.find('&') {
+        result.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        match after.find(';') {
+            Some(end) if end <= 12 => {
+                let entity = &after[1..end];
+                let decoded = match entity {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some(' '),
+                    _ => decode_numeric_entity(entity),
+                };
+                match decoded {
+                    Some(c) => { result.push(c); rest = &after[end + 1..]; }
+                    None => { result.push('&'); rest = &after[1..]; }
+                }
+            }
+            _ => { result.push('&'); rest = &after[1..]; }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+fn decode_numeric_entity(entity: &str) -> Option<char> {
+    let digits = entity.strip_prefix('#')?;
+    let code = match digits.strip_prefix('x').or_else(|| digits.strip_prefix('X')) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
+}
+
+/// 抓回的标题按名称白名单（同 valid_name）清洗：非法字符替换为空格、收敛空白、截 50 字，
+/// 否则含 / ：等字符的标题会在保存时被 check_name 拒绝
+fn sanitize_fetched_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c) || matches!(c, ' ' | '-' | '_' | '－' | '—' | '(' | ')' | '（' | '）' | '.' | '·') { c } else { ' ' }
+        })
+        .collect();
+    let collapsed = collapse_whitespace(&cleaned);
+    let truncated = truncate_chars(&collapsed, 50);
+    if truncated.is_empty() { None } else { Some(truncated) }
+}
+
+fn collapse_whitespace(value: &str) -> String { value.split_whitespace().collect::<Vec<_>>().join(" ") }
+
+fn truncate_chars(value: &str, max: usize) -> String { value.chars().take(max).collect() }
+
+/// 下载网站图标到 favicons 缓存目录（按页面 URL 哈希命名），ICO 转成 PNG 后返回路径
+fn download_web_icon(icon_url: &str, page_url: &str) -> Option<String> {
+    let agent = proxy_agent_builder()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = agent.get(icon_url).set("User-Agent", WEB_UA).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader().take(2 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() { return None; }
+    let ext = detect_web_icon_kind(&bytes, icon_url)?;
+    let dir = default_data_dir().join("favicons");
+    fs::create_dir_all(&dir).ok()?;
+    let hash = hex::encode(Sha256::digest(page_url.as_bytes()));
+    let file = dir.join(format!("{hash}.{ext}"));
+    fs::write(&file, &bytes).ok()?;
+    if ext == "ico" {
+        // ICO 直接给 <img> 渲染兼容性差，转成 PNG；转不了就不要图标
+        let png = file.with_extension("png");
+        if web_ico_to_png(&file, &png) {
+            let _ = fs::remove_file(&file);
+            return Some(display_path(png.display().to_string()));
+        }
+        let _ = fs::remove_file(&file);
+        return None;
+    }
+    Some(display_path(file.display().to_string()))
+}
+
+/// 按魔数嗅探图标格式（不认再按 URL 扩展名），返回文件扩展名
+fn detect_web_icon_kind(bytes: &[u8], url: &str) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Some("png"); }
+    if bytes.starts_with(b"\x00\x00\x01\x00") { return Some("ico"); }
+    if bytes.starts_with(b"\xff\xd8\xff") { return Some("jpg"); }
+    if bytes.starts_with(b"GIF8") { return Some("gif"); }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" { return Some("webp"); }
+    // SVG 是文本：去掉 BOM / 空白后看根标签
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    if head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")) { return Some("svg"); }
+    let ext = url.split(['?', '#']).next()?.rsplit('.').next()?;
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("png"),
+        "ico" => Some("ico"),
+        "jpg" | "jpeg" => Some("jpg"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "svg" => Some("svg"),
+        _ => None,
+    }
+}
+
+/// Windows：用 PowerShell System.Drawing 把 ICO 转成 PNG
+#[cfg(windows)]
+fn web_ico_to_png(source: &Path, output: &Path) -> bool {
+    let script = format!(
+        "Add-Type -AssemblyName System.Drawing; try {{ $icon = New-Object System.Drawing.Icon({}); $bmp = $icon.ToBitmap(); $bmp.Save({}, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose(); $icon.Dispose() }} catch {{}}",
+        ps_quote(source.display().to_string()),
+        ps_quote(output.display().to_string())
+    );
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", &script]);
+    hide_console(&mut command);
+    let _ = command.output();
+    output.exists()
+}
+
+/// macOS：sips 可直接把 ICO 转成 PNG
+#[cfg(target_os = "macos")]
+fn web_ico_to_png(source: &Path, output: &Path) -> bool {
+    icns_to_png(source, output)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn web_ico_to_png(_source: &Path, _output: &Path) -> bool { false }
+
 // ---------- 应用内更新 ----------
 // NSIS 安装版：把安装包流式下载到系统「下载」目录，校验 SHA-256 后由用户确认运行安装程序
 // （NSIS 会装回注册表记录的原目录）。
@@ -2113,42 +2473,75 @@ fn windows_system_proxy() -> Option<String> {
     server.filter(|s| !s.is_empty()).map(|s| format!("http://{s}"))
 }
 
-/// 把系统代理写入进程环境变量（用户已手动配置代理环境变量时不覆盖）：
-/// updater 插件（reqwest）与 ureq 都会读取 HTTPS_PROXY / HTTP_PROXY，
-/// 统一在启动时显式设置——系统开了代理就走代理，没开就是直连
-fn apply_system_proxy_env() {
-    if std::env::var("HTTPS_PROXY").is_ok() || std::env::var("https_proxy").is_ok()
-        || std::env::var("HTTP_PROXY").is_ok() || std::env::var("http_proxy").is_ok()
-    {
-        return;
+/// 归一化代理地址：允许只填 host:port（自动补 http:// 前缀）；空串返回 None
+fn normalize_proxy_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() { return None; }
+    Some(if raw.contains("://") { raw.to_string() } else { format!("http://{raw}") })
+}
+
+/// 进程环境变量里已配置的代理（用户手动设置，或启动时按系统代理注入的）
+fn env_proxy() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            if let Some(url) = normalize_proxy_url(&value) { return Some(url); }
+        }
     }
-    #[cfg(windows)]
-    if let Some(url) = windows_system_proxy() {
+    None
+}
+
+/// 自定义代理（设置页「网络代理」选自定义且填了地址时生效）
+fn custom_proxy(config: &AppConfig) -> Option<String> {
+    if config.proxy_mode == "custom" { normalize_proxy_url(&config.proxy_url) } else { None }
+}
+
+/// 解析当前生效的代理：自定义代理优先，其次环境变量，最后 Windows 系统代理；都没有则 None（直连）
+fn resolve_proxy(config: &AppConfig) -> Option<String> {
+    custom_proxy(config).or_else(env_proxy).or_else(|| {
+        #[cfg(windows)]
+        { windows_system_proxy() }
+        #[cfg(not(windows))]
+        { None }
+    })
+}
+
+/// 环境变量代理是否由本进程注入：切回「跟随系统」时要清掉之前注入的自定义代理，
+/// 避免它继续被当作环境变量代理生效；用户在进程外手动配置的变量不动
+static PROXY_ENV_INJECTED: AtomicBool = AtomicBool::new(false);
+
+/// 把生效代理写入进程环境变量：updater 插件（reqwest）与 ureq 都会读取 HTTPS_PROXY / HTTP_PROXY，
+/// 统一在启动和保存配置时注入——自定义代理优先；跟随系统时系统开了代理就走代理，没开就是直连
+fn apply_proxy_env(config: &AppConfig) {
+    if let Some(url) = custom_proxy(config) {
         std::env::set_var("HTTPS_PROXY", &url);
         std::env::set_var("HTTP_PROXY", &url);
+        PROXY_ENV_INJECTED.store(true, Ordering::SeqCst);
+        return;
+    }
+    if PROXY_ENV_INJECTED.swap(false, Ordering::SeqCst) {
+        std::env::remove_var("HTTPS_PROXY");
+        std::env::remove_var("HTTP_PROXY");
+    }
+    if env_proxy().is_none() {
+        #[cfg(windows)]
+        if let Some(url) = windows_system_proxy() {
+            std::env::set_var("HTTPS_PROXY", &url);
+            std::env::set_var("HTTP_PROXY", &url);
+        }
     }
 }
 
-/// 构建 ureq Agent：优先尝试环境变量 / 系统代理，代理不可用时回退直连
-fn ureq_agent() -> ureq::Agent {
+/// 构建 ureq AgentBuilder 并按当前配置设置代理（自定义优先，环境变量 / 系统代理回退）
+fn proxy_agent_builder() -> ureq::AgentBuilder {
     let builder = ureq::AgentBuilder::new();
-    // 环境变量优先（含 apply_system_proxy_env 从系统代理写入的）
-    if let Ok(proxy) = std::env::var("HTTPS_PROXY")
-        .or_else(|_| std::env::var("https_proxy"))
-        .or_else(|_| std::env::var("HTTP_PROXY"))
-        .or_else(|_| std::env::var("http_proxy"))
-    {
-        if let Ok(proxy) = ureq::Proxy::new(&proxy) {
-            return builder.proxy(proxy).build();
-        }
+    match resolve_proxy(&load_config()).and_then(|url| ureq::Proxy::new(&url).ok()) {
+        Some(proxy) => builder.proxy(proxy),
+        None => builder,
     }
-    // 兜底再直接读一次系统代理（未经过 run() 初始化的场景）
-    #[cfg(windows)]
-    if let Some(proxy) = windows_system_proxy().and_then(|url| ureq::Proxy::new(&url).ok()) {
-        return builder.proxy(proxy).build();
-    }
-    builder.build()
 }
+
+/// 构建 ureq Agent：自定义代理 / 环境变量 / 系统代理，都没有则直连
+fn ureq_agent() -> ureq::Agent { proxy_agent_builder().build() }
 
 /// 带代理回退的 GET：先用代理，连接类错误时自动降级直连
 fn ureq_get_with_fallback(url: &str) -> Result<ureq::Response, Box<ureq::Error>> {
@@ -2478,7 +2871,7 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
 // ---------- 入口 ----------
 
 pub fn run() {
-    apply_system_proxy_env();
+    apply_proxy_env(&load_config());
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
@@ -2553,7 +2946,7 @@ pub fn run() {
             get_background_cache, set_background_config, clear_background_image,
             update_install_kind, portable_update_begin, portable_update_download, http_get_text,
             portable_update_verify, portable_update_apply, installer_update_path, installer_update_run, reveal_path, reveal_item,
-            open_settings_window, set_always_on_top, open_game_window, launcher_icons
+            open_settings_window, set_always_on_top, open_game_window, launcher_icons, fetch_url_meta
         ])
         .setup(move |app| {
             let show = MenuItem::with_id(app, "show", "显示/隐藏面板", true, None::<&str>)?;

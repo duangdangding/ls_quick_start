@@ -129,6 +129,14 @@ encryptUnlockSel.addEventListener("change", () => { config.encryptUnlockMode = e
 const hotkeyUnfocusedSel = $<HTMLSelectElement>("#hotkey-unfocused-behavior");
 hotkeyUnfocusedSel.addEventListener("change", () => { config.hotkeyUnfocusedBehavior = hotkeyUnfocusedSel.value; markDirty(); });
 
+// ---------- 网络代理 ----------
+const proxyModeSel = $<HTMLSelectElement>("#proxy-mode");
+const proxyUrlRow = $<HTMLDivElement>("#proxy-url-row");
+const proxyUrlInput = $<HTMLInputElement>("#proxy-url");
+function syncProxyUrlRow() { proxyUrlRow.hidden = proxyModeSel.value !== "custom"; }
+proxyModeSel.addEventListener("change", () => { config.proxyMode = proxyModeSel.value; syncProxyUrlRow(); markDirty(); });
+proxyUrlInput.addEventListener("input", () => { config.proxyUrl = proxyUrlInput.value; markDirty(); });
+
 // ---------- 外观 ----------
 const themeSel = $<HTMLSelectElement>("#theme");
 const colorInput = $<HTMLInputElement>("#highlight-color");
@@ -873,6 +881,10 @@ $("#btn-save").addEventListener("click", async () => {
 
   encryptUnlockSel.value = config.encryptUnlockMode === "always" ? "always" : "session";
   hotkeyUnfocusedSel.value = config.hotkeyUnfocusedBehavior === "hide" ? "hide" : "front";
+
+  proxyModeSel.value = config.proxyMode === "custom" ? "custom" : "system";
+  proxyUrlInput.value = config.proxyUrl || "";
+  syncProxyUrlRow();
 
   themeSel.value = config.theme;
   // 搜索高亮颜色：空 = 跟随主题强调色（勾选框勾上、取色器禁用但保留上次颜色）
