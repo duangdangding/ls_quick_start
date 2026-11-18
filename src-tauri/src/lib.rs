@@ -29,13 +29,8 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 /// 启动看门狗依据该标记判断页面是否真的加载成功。
 static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
-/// 主面板页面就绪标记：前端每次页面加载完成首次渲染后由 panel_ready 置位。
-/// Windows 上面板从隐藏恢复显示前会趁不可见整页重载，等待该标记再显示窗口（规避 WebView2 白屏）。
-static PANEL_PAGE_READY: AtomicBool = AtomicBool::new(false);
-
-/// 主面板正在「重载并等待就绪」中：热键连击时去重，避免重复重载
-#[cfg(target_os = "windows")]
-static PANEL_OPENING: AtomicBool = AtomicBool::new(false);
+// Windows 主面板显隐只同步原生窗口与 WebView2 控制器，不重载页面、不等待异步就绪，
+// 避免快速连按热键时多个导航 / 显示任务交错，或后续热键被「正在打开」标记吞掉。
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -1822,12 +1817,6 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
     })
 }
 
-/// 主面板前端每次页面加载完成首次渲染后调用：「隐藏时重载页面、就绪后再显示」流程的就绪信号
-#[tauri::command]
-fn panel_ready() {
-    PANEL_PAGE_READY.store(true, Ordering::SeqCst);
-}
-
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
@@ -1835,8 +1824,7 @@ fn show_panel(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_panel(app: tauri::AppHandle) {
-    lock_encrypted_if_needed(&app);
-    if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
+    hide_panel_internal(&app);
 }
 
 #[tauri::command]
@@ -2824,65 +2812,44 @@ fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
     }
 }
 
-fn hide_panel_internal(app: &tauri::AppHandle) {
-    lock_encrypted_if_needed(app);
-    if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
-}
-
-/// WebView2 已知问题：窗口 hide 隐藏后再 show，渲染器偶尔不恢复绘制（整窗白屏），
-/// 与最小化恢复白屏同源。显示后延迟做 1px 尺寸抖动，强制 WebView2 控制器重排重绘。
+/// 同步 WebView2 控制器的可见状态。原生窗口 hide/show 不会可靠地驱动控制器，
+/// 快速切换时可能让控制器停留在隐藏状态，表现为窗口白屏或已经显示却没有内容。
 #[cfg(target_os = "windows")]
-fn schedule_repaint_jiggle(win: &tauri::WebviewWindow) {
-    let w = win.clone();
-    std::thread::spawn(move || {
-        // 等 show 真正生效后再抖动，避免窗口尚不可见时尺寸变化被系统吞掉
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        if let Ok(cur) = w.inner_size() {
-            let _ = w.set_size(tauri::PhysicalSize::new(cur.width + 1, cur.height));
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            let _ = w.set_size(cur);
+fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
+    if let Err(error) = win.with_webview(move |webview| unsafe {
+        if let Err(error) = webview.controller().SetIsVisible(visible) {
+            eprintln!("同步 WebView2 可见状态失败：{error}");
         }
-    });
+    }) {
+        eprintln!("无法访问 WebView2 控制器：{error}");
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn schedule_repaint_jiggle(_win: &tauri::WebviewWindow) {}
+fn set_webview_visible(_win: &tauri::WebviewWindow, _visible: bool) {}
 
-/// 统一的主面板显示入口。
-/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页「预览窗口效果 / 背景」调用抢走焦点。
-/// Windows 上 WebView2 有已知问题：窗口隐藏后再显示，渲染器偶发不恢复绘制（整窗白屏），
-/// 尺寸抖动等手段不能覆盖所有场景。这里改为趁窗口仍隐藏时整页重载（用户看不到重载过程），
-/// 前端渲染就绪（panel_ready）后再显示窗口——每次打开都是全新渲染器，从根上规避白屏。
+fn hide_panel_internal(app: &tauri::AppHandle) {
+    lock_encrypted_if_needed(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+        set_webview_visible(&w, false);
+    }
+}
+
+/// 统一的主面板显示入口：不再重载页面，也没有异步「打开中」状态，
+/// 因而快速连按时每次热键都会按当前真实可见状态切换，不会被去重标记吞掉。
+/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if win.is_visible().unwrap_or(false) {
         let _ = app.emit("panel-shown", ());
         return;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = app.emit("panel-shown", ());
-        let _ = win.show(); let _ = win.set_focus();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // 热键连击去重：正在重载等待就绪时忽略重复触发
-        if PANEL_OPENING.swap(true, Ordering::SeqCst) { return; }
-        PANEL_PAGE_READY.store(false, Ordering::SeqCst);
-        if let Ok(url) = main_page_url().parse() { let _ = win.navigate(url); }
-        let handle = app.clone();
-        std::thread::spawn(move || {
-            // 等前端就绪（最多 ~2.5 秒；超时也照常显示，避免面板彻底叫不出来）
-            for _ in 0..50 {
-                if PANEL_PAGE_READY.load(Ordering::SeqCst) { break; }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            if let Some(w) = handle.get_webview_window("main") {
-                let _ = w.show(); let _ = w.set_focus();
-            }
-            PANEL_OPENING.store(false, Ordering::SeqCst);
-        });
-    }
+    let _ = app.emit("panel-shown", ());
+    // 先恢复控制器，再显示并聚焦原生窗口；顺序与 WebView2 官方建议一致。
+    set_webview_visible(&win, true);
+    let _ = win.show();
+    let _ = win.set_focus();
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
@@ -2893,11 +2860,16 @@ fn toggle_window(app: &tauri::AppHandle) {
             let behavior = app.try_state::<ConfigState>()
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
-            // 置前时也做一次重绘抖动：覆盖「面板可见但渲染卡在白屏」的场景，按热键即可恢复
-            if !focused && behavior != "hide" { let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); schedule_repaint_jiggle(&win); }
-            else { hide_panel_internal(app); }
+            if !focused && behavior != "hide" {
+                set_webview_visible(&win, true);
+                let _ = win.set_focus();
+                let _ = app.emit("panel-shown", ());
+            } else {
+                hide_panel_internal(app);
+            }
+        } else {
+            show_main_panel(app);
         }
-        else { show_main_panel(app); }
     }
 }
 
@@ -3034,7 +3006,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect, panel_ready,
+            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
@@ -3085,7 +3057,11 @@ pub fn run() {
                 }
                 apply_window_effect(&win, &window_effect_cfg, theme_dark);
                 // 窗口默认隐藏（visible: false），非静默启动时在这里统一显示，避免启动闪现
-                if !silent_start { let _ = win.show(); let _ = win.set_focus(); }
+                if !silent_start {
+                    set_webview_visible(&win, true);
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
                 let w = win.clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
