@@ -29,8 +29,14 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 /// 启动看门狗依据该标记判断页面是否真的加载成功。
 static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
-// Windows 主面板显隐只同步原生窗口与 WebView2 控制器，不重载页面、不等待异步就绪，
-// 避免快速连按热键时多个导航 / 显示任务交错，或后续热键被「正在打开」标记吞掉。
+// Windows 主面板显隐序号：每次操作都使上一项延迟校准 / 恢复任务失效，
+// 确保只有最后一次热键意图能触发兜底重载，旧任务不会把新状态覆盖回去。
+#[cfg(target_os = "windows")]
+static PANEL_VISIBILITY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static PANEL_LAST_HOTKEY_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[cfg(target_os = "windows")]
+static PANEL_HOTKEY_BURST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -2828,31 +2834,92 @@ fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
 #[cfg(not(target_os = "windows"))]
 fn set_webview_visible(_win: &tauri::WebviewWindow, _visible: bool) {}
 
+#[cfg(target_os = "windows")]
+fn next_panel_visibility_sequence() -> u64 {
+    PANEL_VISIBILITY_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+#[cfg(not(target_os = "windows"))]
+fn next_panel_visibility_sequence() -> u64 { 0 }
+
+/// 记录热键连按：800ms 内连续三次及以上视为一个快速操作批次。
+/// 普通显隐只校准控制器；只有这种批次才启用一次整页重载兜底。
+#[cfg(target_os = "windows")]
+fn register_hotkey_burst() -> bool {
+    let current = now();
+    let previous = PANEL_LAST_HOTKEY_MS.swap(current, Ordering::SeqCst);
+    let count = if previous > 0 && (0..=800).contains(&(current - previous)) {
+        PANEL_HOTKEY_BURST.fetch_add(1, Ordering::SeqCst) + 1
+    } else {
+        PANEL_HOTKEY_BURST.store(1, Ordering::SeqCst);
+        1
+    };
+    count >= 3
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_hotkey_burst() -> bool { false }
+
+/// 延迟校准最终显隐状态。旧序号任务直接退出，因此快速连按时只处理最后一次操作；
+/// 若该批次最终为显示，300ms 后再重载一次页面，自动恢复 WebView2 已白屏但控制器仍报告可见的情况。
+#[cfg(target_os = "windows")]
+fn schedule_panel_reconcile(app: &tauri::AppHandle, sequence: u64, recover: bool) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        if PANEL_VISIBILITY_SEQUENCE.load(Ordering::SeqCst) != sequence { return; }
+        let Some(win) = handle.get_webview_window("main") else { return };
+        let visible = win.is_visible().unwrap_or(false);
+        set_webview_visible(&win, visible);
+        if !visible || !recover { return; }
+
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        if PANEL_VISIBILITY_SEQUENCE.load(Ordering::SeqCst) != sequence || !win.is_visible().unwrap_or(false) { return; }
+        // 重载期间不阻塞、不吞热键；任何新操作都会递增序号，使后续旧任务失效。
+        set_webview_visible(&win, true);
+        if let Ok(url) = main_page_url().parse() {
+            if let Err(error) = win.navigate(url) { eprintln!("自动恢复面板页面失败：{error}"); }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn schedule_panel_reconcile(_app: &tauri::AppHandle, _sequence: u64, _recover: bool) {}
+
 fn hide_panel_internal(app: &tauri::AppHandle) {
     lock_encrypted_if_needed(app);
     if let Some(w) = app.get_webview_window("main") {
+        let sequence = next_panel_visibility_sequence();
         let _ = w.hide();
         set_webview_visible(&w, false);
+        schedule_panel_reconcile(app, sequence, false);
     }
 }
 
-/// 统一的主面板显示入口：不再重载页面，也没有异步「打开中」状态，
-/// 因而快速连按时每次热键都会按当前真实可见状态切换，不会被去重标记吞掉。
-/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
+/// 普通显示入口（设置页预览等）不触发整页重载。
 fn show_main_panel(app: &tauri::AppHandle) {
+    show_main_panel_with_recovery(app, false);
+}
+
+/// 显示面板并安排最终状态校准；热键连按批次额外启用自动重载兜底。
+/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
+fn show_main_panel_with_recovery(app: &tauri::AppHandle, recover: bool) {
     let Some(win) = app.get_webview_window("main") else { return };
     if win.is_visible().unwrap_or(false) {
         let _ = app.emit("panel-shown", ());
         return;
     }
+    let sequence = next_panel_visibility_sequence();
     let _ = app.emit("panel-shown", ());
     // 先恢复控制器，再显示并聚焦原生窗口；顺序与 WebView2 官方建议一致。
     set_webview_visible(&win, true);
     let _ = win.show();
     let _ = win.set_focus();
+    schedule_panel_reconcile(app, sequence, recover);
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
+    let recover = register_hotkey_burst();
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) {
             // 面板已显示但被其他窗口盖住（未聚焦）时，按配置决定置前还是隐藏
@@ -2861,15 +2928,26 @@ fn toggle_window(app: &tauri::AppHandle) {
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
             if !focused && behavior != "hide" {
+                let sequence = next_panel_visibility_sequence();
                 set_webview_visible(&win, true);
                 let _ = win.set_focus();
                 let _ = app.emit("panel-shown", ());
+                schedule_panel_reconcile(app, sequence, recover);
             } else {
                 hide_panel_internal(app);
             }
         } else {
-            show_main_panel(app);
+            show_main_panel_with_recovery(app, recover);
         }
+    }
+}
+
+/// 托盘是明确的「显示/隐藏」切换：点击托盘会让面板失去焦点，
+/// 不能复用热键的「未聚焦时置前」策略，否则可见面板第一次点击只会重新聚焦而不隐藏。
+fn toggle_tray_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        if win.is_visible().unwrap_or(false) { hide_panel_internal(app); }
+        else { show_main_panel(app); }
     }
 }
 
@@ -3029,7 +3107,12 @@ pub fn run() {
                 .menu(&menu)
                 .tooltip(format!("速启 ({hotkey})"))
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => toggle_window(app),
+                    "show" => {
+                        // 托盘回调位于主事件线程；with_webview 需要等待主线程执行，
+                        // 直接切换会相互等待。转到工作线程，与全局热键的调用环境一致。
+                        let handle = app.clone();
+                        std::thread::spawn(move || toggle_tray_window(&handle));
+                    }
                     "settings" => { let _ = open_settings_window_internal(app); }
                     "quit" => app.exit(0),
                     "toggle" => {
@@ -3041,7 +3124,8 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                        toggle_window(tray.app_handle());
+                        let handle = tray.app_handle().clone();
+                        std::thread::spawn(move || toggle_tray_window(&handle));
                     }
                 })
                 .build(app)?;
