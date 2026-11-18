@@ -1808,15 +1808,7 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
 
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        if !win.is_visible().unwrap_or(false) {
-            // 先通知前端再显示窗口：前端可在面板可见前清空搜索并重绘，避免先闪出旧内容
-            let _ = app.emit("panel-shown", ());
-            let _ = win.show(); let _ = win.set_focus();
-            return;
-        }
-    }
-    let _ = app.emit("panel-shown", ());
+    show_main_panel(&app);
 }
 
 #[tauri::command]
@@ -2815,6 +2807,39 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); }
 }
 
+/// WebView2 已知问题：窗口 hide 隐藏后再 show，渲染器偶尔不恢复绘制（整窗白屏），
+/// 与最小化恢复白屏同源。显示后延迟做 1px 尺寸抖动，强制 WebView2 控制器重排重绘。
+#[cfg(target_os = "windows")]
+fn schedule_repaint_jiggle(win: &tauri::WebviewWindow) {
+    let w = win.clone();
+    std::thread::spawn(move || {
+        // 等 show 真正生效后再抖动，避免窗口尚不可见时尺寸变化被系统吞掉
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Ok(cur) = w.inner_size() {
+            let _ = w.set_size(tauri::PhysicalSize::new(cur.width + 1, cur.height));
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let _ = w.set_size(cur);
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn schedule_repaint_jiggle(_win: &tauri::WebviewWindow) {}
+
+/// 统一的主面板显示入口：先通知前端清空搜索并重绘（避免闪旧内容），再显示并聚焦；
+/// 从隐藏状态恢复显示时做一次重绘抖动，规避 WebView2 隐藏后再显示偶发的整窗白屏。
+/// 面板已可见时不重复聚焦，避免设置页「预览窗口效果 / 背景」等调用把焦点从设置页抢走
+fn show_main_panel(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let was_hidden = !win.is_visible().unwrap_or(false);
+        let _ = app.emit("panel-shown", ());
+        if was_hidden {
+            let _ = win.show(); let _ = win.set_focus();
+            schedule_repaint_jiggle(&win);
+        }
+    }
+}
+
 fn toggle_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) {
@@ -2823,10 +2848,11 @@ fn toggle_window(app: &tauri::AppHandle) {
             let behavior = app.try_state::<ConfigState>()
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
-            if !focused && behavior != "hide" { let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); }
+            // 置前时也做一次重绘抖动：覆盖「面板可见但渲染卡在白屏」的场景，按热键即可恢复
+            if !focused && behavior != "hide" { let _ = win.set_focus(); let _ = app.emit("panel-shown", ()); schedule_repaint_jiggle(&win); }
             else { hide_panel_internal(app); }
         }
-        else { let _ = app.emit("panel-shown", ()); let _ = win.show(); let _ = win.set_focus(); }
+        else { show_main_panel(app); }
     }
 }
 
