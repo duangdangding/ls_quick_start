@@ -29,6 +29,22 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 /// 启动看门狗依据该标记判断页面是否真的加载成功。
 static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 
+/// 主面板页面就绪标记：前端每次页面加载完成首次渲染后由 panel_ready 置位。
+/// Windows 上面板从隐藏恢复显示前会趁不可见整页重载，等待该标记再显示窗口（规避 WebView2 白屏）。
+static PANEL_PAGE_READY: AtomicBool = AtomicBool::new(false);
+
+/// 主面板正在「重载并等待就绪」中：热键连击时去重，避免重复重载
+#[cfg(target_os = "windows")]
+static PANEL_OPENING: AtomicBool = AtomicBool::new(false);
+
+/// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
+fn main_page_url() -> &'static str {
+    #[cfg(dev)]
+    { "http://localhost:1420/" }
+    #[cfg(not(dev))]
+    { "http://tauri.localhost/" }
+}
+
 /// 默认全局快捷键：Windows 用 Win+`；macOS 的 Cmd+` 与系统「切换窗口」冲突，改用 Alt+Space
 #[cfg(target_os = "windows")]
 const DEFAULT_HOTKEY: &str = "Win+`";
@@ -1806,6 +1822,12 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
     })
 }
 
+/// 主面板前端每次页面加载完成首次渲染后调用：「隐藏时重载页面、就绪后再显示」流程的就绪信号
+#[tauri::command]
+fn panel_ready() {
+    PANEL_PAGE_READY.store(true, Ordering::SeqCst);
+}
+
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
@@ -2826,17 +2848,40 @@ fn schedule_repaint_jiggle(win: &tauri::WebviewWindow) {
 #[cfg(not(target_os = "windows"))]
 fn schedule_repaint_jiggle(_win: &tauri::WebviewWindow) {}
 
-/// 统一的主面板显示入口：先通知前端清空搜索并重绘（避免闪旧内容），再显示并聚焦；
-/// 从隐藏状态恢复显示时做一次重绘抖动，规避 WebView2 隐藏后再显示偶发的整窗白屏。
-/// 面板已可见时不重复聚焦，避免设置页「预览窗口效果 / 背景」等调用把焦点从设置页抢走
+/// 统一的主面板显示入口。
+/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页「预览窗口效果 / 背景」调用抢走焦点。
+/// Windows 上 WebView2 有已知问题：窗口隐藏后再显示，渲染器偶发不恢复绘制（整窗白屏），
+/// 尺寸抖动等手段不能覆盖所有场景。这里改为趁窗口仍隐藏时整页重载（用户看不到重载过程），
+/// 前端渲染就绪（panel_ready）后再显示窗口——每次打开都是全新渲染器，从根上规避白屏。
 fn show_main_panel(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let was_hidden = !win.is_visible().unwrap_or(false);
+    let Some(win) = app.get_webview_window("main") else { return };
+    if win.is_visible().unwrap_or(false) {
         let _ = app.emit("panel-shown", ());
-        if was_hidden {
-            let _ = win.show(); let _ = win.set_focus();
-            schedule_repaint_jiggle(&win);
-        }
+        return;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app.emit("panel-shown", ());
+        let _ = win.show(); let _ = win.set_focus();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // 热键连击去重：正在重载等待就绪时忽略重复触发
+        if PANEL_OPENING.swap(true, Ordering::SeqCst) { return; }
+        PANEL_PAGE_READY.store(false, Ordering::SeqCst);
+        if let Ok(url) = main_page_url().parse() { let _ = win.navigate(url); }
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            // 等前端就绪（最多 ~2.5 秒；超时也照常显示，避免面板彻底叫不出来）
+            for _ in 0..50 {
+                if PANEL_PAGE_READY.load(Ordering::SeqCst) { break; }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if let Some(w) = handle.get_webview_window("main") {
+                let _ = w.show(); let _ = w.set_focus();
+            }
+            PANEL_OPENING.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -2989,7 +3034,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect, panel_ready,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
@@ -3076,11 +3121,7 @@ pub fn run() {
             {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    // 与 tauri.conf.json 的 devUrl 保持一致
-                    #[cfg(dev)]
-                    let app_url = "http://localhost:1420/";
-                    #[cfg(not(dev))]
-                    let app_url = "http://tauri.localhost/";
+                    let app_url = main_page_url();
                     let mut attempts = 0u8;
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(if attempts == 0 { 8 } else { 10 }));
