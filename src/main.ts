@@ -155,6 +155,8 @@ function renderName(name: string, needle: string): string {
   if (cursor < name.length) html += escape(name.slice(cursor));
   return html;
 }
+// 每个页面上下文只上报一次：长时间隐藏后的恢复流程会在列表真正渲染后再显示窗口
+let readySent = false;
 async function load() {
   // 解锁状态以后端会话为准：面板重开/页面重载后仍保持已解锁
   // 三个读取相互独立，并行发起，缩短面板加载时间
@@ -172,6 +174,7 @@ async function load() {
   groups = data.groups; passwordSet = data.passwordSet;
   if (!fixedGroups().some((group) => group.id === activeGroup)) activeGroup = "all";
   render(true);
+  if (!readySent) { readySent = true; void invoke("panel_ready"); }
 }
 function itemIcon(item: Item) {
   if (item.iconPath) return `<img src="${escape(convertFileSrc(item.iconPath))}" alt="" />`;

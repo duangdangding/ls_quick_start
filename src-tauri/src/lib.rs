@@ -28,6 +28,9 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 /// 开机自启时系统组件（WebView2 等）可能尚未就绪，页面加载失败会停在 WebView2 错误页且刷新无效，
 /// 启动看门狗依据该标记判断页面是否真的加载成功。
 static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
+/// 主面板每次重新导航后，前端首次完成数据加载与列表渲染时置位。
+/// 长时间隐藏后的恢复流程等待该信号，再显示窗口，避免用户看到二次刷新。
+static PANEL_PAGE_READY: AtomicBool = AtomicBool::new(false);
 
 // Windows 主面板显隐序号：每次操作都使上一项延迟校准 / 恢复任务失效，
 // 确保只有最后一次热键意图能触发兜底重载，旧任务不会把新状态覆盖回去。
@@ -1829,6 +1832,12 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
     })
 }
 
+/// 前端首次完成数据加载与列表渲染后调用，唤醒隐藏在后台的恢复流程。
+#[tauri::command]
+fn panel_ready() {
+    PANEL_PAGE_READY.store(true, Ordering::SeqCst);
+}
+
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
@@ -2883,11 +2892,8 @@ fn consume_panel_idle_recovery() -> bool {
     hidden_since > 0 && now().saturating_sub(hidden_since) >= PANEL_IDLE_RECOVERY_MS
 }
 
-#[cfg(not(target_os = "windows"))]
-fn consume_panel_idle_recovery() -> bool { false }
-
 /// 延迟校准最终显隐状态。旧序号任务直接退出，因此快速连按时只处理最后一次操作；
-/// 快速连按或长时间隐藏后若最终为显示，300ms 后再重载一次页面，自动恢复 WebView2 白屏。
+/// 快速连按批次若最终为显示，300ms 后再重载一次页面，自动恢复 WebView2 白屏。
 #[cfg(target_os = "windows")]
 fn schedule_panel_reconcile(app: &tauri::AppHandle, sequence: u64, recover: bool) {
     let handle = app.clone();
@@ -2911,6 +2917,53 @@ fn schedule_panel_reconcile(app: &tauri::AppHandle, sequence: u64, recover: bool
 
 #[cfg(not(target_os = "windows"))]
 fn schedule_panel_reconcile(_app: &tauri::AppHandle, _sequence: u64, _recover: bool) {}
+
+/// 完成隐藏恢复：仅当本次操作仍是最新意图且窗口仍隐藏时才显示，避免旧任务覆盖新状态。
+#[cfg(target_os = "windows")]
+fn finish_hidden_panel_reload(app: &tauri::AppHandle, win: &tauri::WebviewWindow, sequence: u64) {
+    if PANEL_VISIBILITY_SEQUENCE.load(Ordering::SeqCst) != sequence || win.is_visible().unwrap_or(false) { return; }
+    set_webview_visible(win, true);
+    let _ = win.show();
+    let _ = win.set_focus();
+    schedule_panel_reconcile(app, sequence, false);
+}
+
+/// 长时间隐藏后的恢复：趁窗口不可见时重载，等列表完成渲染后再显示。
+/// 等待期间再次按热键会走普通显示路径并递增序号，从而取消等待、立即显示，不会吞掉操作。
+#[cfg(target_os = "windows")]
+fn show_panel_after_hidden_reload(app: &tauri::AppHandle, win: tauri::WebviewWindow) {
+    let sequence = next_panel_visibility_sequence();
+    PANEL_PAGE_READY.store(false, Ordering::SeqCst);
+    set_webview_visible(&win, false);
+    let result = main_page_url().parse::<tauri::Url>().map_err(|error| error.to_string())
+        .and_then(|url| win.navigate(url).map_err(|error| error.to_string()));
+    if let Err(error) = result {
+        eprintln!("隐藏状态重载面板失败：{error}");
+        finish_hidden_panel_reload(app, &win, sequence);
+        return;
+    }
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        // 最多等待约 2.5 秒；加载异常时仍显示窗口，避免面板永远无法呼出。
+        for _ in 0..50 {
+            if PANEL_VISIBILITY_SEQUENCE.load(Ordering::SeqCst) != sequence { return; }
+            if PANEL_PAGE_READY.load(Ordering::SeqCst) {
+                if let Some(win) = handle.get_webview_window("main") {
+                    finish_hidden_panel_reload(&handle, &win, sequence);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if PANEL_VISIBILITY_SEQUENCE.load(Ordering::SeqCst) == sequence {
+            eprintln!("等待面板列表渲染超时，改为直接显示");
+            if let Some(win) = handle.get_webview_window("main") {
+                finish_hidden_panel_reload(&handle, &win, sequence);
+            }
+        }
+    });
+}
 
 fn hide_panel_internal(app: &tauri::AppHandle) {
     lock_encrypted_if_needed(app);
@@ -2936,7 +2989,11 @@ fn show_main_panel_with_recovery(app: &tauri::AppHandle, recover: bool) {
         let _ = app.emit("panel-shown", ());
         return;
     }
-    let recover = recover || consume_panel_idle_recovery();
+    #[cfg(target_os = "windows")]
+    if consume_panel_idle_recovery() {
+        show_panel_after_hidden_reload(app, win);
+        return;
+    }
     let sequence = next_panel_visibility_sequence();
     let _ = app.emit("panel-shown", ());
     // 先恢复控制器，再显示并聚焦原生窗口；顺序与 WebView2 官方建议一致。
@@ -2956,7 +3013,6 @@ fn toggle_window(app: &tauri::AppHandle) {
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
             if !focused && behavior != "hide" {
-                let recover = recover || consume_panel_idle_recovery();
                 let sequence = next_panel_visibility_sequence();
                 set_webview_visible(&win, true);
                 let _ = win.set_focus();
@@ -3113,7 +3169,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect, panel_ready,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
