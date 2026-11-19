@@ -37,6 +37,12 @@ static PANEL_VISIBILITY_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atom
 static PANEL_LAST_HOTKEY_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 #[cfg(target_os = "windows")]
 static PANEL_HOTKEY_BURST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// 最近一次隐藏主面板的时间（毫秒时间戳）；长时间隐藏后再次显示需要额外的渲染恢复。
+#[cfg(target_os = "windows")]
+static PANEL_HIDDEN_SINCE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// 隐藏超过 5 分钟后，WebView2 更容易在恢复时停止绘制；此时启用整页重载兜底。
+#[cfg(target_os = "windows")]
+const PANEL_IDLE_RECOVERY_MS: i64 = 5 * 60 * 1000;
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -2843,7 +2849,7 @@ fn next_panel_visibility_sequence() -> u64 {
 fn next_panel_visibility_sequence() -> u64 { 0 }
 
 /// 记录热键连按：800ms 内连续三次及以上视为一个快速操作批次。
-/// 普通显隐只校准控制器；只有这种批次才启用一次整页重载兜底。
+/// 这种批次与长时间隐藏后的显示都会启用一次整页重载兜底。
 #[cfg(target_os = "windows")]
 fn register_hotkey_burst() -> bool {
     let current = now();
@@ -2860,8 +2866,28 @@ fn register_hotkey_burst() -> bool {
 #[cfg(not(target_os = "windows"))]
 fn register_hotkey_burst() -> bool { false }
 
+/// 记录面板进入隐藏状态的时间；重复隐藏只刷新时间，不影响显隐序号。
+#[cfg(target_os = "windows")]
+fn mark_panel_hidden() {
+    PANEL_HIDDEN_SINCE_MS.store(now(), Ordering::SeqCst);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn mark_panel_hidden() {}
+
+/// 显示面板时消费隐藏时长：超过阈值才要求整页重载，短时间显隐仍保持轻量切换。
+/// 用 swap 清零，避免一次长时间隐藏导致后续每次置前都重复重载。
+#[cfg(target_os = "windows")]
+fn consume_panel_idle_recovery() -> bool {
+    let hidden_since = PANEL_HIDDEN_SINCE_MS.swap(0, Ordering::SeqCst);
+    hidden_since > 0 && now().saturating_sub(hidden_since) >= PANEL_IDLE_RECOVERY_MS
+}
+
+#[cfg(not(target_os = "windows"))]
+fn consume_panel_idle_recovery() -> bool { false }
+
 /// 延迟校准最终显隐状态。旧序号任务直接退出，因此快速连按时只处理最后一次操作；
-/// 若该批次最终为显示，300ms 后再重载一次页面，自动恢复 WebView2 已白屏但控制器仍报告可见的情况。
+/// 快速连按或长时间隐藏后若最终为显示，300ms 后再重载一次页面，自动恢复 WebView2 白屏。
 #[cfg(target_os = "windows")]
 fn schedule_panel_reconcile(app: &tauri::AppHandle, sequence: u64, recover: bool) {
     let handle = app.clone();
@@ -2890,18 +2916,19 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
     lock_encrypted_if_needed(app);
     if let Some(w) = app.get_webview_window("main") {
         let sequence = next_panel_visibility_sequence();
+        mark_panel_hidden();
         let _ = w.hide();
         set_webview_visible(&w, false);
         schedule_panel_reconcile(app, sequence, false);
     }
 }
 
-/// 普通显示入口（设置页预览等）不触发整页重载。
+/// 普通显示入口（设置页预览、托盘等）只在长时间隐藏后触发整页重载。
 fn show_main_panel(app: &tauri::AppHandle) {
     show_main_panel_with_recovery(app, false);
 }
 
-/// 显示面板并安排最终状态校准；热键连按批次额外启用自动重载兜底。
+/// 显示面板并安排最终状态校准；热键连按或长时间隐藏后额外启用自动重载兜底。
 /// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
 fn show_main_panel_with_recovery(app: &tauri::AppHandle, recover: bool) {
     let Some(win) = app.get_webview_window("main") else { return };
@@ -2909,6 +2936,7 @@ fn show_main_panel_with_recovery(app: &tauri::AppHandle, recover: bool) {
         let _ = app.emit("panel-shown", ());
         return;
     }
+    let recover = recover || consume_panel_idle_recovery();
     let sequence = next_panel_visibility_sequence();
     let _ = app.emit("panel-shown", ());
     // 先恢复控制器，再显示并聚焦原生窗口；顺序与 WebView2 官方建议一致。
@@ -2928,6 +2956,7 @@ fn toggle_window(app: &tauri::AppHandle) {
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
             if !focused && behavior != "hide" {
+                let recover = recover || consume_panel_idle_recovery();
                 let sequence = next_panel_visibility_sequence();
                 set_webview_visible(&win, true);
                 let _ = win.set_focus();
@@ -3140,8 +3169,11 @@ pub fn run() {
                     let _ = win.set_size(tauri::PhysicalSize::new(window_width, window_height));
                 }
                 apply_window_effect(&win, &window_effect_cfg, theme_dark);
-                // 窗口默认隐藏（visible: false），非静默启动时在这里统一显示，避免启动闪现
-                if !silent_start {
+                // 窗口默认隐藏（visible: false），非静默启动时在这里统一显示，避免启动闪现；
+                // 静默启动也记录隐藏起点，保证首次唤起与后续长时间隐藏走同一恢复逻辑。
+                if silent_start {
+                    mark_panel_hidden();
+                } else {
                     set_webview_visible(&win, true);
                     let _ = win.show();
                     let _ = win.set_focus();
