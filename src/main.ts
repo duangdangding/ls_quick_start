@@ -852,13 +852,16 @@ void load().then(() => diagnostic("initial-load-complete", {
 })).catch((error) => diagnostic("initial-load-failed", String(error)));
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
 // 「重新打开面板时清空搜索框」开启时（默认），清空上次的搜索词，从全部条目重新开始；关闭则保留
-listen("panel-shown", () => {
+listen<{ sequence: number }>("panel-shown", (event) => {
   if (appConfig?.clearSearchOnReopen !== false) {
     query = "";
     searchSelection = null;
     selected = 0;
     // 立即用现有数据重绘：不等 load() 的 IPC 往返，避免面板显示后仍残留旧搜索词（感知延迟）
     render();
+  }
+  if (event.payload.sequence > 0) {
+    void invoke("panel_shown_ready", { sequence: event.payload.sequence }).catch(() => {});
   }
   diagnostic("frontend-panel-shown", {
     readyState: document.readyState, visibility: document.visibilityState, appChildren: app.childElementCount,

@@ -28,6 +28,9 @@ const POINTER_FILE: &str = "suqi-data-dir.txt";
 /// 开机自启时系统组件（WebView2 等）可能尚未就绪，页面加载失败会停在 WebView2 错误页且刷新无效，
 /// 启动看门狗依据该标记判断页面是否真的加载成功。
 static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
+/// 面板显隐操作序号与前端应答：用于识别「原生窗口已显示，但 WebView2 前端仍无响应」。
+static PANEL_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PANEL_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -1832,6 +1835,12 @@ fn panel_diagnostic(state: State<'_, ConfigState>, stage: String, detail: String
 }
 
 #[tauri::command]
+fn panel_shown_ready(app: tauri::AppHandle, sequence: u64) {
+    PANEL_FRONTEND_ACK.store(sequence, Ordering::SeqCst);
+    panel_log(&app, "frontend-ack", &format!("sequence={sequence}"));
+}
+
+#[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
 }
@@ -2827,6 +2836,7 @@ fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
 }
 
 fn hide_panel_internal(app: &tauri::AppHandle) {
+    PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     lock_encrypted_if_needed(app);
     if let Some(win) = app.get_webview_window("main") {
         panel_log(app, "backend-hide-before", &format!("visible={:?}", win.is_visible()));
@@ -2835,18 +2845,33 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
     }
 }
 
-/// 显隐只操作原生窗口；诊断版记录前后端状态，不再自动恢复或重载页面。
+/// 正常显隐不重载。只有窗口显示后前端超过 1.2 秒仍未应答，才认定 WebView2 卡住并恢复一次。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if !win.is_visible().unwrap_or(false) {
-        panel_log(app, "backend-show-before", "window hidden");
-        let _ = app.emit("panel-shown", ());
+        let sequence = PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+        panel_log(app, "backend-show-before", &format!("sequence={sequence}"));
+        let _ = app.emit("panel-shown", serde_json::json!({ "sequence": sequence }));
         let result = win.show();
         let _ = win.set_focus();
-        panel_log(app, "backend-show-after", &format!("result={result:?}, visible={:?}", win.is_visible()));
+        panel_log(app, "backend-show-after", &format!("sequence={sequence}, result={result:?}, visible={:?}", win.is_visible()));
+
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            if PANEL_OPERATION_SEQUENCE.load(Ordering::SeqCst) != sequence
+                || PANEL_FRONTEND_ACK.load(Ordering::SeqCst) == sequence { return; }
+            let Some(win) = handle.get_webview_window("main") else { return };
+            if !win.is_visible().unwrap_or(false) { return; }
+            panel_log(&handle, "frontend-unresponsive", &format!("sequence={sequence}, reloading once"));
+            if let Ok(url) = main_page_url().parse() {
+                let result = win.navigate(url);
+                panel_log(&handle, "frontend-reload-result", &format!("sequence={sequence}, result={result:?}"));
+            }
+        });
         return;
     }
-    let _ = app.emit("panel-shown", ());
+    let _ = app.emit("panel-shown", serde_json::json!({ "sequence": 0 }));
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
@@ -2859,7 +2884,7 @@ fn toggle_window(app: &tauri::AppHandle) {
                 .unwrap_or_else(|| "front".into());
             if !focused && behavior != "hide" {
                 let _ = win.set_focus();
-                let _ = app.emit("panel-shown", ());
+                let _ = app.emit("panel-shown", serde_json::json!({ "sequence": 0 }));
             } else {
                 hide_panel_internal(app);
             }
@@ -3011,7 +3036,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, panel_diagnostic, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, panel_diagnostic, panel_shown_ready, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
