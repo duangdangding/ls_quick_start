@@ -2814,7 +2814,25 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
 }
 
-/// 与早期稳定版本一致：显隐只操作原生窗口，不直接干预 WebView2 控制器。
+/// hide/show 后 WebView2 偶尔仍持有空白帧；做一次 1px 尺寸重排，迫使控制器重新绘制。
+/// 仅改变原生窗口尺寸，不刷新页面，也不修改前端状态。
+#[cfg(target_os = "windows")]
+fn force_webview_repaint(win: &tauri::WebviewWindow) {
+    if let Ok(size) = win.inner_size() {
+        if size.width == 0 || size.height == 0 { return; }
+        let _ = win.set_size(tauri::PhysicalSize::new(size.width + 1, size.height));
+        let win = win.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let _ = win.set_size(size);
+        });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn force_webview_repaint(_win: &tauri::WebviewWindow) {}
+
+/// 显隐只操作原生窗口；显示后强制 WebView2 重绘，但不重载页面。
 /// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
@@ -2822,6 +2840,7 @@ fn show_main_panel(app: &tauri::AppHandle) {
         let _ = app.emit("panel-shown", ());
         let _ = win.show();
         let _ = win.set_focus();
+        force_webview_repaint(&win);
         return;
     }
     let _ = app.emit("panel-shown", ());
