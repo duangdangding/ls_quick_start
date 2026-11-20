@@ -2809,42 +2809,22 @@ fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
     }
 }
 
-/// 同步 WebView2 控制器的可见状态。原生窗口 hide/show 不会可靠地驱动控制器，
-/// 快速切换时可能让控制器停留在隐藏状态，表现为窗口白屏或已经显示却没有内容。
-#[cfg(target_os = "windows")]
-fn set_webview_visible(win: &tauri::WebviewWindow, visible: bool) {
-    if let Err(error) = win.with_webview(move |webview| unsafe {
-        if let Err(error) = webview.controller().SetIsVisible(visible) {
-            eprintln!("同步 WebView2 可见状态失败：{error}");
-        }
-    }) {
-        eprintln!("无法访问 WebView2 控制器：{error}");
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn set_webview_visible(_win: &tauri::WebviewWindow, _visible: bool) {}
-
 fn hide_panel_internal(app: &tauri::AppHandle) {
     lock_encrypted_if_needed(app);
-    if let Some(win) = app.get_webview_window("main") {
-        // 只隐藏原生窗口，不在后台重载页面或修改 WebView2 控制器状态。
-        let _ = win.hide();
-    }
+    if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
 }
 
-/// 显示面板：只恢复控制器可见性并显示原生窗口，不做任何自动重载。
+/// 与早期稳定版本一致：显隐只操作原生窗口，不直接干预 WebView2 控制器。
 /// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
-    if win.is_visible().unwrap_or(false) {
+    if !win.is_visible().unwrap_or(false) {
         let _ = app.emit("panel-shown", ());
+        let _ = win.show();
+        let _ = win.set_focus();
         return;
     }
     let _ = app.emit("panel-shown", ());
-    set_webview_visible(&win, true);
-    let _ = win.show();
-    let _ = win.set_focus();
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
@@ -2856,7 +2836,6 @@ fn toggle_window(app: &tauri::AppHandle) {
                 .map(|state| state.config.lock().unwrap().hotkey_unfocused_behavior.clone())
                 .unwrap_or_else(|| "front".into());
             if !focused && behavior != "hide" {
-                set_webview_visible(&win, true);
                 let _ = win.set_focus();
                 let _ = app.emit("panel-shown", ());
             } else {
@@ -3068,7 +3047,6 @@ pub fn run() {
                 apply_window_effect(&win, &window_effect_cfg, theme_dark);
                 // 窗口默认隐藏（visible: false），非静默启动时在这里统一显示，避免启动闪现。
                 if !silent_start {
-                    set_webview_visible(&win, true);
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
