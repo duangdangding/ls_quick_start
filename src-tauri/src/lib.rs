@@ -1814,6 +1814,23 @@ fn get_db_info(data: State<'_, AppData>, _state: State<'_, ConfigState>) -> serd
     })
 }
 
+fn append_panel_diagnostic(dir: &Path, stage: &str, detail: &str) {
+    let line = format!("{} [{stage}] {detail}\n", now());
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(dir.join("panel-diagnostic.log")) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn panel_log(app: &tauri::AppHandle, stage: &str, detail: &str) {
+    let dir = app.state::<ConfigState>().data_dir.clone();
+    append_panel_diagnostic(&dir, stage, detail);
+}
+
+#[tauri::command]
+fn panel_diagnostic(state: State<'_, ConfigState>, stage: String, detail: String) {
+    append_panel_diagnostic(&state.data_dir, &stage, &detail);
+}
+
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
@@ -2811,36 +2828,22 @@ fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
 
 fn hide_panel_internal(app: &tauri::AppHandle) {
     lock_encrypted_if_needed(app);
-    if let Some(win) = app.get_webview_window("main") { let _ = win.hide(); }
-}
-
-/// hide/show 后 WebView2 偶尔仍持有空白帧；做一次 1px 尺寸重排，迫使控制器重新绘制。
-/// 仅改变原生窗口尺寸，不刷新页面，也不修改前端状态。
-#[cfg(target_os = "windows")]
-fn force_webview_repaint(win: &tauri::WebviewWindow) {
-    if let Ok(size) = win.inner_size() {
-        if size.width == 0 || size.height == 0 { return; }
-        let _ = win.set_size(tauri::PhysicalSize::new(size.width + 1, size.height));
-        let win = win.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            let _ = win.set_size(size);
-        });
+    if let Some(win) = app.get_webview_window("main") {
+        panel_log(app, "backend-hide-before", &format!("visible={:?}", win.is_visible()));
+        let result = win.hide();
+        panel_log(app, "backend-hide-after", &format!("result={result:?}"));
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn force_webview_repaint(_win: &tauri::WebviewWindow) {}
-
-/// 显隐只操作原生窗口；显示后强制 WebView2 重绘，但不重载页面。
-/// 面板已可见时只通知前端（清空搜索等），不重复聚焦，避免设置页预览抢走焦点。
+/// 显隐只操作原生窗口；诊断版记录前后端状态，不再自动恢复或重载页面。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if !win.is_visible().unwrap_or(false) {
+        panel_log(app, "backend-show-before", "window hidden");
         let _ = app.emit("panel-shown", ());
-        let _ = win.show();
+        let result = win.show();
         let _ = win.set_focus();
-        force_webview_repaint(&win);
+        panel_log(app, "backend-show-after", &format!("result={result:?}, visible={:?}", win.is_visible()));
         return;
     }
     let _ = app.emit("panel-shown", ());
@@ -3008,7 +3011,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, panel_diagnostic, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,

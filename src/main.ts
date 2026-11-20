@@ -6,6 +6,14 @@ import { AppConfig, applyAppearance, applyWindowBackground, applyWindowEffect, i
 import { autoCheckEnabled, checkUpdate } from "./updater";
 import "./styles.css";
 
+// 临时诊断：只记录运行阶段、DOM 数量和异常，不记录启动项内容或搜索词。
+function diagnostic(stage: string, detail: unknown = "") {
+  const text = typeof detail === "string" ? detail : JSON.stringify(detail);
+  void invoke("panel_diagnostic", { stage, detail: text }).catch(() => {});
+}
+window.addEventListener("error", (event) => diagnostic("frontend-error", `${event.message} @ ${event.filename}:${event.lineno}`));
+window.addEventListener("unhandledrejection", (event) => diagnostic("frontend-rejection", String(event.reason)));
+
 type SearchCache = { kw: string; kwPy: string; kwIn: string; nm: string; nmPy: string; nmIn: string };
 type Item = { id: string; name: string; keyword: string; description: string; target: string; lnkPath: string | null; groupId: string | null; isEncrypted: boolean; isCmd: boolean; iconPath: string | null; sortOrder: number; createdAt: number; search?: SearchCache };
 type Group = { id: string; name: string; sortOrder: number };
@@ -839,7 +847,9 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); }
 });
-void load();
+void load().then(() => diagnostic("initial-load-complete", {
+  readyState: document.readyState, appChildren: app.childElementCount, shell: !!document.querySelector(".shell"),
+})).catch((error) => diagnostic("initial-load-failed", String(error)));
 // 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
 // 「重新打开面板时清空搜索框」开启时（默认），清空上次的搜索词，从全部条目重新开始；关闭则保留
 listen("panel-shown", () => {
@@ -850,7 +860,12 @@ listen("panel-shown", () => {
     // 立即用现有数据重绘：不等 load() 的 IPC 往返，避免面板显示后仍残留旧搜索词（感知延迟）
     render();
   }
-  void load();
+  diagnostic("frontend-panel-shown", {
+    readyState: document.readyState, visibility: document.visibilityState, appChildren: app.childElementCount,
+    shell: !!document.querySelector(".shell"), width: document.body.scrollWidth, height: document.body.scrollHeight,
+  });
+  void load().then(() => diagnostic("panel-load-complete", { appChildren: app.childElementCount }))
+    .catch((error) => diagnostic("panel-load-failed", String(error)));
 });
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
 document.addEventListener("click", (event) => {
