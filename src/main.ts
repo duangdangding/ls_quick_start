@@ -163,23 +163,38 @@ function renderName(name: string, needle: string): string {
   if (cursor < name.length) html += escape(name.slice(cursor));
   return html;
 }
+let loadSequence = 0;
+let iconsRequest: Promise<ItemIcon[]> | null = null;
+function requestIcons() {
+  // 连续呼出时共享同一次图标提取，避免多个 load 重复调用外部命令。
+  if (!iconsRequest) iconsRequest = invoke<ItemIcon[]>("item_icons").finally(() => { iconsRequest = null; });
+  return iconsRequest;
+}
 async function load() {
-  // 解锁状态以后端会话为准：面板重开/页面重载后仍保持已解锁
-  // 三个读取相互独立，并行发起，缩短面板加载时间
-  const [data, index, icons] = await Promise.all([
+  const sequence = ++loadSequence;
+  // 首屏只等待列表和搜索索引；图标提取较慢，改为后台补齐，不阻塞列表显示。
+  const [data, index] = await Promise.all([
     invoke<{ items: Item[]; groups: Group[]; passwordSet: boolean; unlocked: boolean }>("list_data", { includeEncrypted: unlocked }),
     invoke<{ id: string; fullPinyin: string; initials: string }[]>("searchable_items", { includeEncrypted: unlocked }),
-    invoke<ItemIcon[]>("item_icons"),
   ]);
   unlocked = data.unlocked;
   const words = new Map(index.map((entry) => [entry.id, entry]));
   items = data.items.map((item) => Object.assign(item, words.get(item.id)));
-  const iconMap = new Map(icons.map((icon) => [icon.id, icon.iconPath]));
-  items.forEach((item) => { if (!item.iconPath) item.iconPath = iconMap.get(item.id) ?? null; });
   items.forEach((item) => { item.search = buildSearchCache(item); });
   groups = data.groups; passwordSet = data.passwordSet;
   if (!fixedGroups().some((group) => group.id === activeGroup)) activeGroup = "all";
   render(true);
+
+  void requestIcons().then((icons) => {
+    if (sequence !== loadSequence) return;
+    const iconMap = new Map(icons.map((icon) => [icon.id, icon.iconPath]));
+    let changed = false;
+    items.forEach((item) => {
+      const iconPath = item.iconPath || iconMap.get(item.id);
+      if (iconPath && item.iconPath !== iconPath) { item.iconPath = iconPath; changed = true; }
+    });
+    if (changed) render(true);
+  }).catch((error) => diagnostic("icons-load-failed", String(error)));
 }
 function itemIcon(item: Item) {
   if (item.iconPath) return `<img src="${escape(convertFileSrc(item.iconPath))}" alt="" />`;

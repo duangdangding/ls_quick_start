@@ -2861,7 +2861,7 @@ fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
     let handle = app.clone();
     std::thread::spawn(move || {
         // 等旧窗口从窗口管理器中移除后再复用 main 标签。
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(100));
         let (always_on_top, effect, dark) = {
             let state = handle.state::<ConfigState>();
             let config = state.config.lock().unwrap();
@@ -2901,7 +2901,7 @@ fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
     }
 }
 
-/// 正常显隐不重载。只有窗口显示后前端超过 1.2 秒仍未应答，才认定 WebView2 卡住并重建。
+/// 正常显隐不重载。正常前端应答通常在 50ms 内；超过 300ms 未应答才认定 WebView2 卡住并重建。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if !win.is_visible().unwrap_or(false) {
@@ -2914,7 +2914,7 @@ fn show_main_panel(app: &tauri::AppHandle) {
 
         let handle = app.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(1200));
+            std::thread::sleep(std::time::Duration::from_millis(300));
             if PANEL_OPERATION_SEQUENCE.load(Ordering::SeqCst) != sequence
                 || PANEL_FRONTEND_ACK.load(Ordering::SeqCst) == sequence { return; }
             let Some(win) = handle.get_webview_window("main") else { return };
