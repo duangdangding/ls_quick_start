@@ -2845,7 +2845,63 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
     }
 }
 
-/// 正常显隐不重载。只有窗口显示后前端超过 1.2 秒仍未应答，才认定 WebView2 卡住并恢复一次。
+/// 日志已证实卡死的 WebView2 对 navigate 也只是返回 Ok，页面并不会重新运行。
+/// 仅在这种情况下销毁并重建主面板，保留尺寸、位置、置顶、外观和窗口事件。
+#[cfg(target_os = "windows")]
+fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    let size = win.inner_size().unwrap_or(tauri::PhysicalSize::new(980, 680));
+    let position = win.outer_position().ok();
+    panel_log(app, "webview-recreate-destroy", &format!("sequence={sequence}"));
+    if let Err(error) = win.destroy() {
+        panel_log(app, "webview-recreate-destroy-failed", &format!("{error}"));
+        app.restart();
+    }
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        // 等旧窗口从窗口管理器中移除后再复用 main 标签。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (always_on_top, effect, dark) = {
+            let state = handle.state::<ConfigState>();
+            let config = state.config.lock().unwrap();
+            (config.always_on_top, config.window_effect.clone(), config.theme != "light")
+        };
+        let builder = tauri::WebviewWindowBuilder::new(
+            &handle, "main", tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("速启")
+        .min_inner_size(700.0, 500.0)
+        .resizable(true)
+        .visible(false)
+        .always_on_top(always_on_top);
+        match builder.build() {
+            Ok(win) => {
+                let _ = win.set_size(size);
+                if let Some(position) = position { let _ = win.set_position(position); }
+                apply_window_effect(&win, &effect, dark);
+                attach_main_window_handlers(&win);
+                let result = win.show();
+                let _ = win.set_focus();
+                panel_log(&handle, "webview-recreate-complete", &format!("sequence={sequence}, result={result:?}"));
+            }
+            Err(error) => {
+                panel_log(&handle, "webview-recreate-failed", &format!("{error}"));
+                handle.restart();
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
+    if let Some(win) = app.get_webview_window("main") {
+        panel_log(app, "frontend-unresponsive-reload", &format!("sequence={sequence}"));
+        if let Ok(url) = main_page_url().parse() { let _ = win.navigate(url); }
+    }
+}
+
+/// 正常显隐不重载。只有窗口显示后前端超过 1.2 秒仍未应答，才认定 WebView2 卡住并重建。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
     if !win.is_visible().unwrap_or(false) {
@@ -2863,11 +2919,8 @@ fn show_main_panel(app: &tauri::AppHandle) {
                 || PANEL_FRONTEND_ACK.load(Ordering::SeqCst) == sequence { return; }
             let Some(win) = handle.get_webview_window("main") else { return };
             if !win.is_visible().unwrap_or(false) { return; }
-            panel_log(&handle, "frontend-unresponsive", &format!("sequence={sequence}, reloading once"));
-            if let Ok(url) = main_page_url().parse() {
-                let result = win.navigate(url);
-                panel_log(&handle, "frontend-reload-result", &format!("sequence={sequence}, result={result:?}"));
-            }
+            panel_log(&handle, "frontend-unresponsive", &format!("sequence={sequence}, recreating webview"));
+            recover_unresponsive_panel(&handle, sequence);
         });
         return;
     }
@@ -2963,6 +3016,18 @@ fn attach_minimize_repaint_fix(win: &tauri::WebviewWindow) {
 
 #[cfg(not(target_os = "windows"))]
 fn attach_minimize_repaint_fix(_win: &tauri::WebviewWindow) {}
+
+/// 主窗口首次创建与故障重建共用：关闭按钮仍改为隐藏，并保留最小化恢复处理。
+fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
+    let w = win.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            hide_panel_internal(w.app_handle());
+        }
+    });
+    attach_minimize_repaint_fix(win);
+}
 
 // ---------- 入口 ----------
 
@@ -3097,14 +3162,7 @@ pub fn run() {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
-                let w = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_panel_internal(w.app_handle());
-                    }
-                });
-                attach_minimize_repaint_fix(&win);
+                attach_main_window_handlers(&win);
             }
             if let Some(win) = app.get_webview_window("settings") {
                 let w = win.clone();
