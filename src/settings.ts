@@ -8,6 +8,11 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { autoCheckEnabled, checkUpdate, resetUpdateCache, setAutoCheckEnabled, UpdateInfo } from "./updater";
 import "./styles.css";
 
+// 设置页从隐藏恢复时应答；只有卡死无应答时后端才会重建窗口。
+listen<{ sequence: number }>("settings-shown", (event) => {
+  void invoke("window_shown_ready", { label: "settings", sequence: event.payload.sequence }).catch(() => {});
+});
+
 let config: AppConfig;
 let recordingHotkey = false;
 

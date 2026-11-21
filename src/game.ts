@@ -1,6 +1,12 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { applyAppearance, applyWindowEffect, loadConfig } from "./config";
 import "./styles.css";
+
+// 台球页从隐藏恢复时应答；正常呼出不会重建或重置当前对局。
+listen<{ sequence: number }>("game-shown", (event) => {
+  void invoke("window_shown_ready", { label: "game", sequence: event.payload.sequence }).catch(() => {});
+});
 
 // 速启台球：娱乐模式，无复杂规则——全部目标球打进即结束。
 // 选项：辅助线 / 用启动列表图标做球 / 双人计分。

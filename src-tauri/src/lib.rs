@@ -31,6 +31,10 @@ static MAIN_FRONTEND_READY: AtomicBool = AtomicBool::new(false);
 /// 面板显隐操作序号与前端应答：用于识别「原生窗口已显示，但 WebView2 前端仍无响应」。
 static PANEL_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PANEL_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTINGS_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SETTINGS_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAME_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GAME_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -1840,6 +1844,22 @@ fn panel_shown_ready(app: tauri::AppHandle, sequence: u64) {
     panel_log(&app, "frontend-ack", &format!("sequence={sequence}"));
 }
 
+fn aux_sequence_pair(label: &str) -> Option<(&'static std::sync::atomic::AtomicU64, &'static std::sync::atomic::AtomicU64)> {
+    match label {
+        "settings" => Some((&SETTINGS_OPERATION_SEQUENCE, &SETTINGS_FRONTEND_ACK)),
+        "game" => Some((&GAME_OPERATION_SEQUENCE, &GAME_FRONTEND_ACK)),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+fn window_shown_ready(app: tauri::AppHandle, label: String, sequence: u64) {
+    if let Some((_, ack)) = aux_sequence_pair(&label) {
+        ack.store(sequence, Ordering::SeqCst);
+        panel_log(&app, "aux-frontend-ack", &format!("label={label}, sequence={sequence}"));
+    }
+}
+
 #[tauri::command]
 fn show_panel(app: tauri::AppHandle) {
     show_main_panel(&app);
@@ -2732,19 +2752,108 @@ fn reveal_path(path: String) -> Result<(), String> {
 
 // ---------- 窗口控制 ----------
 
+#[cfg(target_os = "windows")]
+fn recover_unresponsive_aux_window(app: &tauri::AppHandle, label: &str, sequence: u64) {
+    let Some(win) = app.get_webview_window(label) else { return };
+    let size = win.inner_size().unwrap_or_else(|_| if label == "game" {
+        tauri::PhysicalSize::new(1060, 720)
+    } else {
+        tauri::PhysicalSize::new(720, 560)
+    });
+    let position = win.outer_position().ok();
+    panel_log(app, "aux-webview-recreate-destroy", &format!("label={label}, sequence={sequence}"));
+    if let Err(error) = win.destroy() {
+        panel_log(app, "aux-webview-recreate-destroy-failed", &format!("label={label}, error={error}"));
+        app.restart();
+    }
+
+    let handle = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (effect, dark) = {
+            let state = handle.state::<ConfigState>();
+            let config = state.config.lock().unwrap();
+            (config.window_effect.clone(), config.theme != "light")
+        };
+        let (url, title, min_width, min_height) = if label == "game" {
+            ("game.html", "速启台球", 860.0, 600.0)
+        } else {
+            ("settings.html", "速启设置", 480.0, 400.0)
+        };
+        let builder = tauri::WebviewWindowBuilder::new(
+            &handle, label.clone(), tauri::WebviewUrl::App(url.into()),
+        )
+        .title(title)
+        .min_inner_size(min_width, min_height)
+        .resizable(true)
+        .visible(false);
+        match builder.build() {
+            Ok(win) => {
+                let _ = win.set_size(size);
+                if let Some(position) = position { let _ = win.set_position(position); }
+                apply_window_effect(&win, &effect, dark);
+                attach_aux_window_handlers(&win);
+                let result = win.show();
+                let _ = win.set_focus();
+                panel_log(&handle, "aux-webview-recreate-complete", &format!("label={label}, sequence={sequence}, result={result:?}"));
+            }
+            Err(error) => {
+                panel_log(&handle, "aux-webview-recreate-failed", &format!("label={label}, error={error}"));
+                handle.restart();
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn recover_unresponsive_aux_window(app: &tauri::AppHandle, label: &str, sequence: u64) {
+    if let Some(win) = app.get_webview_window(label) {
+        panel_log(app, "aux-frontend-unresponsive-reload", &format!("label={label}, sequence={sequence}"));
+        let url = if cfg!(dev) {
+            format!("http://localhost:1420/{label}.html")
+        } else {
+            format!("http://tauri.localhost/{label}.html")
+        };
+        if let Ok(url) = url.parse() { let _ = win.navigate(url); }
+    }
+}
+
+fn show_aux_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
+    let Some(win) = app.get_webview_window(label) else { return Ok(()) };
+    if win.is_visible().unwrap_or(false) { let _ = win.set_focus(); return Ok(()); }
+    let Some((operation, ack)) = aux_sequence_pair(label) else { return Ok(()) };
+    let sequence = operation.fetch_add(1, Ordering::SeqCst) + 1;
+    let event = format!("{label}-shown");
+    let _ = app.emit(&event, serde_json::json!({ "sequence": sequence }));
+    let _ = win.show();
+    let _ = win.set_focus();
+    panel_log(app, "aux-backend-show", &format!("label={label}, sequence={sequence}"));
+
+    let handle = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if operation.load(Ordering::SeqCst) != sequence || ack.load(Ordering::SeqCst) == sequence { return; }
+        let Some(win) = handle.get_webview_window(&label) else { return };
+        if !win.is_visible().unwrap_or(false) { return; }
+        panel_log(&handle, "aux-frontend-unresponsive", &format!("label={label}, sequence={sequence}"));
+        recover_unresponsive_aux_window(&handle, &label, sequence);
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> { open_settings_window_internal(&app) }
 
 fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("settings") { let _ = w.show(); let _ = w.set_focus(); }
-    Ok(())
+    show_aux_window(app, "settings")
 }
 
-/// 打开台球娱乐窗口（重复打开时聚焦已有窗口）
+/// 打开台球娱乐窗口（重复打开时聚焦已有窗口；仅前端卡死时才重建）
 #[tauri::command]
 fn open_game_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("game") { let _ = w.show(); let _ = w.set_focus(); }
-    Ok(())
+    show_aux_window(&app, "game")
 }
 
 /// 台球游戏用的启动列表图标：返回已存在的图标文件路径（自定义图标优先，否则取图标缓存），
@@ -3029,6 +3138,21 @@ fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
     attach_minimize_repaint_fix(win);
 }
 
+/// 设置与台球窗口首次创建、故障重建共用：关闭改为隐藏，并使旧的无响应检测失效。
+fn attach_aux_window_handlers(win: &tauri::WebviewWindow) {
+    let w = win.clone();
+    win.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Some((operation, _)) = aux_sequence_pair(w.label()) {
+                operation.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = w.hide();
+        }
+    });
+    attach_minimize_repaint_fix(win);
+}
+
 // ---------- 入口 ----------
 
 pub fn run() {
@@ -3101,7 +3225,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, panel_diagnostic, panel_shown_ready, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, panel_diagnostic, panel_shown_ready, window_shown_ready, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
@@ -3164,27 +3288,9 @@ pub fn run() {
                 }
                 attach_main_window_handlers(&win);
             }
-            if let Some(win) = app.get_webview_window("settings") {
-                let w = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-                attach_minimize_repaint_fix(&win);
-            }
+            if let Some(win) = app.get_webview_window("settings") { attach_aux_window_handlers(&win); }
             // 台球窗口同设置窗口：关闭按钮改为隐藏，下次打开时保留当局进度
-            if let Some(win) = app.get_webview_window("game") {
-                let w = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-                attach_minimize_repaint_fix(&win);
-            }
+            if let Some(win) = app.get_webview_window("game") { attach_aux_window_handlers(&win); }
             // 启动看门狗：页面若因开机时系统组件未就绪而加载失败（停在 WebView2 错误页，前端永远跑不起来，
             // 手动刷新也无效），检测到前端未就绪就重新导航；多次重载仍失败且为开机自启启动时，重启进程自救一次。
             {
