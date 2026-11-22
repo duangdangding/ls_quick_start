@@ -2850,9 +2850,32 @@ fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
     show_aux_window(app, "settings")
 }
 
-/// 打开台球娱乐窗口（重复打开时聚焦已有窗口；仅前端卡死时才重建）
+/// 打开台球娱乐窗口：首次点击时才创建 WebView，不再随应用启动常驻隐藏页面。
+/// 后续重复打开复用原窗口以保留对局；只有前端卡死时才重建。
 #[tauri::command]
 fn open_game_window(app: tauri::AppHandle) -> Result<(), String> {
+    if app.get_webview_window("game").is_none() {
+        let (effect, dark) = {
+            let state = app.state::<ConfigState>();
+            let config = state.config.lock().unwrap();
+            (config.window_effect.clone(), config.theme != "light")
+        };
+        let win = tauri::WebviewWindowBuilder::new(
+            &app, "game", tauri::WebviewUrl::App("game.html".into()),
+        )
+        .title("速启台球")
+        .inner_size(1060.0, 720.0)
+        .min_inner_size(860.0, 600.0)
+        .resizable(true)
+        .visible(false)
+        .build()
+        .map_err(|error| format!("创建台球窗口失败：{error}"))?;
+        apply_window_effect(&win, &effect, dark);
+        attach_aux_window_handlers(&win);
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
     show_aux_window(&app, "game")
 }
 
@@ -3098,35 +3121,8 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
     }
 }
 
-/// WebView2 已知问题：窗口最小化一段时间再恢复时，渲染器偶尔不恢复绘制（整窗白屏）。
-/// 跟踪最小化状态，从最小化恢复（尺寸由 0 变为非 0）时做 1px 尺寸抖动，强制 WebView2 控制器重排重绘。
-#[cfg(target_os = "windows")]
-fn attach_minimize_repaint_fix(win: &tauri::WebviewWindow) {
-    let minimized = std::sync::Arc::new(AtomicBool::new(false));
-    let flag = minimized.clone();
-    let w = win.clone();
-    win.on_window_event(move |event| {
-        if let tauri::WindowEvent::Resized(size) = event {
-            if size.width == 0 || size.height == 0 {
-                flag.store(true, Ordering::SeqCst);
-            } else if flag.swap(false, Ordering::SeqCst) {
-                if let Ok(cur) = w.inner_size() {
-                    let _ = w.set_size(tauri::PhysicalSize::new(cur.width + 1, cur.height));
-                    let w2 = w.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(60));
-                        let _ = w2.set_size(cur);
-                    });
-                }
-            }
-        }
-    });
-}
-
-#[cfg(not(target_os = "windows"))]
-fn attach_minimize_repaint_fix(_win: &tauri::WebviewWindow) {}
-
-/// 主窗口首次创建与故障重建共用：关闭按钮仍改为隐藏，并保留最小化恢复处理。
+/// 主窗口首次创建与故障重建共用：关闭按钮改为隐藏。
+/// 与 0.18 稳定版一致，显隐只操作原生窗口，不再做尺寸抖动或干预 WebView2 控制器。
 fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
     let w = win.clone();
     win.on_window_event(move |event| {
@@ -3135,7 +3131,6 @@ fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
             hide_panel_internal(w.app_handle());
         }
     });
-    attach_minimize_repaint_fix(win);
 }
 
 /// 设置与台球窗口首次创建、故障重建共用：关闭改为隐藏，并使旧的无响应检测失效。
@@ -3150,7 +3145,6 @@ fn attach_aux_window_handlers(win: &tauri::WebviewWindow) {
             let _ = w.hide();
         }
     });
-    attach_minimize_repaint_fix(win);
 }
 
 // ---------- 入口 ----------
@@ -3199,8 +3193,12 @@ pub fn run() {
     let window_effect_cfg = config.window_effect.clone();
 
     tauri::Builder::default()
-        // 单实例插件必须最先注册：重复启动时新进程直接退出，并在已运行的实例里提示
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // 单实例插件必须最先注册：重复启动时新进程直接退出，并在已运行的实例里提示。
+        // Windows 登录时可能同时恢复上次应用并执行开机自启项，此时静默忽略自启副本，避免误报。
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == "--autostart") {
+                return;
+            }
             app.dialog()
                 .message("速启已在运行，请从系统托盘或全局快捷键呼出面板。")
                 .title("速启")
