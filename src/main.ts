@@ -865,14 +865,14 @@ window.addEventListener("keydown", (event) => {
 void load().then(() => diagnostic("initial-load-complete", {
   readyState: document.readyState, appChildren: app.childElementCount, shell: !!document.querySelector(".shell"),
 })).catch((error) => diagnostic("initial-load-failed", String(error)));
-// 面板重新显示时同步后端解锁状态：选择「每次打开面板都需输入密码」时，隐藏即上锁，重开需重新输入
-// 「重新打开面板时清空搜索框」开启时（默认），清空上次的搜索词，从全部条目重新开始；关闭则保留
+// 普通显隐复用现有 DOM，不重新拉取数据或重建列表；新增、编辑、删除、导入等数据操作会主动 load()
+// 「重新打开面板时清空搜索框」开启时（默认），仅在搜索状态确有变化时用现有数据重绘
 listen<{ sequence: number }>("panel-shown", (event) => {
-  if (appConfig?.clearSearchOnReopen !== false) {
+  const resetSearch = appConfig?.clearSearchOnReopen !== false && (query !== "" || searchSelection !== null || selected !== 0);
+  if (resetSearch) {
     query = "";
     searchSelection = null;
     selected = 0;
-    // 立即用现有数据重绘：不等 load() 的 IPC 往返，避免面板显示后仍残留旧搜索词（感知延迟）
     render();
   }
   if (event.payload.sequence > 0) {
@@ -882,8 +882,11 @@ listen<{ sequence: number }>("panel-shown", (event) => {
     readyState: document.readyState, visibility: document.visibilityState, appChildren: app.childElementCount,
     shell: !!document.querySelector(".shell"), width: document.body.scrollWidth, height: document.body.scrollHeight,
   });
-  void load().then(() => diagnostic("panel-load-complete", { appChildren: app.childElementCount }))
-    .catch((error) => diagnostic("panel-load-failed", String(error)));
+  // 「每次打开面板都需输入密码」会在后端隐藏时上锁，只有这种安全状态变化才需要重新加载
+  if (appConfig?.encryptUnlockMode === "always" && unlocked) {
+    void load().then(() => diagnostic("panel-load-complete", { appChildren: app.childElementCount }))
+      .catch((error) => diagnostic("panel-load-failed", String(error)));
+  }
 });
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
 document.addEventListener("click", (event) => {
