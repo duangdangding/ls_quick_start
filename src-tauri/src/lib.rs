@@ -3013,6 +3013,11 @@ fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
 /// 正常显隐不重载。正常前端应答通常在 50ms 内；超过 300ms 未应答才认定 WebView2 卡住并重建。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
+    // Win+D / 显示桌面会最小化窗口，但 is_visible 仍为 true；必须先还原，再聚焦，不能只 show / focus
+    if win.is_minimized().unwrap_or(false) {
+        let result = win.unminimize();
+        panel_log(app, "backend-unminimize", &format!("result={result:?}"));
+    }
     if !win.is_visible().unwrap_or(false) {
         let sequence = PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
         panel_log(app, "backend-show-before", &format!("sequence={sequence}"));
@@ -3033,12 +3038,15 @@ fn show_main_panel(app: &tauri::AppHandle) {
         });
         return;
     }
+    let _ = win.set_focus();
     let _ = app.emit("panel-shown", serde_json::json!({ "sequence": 0 }));
 }
 
 fn toggle_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) {
+        let visible = win.is_visible().unwrap_or(false);
+        let minimized = win.is_minimized().unwrap_or(false);
+        if visible && !minimized {
             // 面板已显示但被其他窗口盖住（未聚焦）时，按配置决定置前还是隐藏
             let focused = win.is_focused().unwrap_or(true);
             let behavior = app.try_state::<ConfigState>()
@@ -3051,6 +3059,7 @@ fn toggle_window(app: &tauri::AppHandle) {
                 hide_panel_internal(app);
             }
         } else {
+            // 隐藏或最小化都视为需要重新显示，避免 Win+D 后误走隐藏 / 单纯聚焦分支
             show_main_panel(app);
         }
     }
@@ -3060,7 +3069,9 @@ fn toggle_window(app: &tauri::AppHandle) {
 /// 不能复用热键的「未聚焦时置前」策略，否则可见面板第一次点击只会重新聚焦而不隐藏。
 fn toggle_tray_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) { hide_panel_internal(app); }
+        let visible = win.is_visible().unwrap_or(false);
+        let minimized = win.is_minimized().unwrap_or(false);
+        if visible && !minimized { hide_panel_internal(app); }
         else { show_main_panel(app); }
     }
 }
