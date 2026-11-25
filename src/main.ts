@@ -888,6 +888,10 @@ listen<{ sequence: number }>("panel-shown", (event) => {
       .catch((error) => diagnostic("panel-load-failed", String(error)));
   }
 });
+// 可见面板的渲染健康检查：只应答，不重置搜索、不拉取数据，也不重绘 DOM
+listen<{ sequence: number }>("panel-health-check", (event) => {
+  void invoke("panel_health_ready", { sequence: event.payload.sequence }).catch(() => {});
+});
 // 条目「⋯」菜单：点击菜单外任意位置即关闭（「⋯」按钮自身已 stopPropagation，不影响刚打开的菜单）
 document.addEventListener("click", (event) => {
   if ((event.target as HTMLElement).closest(".menu")) return;

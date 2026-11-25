@@ -1852,7 +1852,7 @@ fn panel_diagnostic(state: State<'_, ConfigState>, stage: String, detail: String
 
 #[tauri::command]
 fn panel_shown_ready(app: tauri::AppHandle, sequence: u64) {
-    PANEL_FRONTEND_ACK.store(sequence, Ordering::SeqCst);
+    PANEL_FRONTEND_ACK.fetch_max(sequence, Ordering::SeqCst);
     panel_log(&app, "frontend-ack", &format!("sequence={sequence}"));
 }
 
@@ -3149,7 +3149,49 @@ fn attach_aux_window_handlers(win: &tauri::WebviewWindow) {
 
 // ---------- 入口 ----------
 
+/// WebView2 在窗口长期隐藏或被遮挡时可能降低渲染器优先级，导致再次显示只剩空白帧。
+/// 保留用户已有的浏览器参数，只补充缺失的后台抑制开关。
+#[cfg(windows)]
+fn configure_webview2_renderer() {
+    const FLAGS: [&str; 3] = ["--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"];
+    let current = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+    let missing = FLAGS.iter().filter(|flag| !current.split_whitespace().any(|value| value == **flag)).copied().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let args = if current.trim().is_empty() { missing.join(" ") } else { format!("{} {}", current.trim(), missing.join(" ")) };
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+    }
+}
+
+/// 可见主面板的轻量心跳：窗口长期保持可见时，渲染器也可能失效，不能只在 hide/show 时检查。
+/// 心跳事件只应答，不触发搜索重置或 DOM 重绘；隐藏 / 最小化时完全跳过。
+fn monitor_main_panel_health(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let Some(win) = app.get_webview_window("main") else { continue };
+        if !win.is_visible().unwrap_or(false) || win.is_minimized().unwrap_or(false) { continue; }
+        let sequence = PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+        if app.emit("panel-health-check", serde_json::json!({ "sequence": sequence })).is_err() { continue; }
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if PANEL_OPERATION_SEQUENCE.load(Ordering::SeqCst) != sequence
+                || PANEL_FRONTEND_ACK.load(Ordering::SeqCst) == sequence { return; }
+            let Some(win) = handle.get_webview_window("main") else { return };
+            if !win.is_visible().unwrap_or(false) || win.is_minimized().unwrap_or(false) { return; }
+            panel_log(&handle, "frontend-health-check-failed", &format!("sequence={sequence}, recreating webview"));
+            recover_unresponsive_panel(&handle, sequence);
+        });
+    });
+}
+
+#[tauri::command]
+fn panel_health_ready(sequence: u64) {
+    PANEL_FRONTEND_ACK.fetch_max(sequence, Ordering::SeqCst);
+}
+
 pub fn run() {
+    #[cfg(windows)]
+    configure_webview2_renderer();
     apply_proxy_env(&load_config());
     #[cfg(windows)]
     {
@@ -3223,7 +3265,7 @@ pub fn run() {
             list_data, searchable_items, save_item, delete_item, delete_items, move_items, open_item, create_group, rename_group,
             delete_group, save_group_order, save_item_order, unlock_encrypted, lock_encrypted, reset_password, clear_encrypted, scan_desktop, scan_folder, scan_start_menu,
             import_scanned, delete_shortcut_files, export_items, item_icons, prepare_dropped, get_config, save_config, get_db_info, run_target,
-            show_panel, hide_panel, panel_diagnostic, panel_shown_ready, window_shown_ready, set_panel_pinned, get_panel_pinned, set_window_effect,
+            show_panel, hide_panel, panel_diagnostic, panel_shown_ready, panel_health_ready, window_shown_ready, set_panel_pinned, get_panel_pinned, set_window_effect,
             get_config_dir, get_db_dir, set_data_dirs,
             import_background_source, read_background_source, save_background_cache,
             get_background_cache, set_background_config, clear_background_image,
@@ -3289,6 +3331,7 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("settings") { attach_aux_window_handlers(&win); }
             // 台球窗口同设置窗口：关闭按钮改为隐藏，下次打开时保留当局进度
             if let Some(win) = app.get_webview_window("game") { attach_aux_window_handlers(&win); }
+            monitor_main_panel_health(app.handle().clone());
             // 启动看门狗：页面若因开机时系统组件未就绪而加载失败（停在 WebView2 错误页，前端永远跑不起来，
             // 手动刷新也无效），检测到前端未就绪就重新导航；多次重载仍失败且为开机自启启动时，重启进程自救一次。
             {
