@@ -2862,9 +2862,34 @@ fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
     show_aux_window(app, "settings")
 }
 
-/// 打开台球娱乐窗口（重复打开时聚焦已有窗口；仅前端卡死时才重建）
+/// 打开台球娱乐窗口：首次点击时才创建，避免常驻的隐藏画布影响其他 WebView。
+/// 后续打开复用原窗口并保留当局进度；仅前端卡死时才重建。
 #[tauri::command]
 fn open_game_window(app: tauri::AppHandle) -> Result<(), String> {
+    if app.get_webview_window("game").is_none() {
+        let (effect, dark) = {
+            let state = app.state::<ConfigState>();
+            let config = state.config.lock().unwrap();
+            (config.window_effect.clone(), config.theme != "light")
+        };
+        let win = tauri::WebviewWindowBuilder::new(
+            &app, "game", tauri::WebviewUrl::App("game.html".into()),
+        )
+        .title("速启台球")
+        .inner_size(1060.0, 720.0)
+        .min_inner_size(860.0, 600.0)
+        .resizable(true)
+        .visible(false)
+        .build()
+        .map_err(|e| format!("创建台球窗口失败: {e}"))?;
+        apply_window_effect(&win, &effect, dark);
+        attach_aux_window_handlers(&win);
+        // 首次页面尚未加载，不能发送需要前端应答的 game-shown，否则会被误判为卡死并立即重建。
+        win.show().map_err(|e| format!("显示台球窗口失败: {e}"))?;
+        let _ = win.set_focus();
+        panel_log(&app, "aux-initial-show", "label=game");
+        return Ok(());
+    }
     show_aux_window(&app, "game")
 }
 

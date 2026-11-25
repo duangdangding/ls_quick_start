@@ -551,13 +551,29 @@ function draw() {
 
 // ---------- 主循环 ----------
 let lastTime = performance.now();
+let animationFrame: number | null = null;
 function tick(now: number) {
+  animationFrame = null;
+  if (document.hidden) return;
   const dt = Math.min(0.05, (now - lastTime) / 1000);
   lastTime = now;
   step(dt);
   draw();
-  requestAnimationFrame(tick);
+  animationFrame = requestAnimationFrame(tick);
 }
+/** 隐藏时彻底停帧；恢复可见时重置计时，避免把隐藏时长算成一帧。 */
+function syncAnimationFrame() {
+  if (document.hidden) {
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    return;
+  }
+  if (animationFrame === null) {
+    lastTime = performance.now();
+    animationFrame = requestAnimationFrame(tick);
+  }
+}
+document.addEventListener("visibilitychange", syncAnimationFrame);
 
 // ---------- 交互 ----------
 function toPlayCoords(event: MouseEvent): [number, number] {
@@ -652,4 +668,4 @@ resize();
 // draw() 里取不到白球会直接抛错，渲染循环在第一帧就永久停掉（只剩台面，没有球也没有球杆）
 newRack();
 void loadIconsAsync();
-requestAnimationFrame(tick);
+syncAnimationFrame();
