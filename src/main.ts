@@ -26,7 +26,7 @@ type ImportResult = { added: number; skippedDuplicates: number; skippedInvalid: 
 type DeleteShortcutsResult = { deleted: number; failures: ImportSkip[] };
 type ExportResult = { exported: number; skipped: ImportSkip[]; failures: ImportSkip[]; dir: string };
 type ItemIcon = { id: string; iconPath: string | null };
-type DropDraft = { name: string; target: string; iconPath: string | null };
+type DropDraft = { name: string; target: string; iconPath: string | null; lnkPath: string | null };
 
 const encryptedId = "__encrypted__";
 let items: Item[] = [];
@@ -425,7 +425,7 @@ function openItemDialog(item?: Item, draft?: DropDraft) { const prefill = item ?
   const syncFetchMetaBtn = () => { fetchMetaBtn.hidden = kind.value === "cmd" || !isWebTarget(targetInput.value.trim()); };
   targetInput.addEventListener("input", syncFetchMetaBtn); kind.addEventListener("change", syncFetchMetaBtn); syncFetchMetaBtn();
   fetchMetaBtn.onclick = async () => { fetchMetaBtn.disabled = true; fetchMetaBtn.textContent = "获取中…"; try { const url = normalizeWebTarget(targetInput.value.trim()); const meta = await invoke<{ title: string | null; description: string | null; iconPath: string | null }>("fetch_url_meta", { url }); targetInput.value = url; let filled = false; if (meta.title) { (form.elements.namedItem("name") as HTMLInputElement).value = meta.title; filled = true; } if (meta.description) { (form.elements.namedItem("description") as HTMLInputElement).value = meta.description; filled = true; } if (meta.iconPath) { (form.elements.namedItem("icon") as HTMLInputElement).value = meta.iconPath; filled = true; } if (!filled) message("未获取到网站信息"); } catch (error) { message(error); } finally { fetchMetaBtn.disabled = false; fetchMetaBtn.textContent = "获取网站信息"; } };
-  form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", description: values.get("description") ?? "", target: values.get("target"), groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, lnkPath: item?.lnkPath ?? null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
+  form.onsubmit = async (event) => { event.preventDefault(); const values = new FormData(form); try { const target = String(values.get("target") ?? ""); const saveTarget = kind.value !== "cmd" && draft?.lnkPath && target === draft.target ? draft.lnkPath : target; await invoke("save_item", { item: { id: item?.id ?? "", name: values.get("name"), keyword: values.get("keyword") ?? "", description: values.get("description") ?? "", target: saveTarget, groupId: values.get("group") || null, isEncrypted: false, isCmd: kind.value === "cmd", iconPath: values.get("icon") || null, lnkPath: item?.lnkPath ?? null, sortOrder: item?.sortOrder ?? 0, createdAt: item?.createdAt ?? 0 }, isCmd: kind.value === "cmd" }); node.remove(); await load(); } catch (error) { message(error); } };
   // 拖拽批量添加：弹窗关闭（保存或取消）后自动打开下一个草稿
   if (draft) { const observer = new MutationObserver(() => { if (!node.isConnected) { observer.disconnect(); openNextDropDraft(); } }); observer.observe(document.body, { childList: true }); }
 }

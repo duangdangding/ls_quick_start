@@ -1466,7 +1466,7 @@ fn delete_shortcut_files(data: State<'_, AppData>, paths: Vec<String>) -> Result
 /// 拖拽到面板的文件 / 文件夹 / 快捷方式 / 网址文件，解析为「添加启动项」弹窗的草稿
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DropDraft { name: String, target: String, icon_path: Option<String> }
+struct DropDraft { name: String, target: String, icon_path: Option<String>, lnk_path: Option<String> }
 
 /// 解析 .url 网址文件（INI 格式，取 URL= 行）
 fn read_url_shortcut(path: &Path) -> Option<String> {
@@ -1478,27 +1478,39 @@ fn read_url_shortcut(path: &Path) -> Option<String> {
 fn prepare_dropped(paths: Vec<String>) -> Vec<DropDraft> {
     let icon_dir = default_data_dir().join("scan-icons");
     let _ = fs::create_dir_all(&icon_dir);
+    let dropped: Vec<(String, PathBuf)> = paths.into_iter().filter_map(|raw| {
+        let path = PathBuf::from(&raw);
+        path.exists().then_some((raw, path))
+    }).collect();
+    // 与扫描导入一致，批量解析快捷方式，让添加弹窗直接显示真实目标
+    let shortcut_paths: Vec<PathBuf> = dropped.iter().filter(|(_, path)| path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"))).map(|(_, path)| path.clone()).collect();
+    let shortcut_targets = resolve_shortcuts(&shortcut_paths);
+    let mut shortcut_index = 0;
     let mut drafts: Vec<(DropDraft, PathBuf)> = Vec::new();
     let mut icon_pairs = Vec::new();
-    for raw in paths {
-        let path = PathBuf::from(&raw);
-        if !path.exists() { continue; }
+    for (raw, path) in dropped {
         // macOS 的 .app 应用包是目录，名称取 stem；普通目录取完整目录名，避免目录名中的 . 被当作扩展名截断
         let is_app_bundle = cfg!(target_os = "macos") && path.extension().is_some_and(|x| x.eq_ignore_ascii_case("app"));
         let name = if path.is_dir() && !is_app_bundle { path.file_name() } else { path.file_stem() }
             .map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| raw.clone());
-        // .url 网址文件解析出真实 URL；其余以路径本身为目标——.lnk 交给 save_item 的
-        // normalize_target / resolve_lnk_path 处理，从而保留快捷方式来源（目标+参数+工作目录）
-        let target = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("url")) {
-            match read_url_shortcut(&path) { Some(url) => url, None => continue }
+        let source_path = display_path(path.display().to_string());
+        let is_lnk = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk"));
+        // .url 与 .lnk 都在生成草稿时解析真实目标；同时保留原始 .lnk，保存后仍由 Shell 还原参数与工作目录
+        let (target, lnk_path) = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("url")) {
+            match read_url_shortcut(&path) { Some(url) => (url, None), None => continue }
+        } else if is_lnk {
+            let resolved = shortcut_targets.get(shortcut_index).cloned().unwrap_or_default();
+            shortcut_index += 1;
+            let target = normalize_target(&resolved, false).unwrap_or_else(|_| source_path.clone());
+            (target, Some(source_path))
         } else {
-            display_path(path.display().to_string())
+            (source_path, None)
         };
         // 图标文件名规则与 scan_dir 一致（来源路径的 sha256），已缓存则复用
         let mut hasher = Sha256::new(); hasher.update(raw.as_bytes());
         let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
         if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
-        drafts.push((DropDraft { name, target, icon_path: None }, icon_file));
+        drafts.push((DropDraft { name, target, icon_path: None, lnk_path }, icon_file));
     }
     extract_icons(&icon_pairs);
     drafts.into_iter().map(|(mut draft, icon_file)| {
