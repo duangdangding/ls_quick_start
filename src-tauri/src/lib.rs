@@ -2864,7 +2864,8 @@ fn open_settings_window_internal(app: &tauri::AppHandle) -> Result<(), String> {
 
 /// 打开台球娱乐窗口：首次点击时才创建，避免常驻的隐藏画布影响其他 WebView。
 /// 后续打开复用原窗口并保留当局进度；仅前端卡死时才重建。
-#[tauri::command]
+/// Windows 的同步命令中创建 WebView 会与主线程相互等待，必须放到异步运行时。
+#[tauri::command(async)]
 fn open_game_window(app: tauri::AppHandle) -> Result<(), String> {
     if app.get_webview_window("game").is_none() {
         let (effect, dark) = {
