@@ -3048,6 +3048,16 @@ fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
     }
 }
 
+/// 在销毁失活的 WebView2 前保存原生侧现场；此时不能再依赖已经无应答的前端补日志。
+fn log_unresponsive_panel_state(app: &tauri::AppHandle, sequence: u64) {
+    let Some(win) = app.get_webview_window("main") else { return };
+    panel_log(app, "frontend-unresponsive-state", &format!(
+        "sequence={sequence}, url={:?}, visible={:?}, minimized={:?}, focused={:?}, inner_size={:?}, position={:?}, last_ack={}",
+        win.url(), win.is_visible(), win.is_minimized(), win.is_focused(), win.inner_size(), win.outer_position(),
+        PANEL_FRONTEND_ACK.load(Ordering::SeqCst),
+    ));
+}
+
 /// 正常显隐不重载。正常前端应答通常在 50ms 内；超过 300ms 未应答才认定 WebView2 卡住并重建。
 fn show_main_panel(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("main") else { return };
@@ -3072,6 +3082,7 @@ fn show_main_panel(app: &tauri::AppHandle) {
             let Some(win) = handle.get_webview_window("main") else { return };
             if !win.is_visible().unwrap_or(false) { return; }
             panel_log(&handle, "frontend-unresponsive", &format!("sequence={sequence}, recreating webview"));
+            log_unresponsive_panel_state(&handle, sequence);
             recover_unresponsive_panel(&handle, sequence);
         });
         return;
@@ -3205,6 +3216,7 @@ fn monitor_main_panel_health(app: tauri::AppHandle) {
             let Some(win) = handle.get_webview_window("main") else { return };
             if !win.is_visible().unwrap_or(false) || win.is_minimized().unwrap_or(false) { return; }
             panel_log(&handle, "frontend-health-check-failed", &format!("sequence={sequence}, recreating webview"));
+            log_unresponsive_panel_state(&handle, sequence);
             recover_unresponsive_panel(&handle, sequence);
         });
     });

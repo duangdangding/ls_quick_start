@@ -862,9 +862,18 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && shown[selected]) { event.preventDefault(); void openItem(shown[selected].id); }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && shown.length) { event.preventDefault(); const width = arrowColumns(); const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -width : width; selected = (selected + delta + shown.length) % shown.length; render(true); }
 });
-void load().then(() => diagnostic("initial-load-complete", {
-  readyState: document.readyState, appChildren: app.childElementCount, shell: !!document.querySelector(".shell"),
-})).catch((error) => diagnostic("initial-load-failed", String(error)));
+// 自动恢复前的现场追查：保留最后一次生命周期事件；渲染器失活后不再依赖它补充日志。
+function panelLifecycleDiagnostic(stage: string) {
+  diagnostic(stage, {
+    href: location.href, readyState: document.readyState, visibility: document.visibilityState,
+    focused: document.hasFocus(), appChildren: app.childElementCount, shell: !!document.querySelector(".shell"),
+    width: document.body.scrollWidth, height: document.body.scrollHeight, performanceMs: Math.round(performance.now()),
+  });
+}
+for (const type of ["pagehide", "pageshow"]) window.addEventListener(type, () => panelLifecycleDiagnostic(`frontend-${type}`));
+for (const type of ["visibilitychange", "freeze", "resume"]) document.addEventListener(type, () => panelLifecycleDiagnostic(`frontend-${type}`));
+void load().then(() => panelLifecycleDiagnostic("initial-load-complete"))
+  .catch((error) => diagnostic("initial-load-failed", String(error)));
 // 普通显隐复用现有 DOM，不重新拉取数据或重建列表；新增、编辑、删除、导入等数据操作会主动 load()
 // 「重新打开面板时清空搜索框」开启时（默认），仅在搜索状态确有变化时用现有数据重绘
 listen<{ sequence: number }>("panel-shown", (event) => {
@@ -878,10 +887,7 @@ listen<{ sequence: number }>("panel-shown", (event) => {
   if (event.payload.sequence > 0) {
     void invoke("panel_shown_ready", { sequence: event.payload.sequence }).catch(() => {});
   }
-  diagnostic("frontend-panel-shown", {
-    readyState: document.readyState, visibility: document.visibilityState, appChildren: app.childElementCount,
-    shell: !!document.querySelector(".shell"), width: document.body.scrollWidth, height: document.body.scrollHeight,
-  });
+  panelLifecycleDiagnostic("frontend-panel-shown");
   // 「每次打开面板都需输入密码」会在后端隐藏时上锁，只有这种安全状态变化才需要重新加载
   if (appConfig?.encryptUnlockMode === "always" && unlocked) {
     void load().then(() => diagnostic("panel-load-complete", { appChildren: app.childElementCount }))
