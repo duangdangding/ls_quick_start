@@ -1302,7 +1302,18 @@ fn append_desktop_shell_entries(entries: &mut Vec<DesktopEntry>) {
 #[tauri::command]
 async fn scan_desktop(recursive: Option<bool>) -> Result<Vec<DesktopEntry>, String> {
     let desktop = dirs::desktop_dir().or_else(|| dirs::home_dir().map(|p| p.join("Desktop"))).ok_or("无法定位桌面目录")?;
-    let mut entries = scan_dir(&desktop, recursive.unwrap_or(false))?;
+    let mut desktops = vec![desktop];
+    // Windows 桌面会合并显示当前用户与公共桌面；安装程序常为所有用户把快捷方式放进公共桌面，不能只扫前者
+    #[cfg(windows)]
+    if let Some(public_desktop) = dirs::public_dir().map(|path| path.join("Desktop")) {
+        if public_desktop.is_dir() { desktops.push(public_desktop); }
+    }
+    let recursive = recursive.unwrap_or(false);
+    let mut entries = Vec::new();
+    for desktop in desktops { entries.append(&mut scan_dir(&desktop, recursive)?); }
+    // 两个桌面来源路径不同时都保留；同一目录被重复加入时按来源路径去重
+    let mut seen = HashSet::new();
+    entries.retain(|entry| seen.insert(entry.source_path.to_lowercase()));
     // Windows 下把显示在桌面的系统图标（此电脑 / 回收站等虚拟对象）一并并入，再统一排序
     #[cfg(windows)]
     append_desktop_shell_entries(&mut entries);
