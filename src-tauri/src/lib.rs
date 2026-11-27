@@ -443,6 +443,12 @@ fn resolve_lnk(path: &Path) -> String {
 fn display_path(value: impl AsRef<str>) -> String {
     value.as_ref().strip_prefix(r"\\?\").unwrap_or(value.as_ref()).to_string()
 }
+/// 图标缓存路径。macOS 文件夹改用 NSWorkspace 后使用新缓存版本，避免继续显示旧的文档 / 空白 PNG。
+fn icon_cache_path(dir: &Path, key: &str, _input: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if _input.is_dir() && !is_app_bundle(_input) { return dir.join(format!("{key}.folder-v2.png")); }
+    dir.join(format!("{key}.png"))
+}
 /// Windows 下以「无窗口」方式启动子进程，避免 powershell / cmd 等控制台程序闪现黑窗
 #[cfg(windows)]
 fn hide_console(command: &mut Command) {
@@ -614,9 +620,40 @@ fn copy_generic_icon(source: &Path, outputs: &[&PathBuf]) {
     }
     if let Some(temp) = cached { let _ = fs::remove_file(temp); }
 }
+/// macOS 文件夹直接取 NSWorkspace 的访达实际图标：兼容自定义图标，也避免部分系统上
+/// sips 无法转换 GenericFolderIcon.icns、随后误落为文档图标的问题。批量脚本只调用一次 osascript。
+#[cfg(target_os = "macos")]
+fn workspace_folder_icons(pairs: &[(PathBuf, PathBuf)]) {
+    if pairs.is_empty() { return; }
+    let values: Vec<(String, String)> = pairs.iter().map(|(input, output)| {
+        (input.display().to_string(), output.display().to_string())
+    }).collect();
+    let Ok(values) = serde_json::to_string(&values) else { return; };
+    let script = format!(r#"ObjC.import('AppKit');
+const pairs = {values};
+for (const [input, output] of pairs) {{
+  try {{
+    const image = $.NSWorkspace.sharedWorkspace.iconForFile(input);
+    if (!image) continue;
+    image.size = $.NSMakeSize(128, 128);
+    const tiff = image.TIFFRepresentation;
+    if (!tiff) continue;
+    const bitmap = $.NSBitmapImageRep.imageRepWithData(tiff);
+    if (!bitmap) continue;
+    const png = bitmap.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+    if (png) png.writeToFileAtomically(output, true);
+  }} catch (_) {{}}
+}}"#);
+    let script_file = std::env::temp_dir().join(format!("suqi-folder-icons-{}-{}.js", std::process::id(), now()));
+    if fs::write(&script_file, script).is_err() { return; }
+    let mut command = Command::new("osascript");
+    command.args(["-l", "JavaScript"]).arg(&script_file);
+    run_with_timeout(&mut command, std::time::Duration::from_secs(30));
+    let _ = fs::remove_file(&script_file);
+}
 /// macOS 图标提取：
 /// 1. `.app` 应用包：直接读包内 `.icns`（优先 AppIcon.icns）用 sips 转 128px PNG，并发执行；
-/// 2. 仍缺图标的应用包 / 文件夹：用系统 CoreTypes.bundle 里的通用图标兜底；
+/// 2. 文件夹：通过 NSWorkspace 取访达实际图标，仍缺图标的应用包 / 文件夹再用系统通用图标兜底；
 /// 3. 普通文件：图片类直接用 sips 转缩略图，其余用系统通用文档图标兜底。
 ///    全程不用 qlmanage —— 它对部分文件会直接崩溃，导致系统反复弹「“qlmanage”意外退出」
 #[cfg(target_os = "macos")]
@@ -638,11 +675,15 @@ fn extract_icons(pairs: &[(PathBuf, PathBuf)]) {
             }
         });
     }
-    // 2) 通用图标兜底：仍缺图标的应用包 / 文件夹
+    // 2) 文件夹优先取访达实际图标；应用包 / 文件夹的失败项再用系统通用图标兜底
     let app_outputs: Vec<&PathBuf> = pairs.iter().filter(|(input, output)| !output.exists() && is_app_bundle(input)).map(|(_, output)| output).collect();
     if !app_outputs.is_empty() {
         if let Some(source) = system_icon_icns("GenericApplicationIcon.icns") { copy_generic_icon(&source, &app_outputs); }
     }
+    let folder_pairs: Vec<(PathBuf, PathBuf)> = pairs.iter()
+        .filter(|(input, output)| !output.exists() && !is_app_bundle(input) && input.is_dir())
+        .map(|(input, output)| (input.clone(), output.clone())).collect();
+    workspace_folder_icons(&folder_pairs);
     let folder_outputs: Vec<&PathBuf> = pairs.iter().filter(|(input, output)| !output.exists() && !is_app_bundle(input) && input.is_dir()).map(|(_, output)| output).collect();
     if !folder_outputs.is_empty() {
         if let Some(source) = system_icon_icns("GenericFolderIcon.icns") { copy_generic_icon(&source, &folder_outputs); }
@@ -1141,7 +1182,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
                 .map(|relative| relative.components().map(|part| part.as_os_str().to_string_lossy().to_string()).collect())
                 .unwrap_or_default();
             let mut hasher = Sha256::new(); hasher.update(source_path.as_bytes());
-            let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
+            let icon_file = icon_cache_path(&icon_dir, &hex::encode(hasher.finalize()), &path);
             if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
             // macOS 应用包优先用本地化显示名（如「微信」而非「WeChat」），其余条目用文件名
             let fallback = || path.file_stem().or_else(|| path.file_name()).unwrap_or_default().to_string_lossy().into();
@@ -1164,7 +1205,7 @@ fn scan_dir(dir: &Path, recursive: bool) -> Result<Vec<DesktopEntry>, String> {
     extract_icons(&icon_pairs);
     for entry in &mut entries {
         let mut hasher = Sha256::new(); hasher.update(entry.source_path.as_bytes());
-        let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
+        let icon_file = icon_cache_path(&icon_dir, &hex::encode(hasher.finalize()), Path::new(&entry.source_path));
         entry.scan_icon_path = icon_file.exists().then(|| display_path(icon_file.display().to_string()));
     }
     sort_scan_entries(&mut entries);
@@ -1525,7 +1566,7 @@ fn prepare_dropped(paths: Vec<String>) -> Vec<DropDraft> {
         };
         // 图标文件名规则与 scan_dir 一致（来源路径的 sha256），已缓存则复用
         let mut hasher = Sha256::new(); hasher.update(raw.as_bytes());
-        let icon_file = icon_dir.join(format!("{}.png", hex::encode(hasher.finalize())));
+        let icon_file = icon_cache_path(&icon_dir, &hex::encode(hasher.finalize()), &path);
         if !icon_file.exists() { icon_pairs.push((path.clone(), icon_file.clone())); }
         drafts.push((DropDraft { name, target, icon_path: None, lnk_path }, icon_file));
     }
@@ -1787,7 +1828,7 @@ async fn export_items(data: State<'_, AppData>, request: ExportRequest) -> Resul
 }
 
 /// 补齐缺失的条目图标。声明为 async + spawn_blocking：图标提取要调用外部命令
-/// （Windows PowerShell / macOS sips），同步命令会在主线程执行导致界面卡死（导入后刷新图标时尤其明显）。
+/// （Windows PowerShell / macOS sips、osascript），同步命令会在主线程执行导致界面卡死（导入后刷新图标时尤其明显）。
 #[tauri::command]
 async fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> Result<Vec<ItemIcon>, String> {
     let items = data.store.lock().unwrap().items.clone();
@@ -1796,15 +1837,25 @@ async fn item_icons(data: State<'_, AppData>, state: State<'_, ConfigState>) -> 
     #[cfg(any(windows, target_os = "macos"))]
     {
         let pairs = items.iter().filter_map(|item| {
-            if item.icon_path.is_some() || item.is_cmd || is_url(&item.target) { return None; }
-            let output = cache_dir.join(format!("{}.png", item.id));
-            (!output.exists()).then(|| (PathBuf::from(&item.target), output))
+            let input = PathBuf::from(&item.target);
+            let macos_folder = cfg!(target_os = "macos") && input.is_dir() && !input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+            // macOS 文件夹即使用户旧数据已记录 icon_path，也切换到新版缓存，防止继续显示错误图标
+            if (item.icon_path.is_some() && !macos_folder) || item.is_cmd || is_url(&item.target) { return None; }
+            let output = icon_cache_path(&cache_dir, &item.id, &input);
+            (!output.exists()).then_some((input, output))
         }).collect::<Vec<_>>();
         let _ = tauri::async_runtime::spawn_blocking(move || extract_icons(&pairs)).await;
     }
     let icons = items.into_iter().map(|item| {
-        let cached = cache_dir.join(format!("{}.png", item.id));
-        ItemIcon { id: item.id, icon_path: item.icon_path.or_else(|| cached.exists().then(|| display_path(cached.display().to_string()))) }
+        let input = PathBuf::from(&item.target);
+        let cached = icon_cache_path(&cache_dir, &item.id, &input);
+        let macos_folder = cfg!(target_os = "macos") && input.is_dir() && !input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+        let icon_path = if macos_folder {
+            cached.exists().then(|| display_path(cached.display().to_string()))
+        } else {
+            item.icon_path.or_else(|| cached.exists().then(|| display_path(cached.display().to_string())))
+        };
+        ItemIcon { id: item.id, icon_path }
     }).collect();
     Ok(icons)
 }
