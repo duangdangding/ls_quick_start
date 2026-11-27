@@ -1,21 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 
-// Windows WebView2 隐藏后可能把整个渲染器挂起，且不一定派发 freeze / visibilitychange。
-// 每个页面持有独立 WebLock，阻止后台休眠；没有定时器或持续 CPU 工作，页面销毁时锁自动释放。
-if (navigator.platform.toUpperCase().includes("WIN")) {
-  const detail = location.pathname;
-  if ("locks" in navigator) {
-    void navigator.locks.request(`suqi-renderer-${detail}`, () => {
-      void invoke("panel_diagnostic", { stage: "renderer-lock-acquired", detail }).catch(() => {});
-      return new Promise<never>(() => {});
-    }).catch(() => {
-      void invoke("panel_diagnostic", { stage: "renderer-lock-failed", detail }).catch(() => {});
-    });
-  } else {
-    void invoke("panel_diagnostic", { stage: "renderer-lock-unavailable", detail }).catch(() => {});
-  }
-}
-
 /** 背景图选区：归一化坐标（0-1），相对于旋转后的源图 */
 export interface BgRegion { x: number; y: number; w: number; h: number }
 

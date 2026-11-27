@@ -35,6 +35,12 @@ static SETTINGS_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::at
 static SETTINGS_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GAME_OPERATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GAME_FRONTEND_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// WebView2 浏览器进程失败后按窗口去重重建，避免同一事件的重复通知并发销毁窗口。
+static MAIN_WEBVIEW_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
+static SETTINGS_WEBVIEW_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
+static GAME_WEBVIEW_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
+/// 同一浏览器环境的所有窗口共享一个恢复队列，禁止多窗口并发创建 WebView2。
+static WEBVIEW_PROCESS_RECOVERY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 主面板页面地址：与 tauri.conf.json 的 devUrl / 生产资源协议保持一致
 fn main_page_url() -> &'static str {
@@ -1864,6 +1870,15 @@ fn aux_sequence_pair(label: &str) -> Option<(&'static std::sync::atomic::AtomicU
     }
 }
 
+fn webview_recovery_pending(label: &str) -> Option<&'static AtomicBool> {
+    match label {
+        "main" => Some(&MAIN_WEBVIEW_RECOVERY_PENDING),
+        "settings" => Some(&SETTINGS_WEBVIEW_RECOVERY_PENDING),
+        "game" => Some(&GAME_WEBVIEW_RECOVERY_PENDING),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 fn window_shown_ready(app: tauri::AppHandle, label: String, sequence: u64) {
     if let Some((_, ack)) = aux_sequence_pair(&label) {
@@ -2766,16 +2781,26 @@ fn reveal_path(path: String) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn recover_unresponsive_aux_window(app: &tauri::AppHandle, label: &str, sequence: u64) {
-    let Some(win) = app.get_webview_window(label) else { return };
+    let Some(pending) = webview_recovery_pending(label) else { return };
+    if pending.swap(true, Ordering::SeqCst) {
+        panel_log(app, "aux-webview-recreate-skipped", &format!("label={label}, sequence={sequence}, reason=already-pending"));
+        return;
+    }
+    let Some(win) = app.get_webview_window(label) else {
+        pending.store(false, Ordering::SeqCst);
+        return;
+    };
+    let was_visible = win.is_visible().unwrap_or(false);
     let size = win.inner_size().unwrap_or_else(|_| if label == "game" {
         tauri::PhysicalSize::new(1060, 720)
     } else {
         tauri::PhysicalSize::new(720, 560)
     });
     let position = win.outer_position().ok();
-    panel_log(app, "aux-webview-recreate-destroy", &format!("label={label}, sequence={sequence}"));
+    panel_log(app, "aux-webview-recreate-destroy", &format!("label={label}, sequence={sequence}, was_visible={was_visible}"));
     if let Err(error) = win.destroy() {
         panel_log(app, "aux-webview-recreate-destroy-failed", &format!("label={label}, error={error}"));
+        pending.store(false, Ordering::SeqCst);
         app.restart();
     }
 
@@ -2806,12 +2831,19 @@ fn recover_unresponsive_aux_window(app: &tauri::AppHandle, label: &str, sequence
                 if let Some(position) = position { let _ = win.set_position(position); }
                 apply_window_effect(&win, &effect, dark);
                 attach_aux_window_handlers(&win);
-                let result = win.show();
-                let _ = win.set_focus();
-                panel_log(&handle, "aux-webview-recreate-complete", &format!("label={label}, sequence={sequence}, result={result:?}"));
+                let result = if was_visible {
+                    let result = win.show();
+                    let _ = win.set_focus();
+                    result
+                } else {
+                    Ok(())
+                };
+                panel_log(&handle, "aux-webview-recreate-complete", &format!("label={label}, sequence={sequence}, visible={was_visible}, result={result:?}"));
+                pending.store(false, Ordering::SeqCst);
             }
             Err(error) => {
                 panel_log(&handle, "aux-webview-recreate-failed", &format!("label={label}, error={error}"));
+                pending.store(false, Ordering::SeqCst);
                 handle.restart();
             }
         }
@@ -2982,6 +3014,99 @@ fn lock_encrypted_if_needed(app: &tauri::AppHandle) {
     }
 }
 
+/// COM 回调返回后立即在工作线程串行重建所有关联窗口，避免回调内销毁 WebView2 造成重入，
+/// 也避免主面板与辅助窗口同时创建 WebView2 时相互等待。
+#[cfg(target_os = "windows")]
+fn schedule_webview_process_recovery(app: &tauri::AppHandle, source_label: &str) {
+    if WEBVIEW_PROCESS_RECOVERY_PENDING.swap(true, Ordering::SeqCst) {
+        panel_log(app, "webview-process-recovery-coalesced", &format!("source={source_label}"));
+        return;
+    }
+    let handle = app.clone();
+    let source_label = source_label.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        panel_log(&handle, "webview-process-recovery-scheduled", &format!("source={source_label}"));
+        if handle.get_webview_window("main").is_some() {
+            let sequence = PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+            recover_unresponsive_panel(&handle, sequence);
+            while MAIN_WEBVIEW_RECOVERY_PENDING.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        for label in ["settings", "game"] {
+            if handle.get_webview_window(label).is_none() { continue; }
+            let Some((operation, _)) = aux_sequence_pair(label) else { continue };
+            let sequence = operation.fetch_add(1, Ordering::SeqCst) + 1;
+            recover_unresponsive_aux_window(&handle, label, sequence);
+            while webview_recovery_pending(label).is_some_and(|pending| pending.load(Ordering::SeqCst)) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        WEBVIEW_PROCESS_RECOVERY_PENDING.store(false, Ordering::SeqCst);
+        panel_log(&handle, "webview-process-recovery-queue-complete", &format!("source={source_label}"));
+    });
+}
+
+/// 记录 WebView2 进程组的真实失败原因。浏览器进程退出会使同一环境的所有控制器失效，
+/// 仅重载页面或切换 IsVisible 无法恢复，必须销毁并重建关联 WebView。
+#[cfg(target_os = "windows")]
+fn attach_webview2_process_diagnostics(win: &tauri::WebviewWindow) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ProcessFailedEventArgs2;
+    use webview2_com::ProcessFailedEventHandler;
+    use windows::core::Interface;
+
+    let app = win.app_handle().clone();
+    let label = win.label().to_string();
+    let callback_app = app.clone();
+    let callback_label = label.clone();
+    let handler_app = app.clone();
+    let result = win.with_webview(move |webview| {
+        unsafe {
+            match webview.controller().CoreWebView2() {
+                Ok(core) => {
+                    let handler = ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                        let mut browser_process_exited = false;
+                        let detail = if let Some(args) = args {
+                            let mut kind = Default::default();
+                            let kind_result = args.ProcessFailedKind(&mut kind);
+                            browser_process_exited = kind_result.is_ok() && kind.0 == 0;
+                            let mut reason = None;
+                            let mut exit_code = None;
+                            if let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                                let mut value = Default::default();
+                                if args2.Reason(&mut value).is_ok() { reason = Some(value); }
+                                let mut value = 0;
+                                if args2.ExitCode(&mut value).is_ok() { exit_code = Some(value); }
+                            }
+                            format!("kind={kind:?}, kind_result={kind_result:?}, reason={reason:?}, exit_code={exit_code:?}")
+                        } else {
+                            "missing event args".to_string()
+                        };
+                        panel_log(&callback_app, "webview-process-failed", &format!("label={callback_label}, {detail}"));
+                        if browser_process_exited {
+                            schedule_webview_process_recovery(&callback_app, &callback_label);
+                        }
+                        Ok(())
+                    }));
+                    let mut token = 0i64;
+                    let register_result = core.add_ProcessFailed(&handler, &mut token);
+                    panel_log(&handler_app, "webview-process-handler", &format!("label={label}, result={register_result:?}"));
+                }
+                Err(error) => {
+                    panel_log(&handler_app, "webview-process-handler-failed", &format!("label={label}, error={error}"));
+                }
+            }
+        }
+    });
+    if let Err(error) = result {
+        panel_log(&app, "webview-process-handler-failed", &format!("label={}, error={error}", win.label()));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_webview2_process_diagnostics(_win: &tauri::WebviewWindow) {}
+
 fn hide_panel_internal(app: &tauri::AppHandle) {
     PANEL_OPERATION_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     lock_encrypted_if_needed(app);
@@ -2996,12 +3121,22 @@ fn hide_panel_internal(app: &tauri::AppHandle) {
 /// 仅在这种情况下销毁并重建主面板，保留尺寸、位置、置顶、外观和窗口事件。
 #[cfg(target_os = "windows")]
 fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
-    let Some(win) = app.get_webview_window("main") else { return };
+    let pending = &MAIN_WEBVIEW_RECOVERY_PENDING;
+    if pending.swap(true, Ordering::SeqCst) {
+        panel_log(app, "webview-recreate-skipped", &format!("sequence={sequence}, reason=already-pending"));
+        return;
+    }
+    let Some(win) = app.get_webview_window("main") else {
+        pending.store(false, Ordering::SeqCst);
+        return;
+    };
+    let was_visible = win.is_visible().unwrap_or(false);
     let size = win.inner_size().unwrap_or(tauri::PhysicalSize::new(980, 680));
     let position = win.outer_position().ok();
-    panel_log(app, "webview-recreate-destroy", &format!("sequence={sequence}"));
+    panel_log(app, "webview-recreate-destroy", &format!("sequence={sequence}, was_visible={was_visible}"));
     if let Err(error) = win.destroy() {
         panel_log(app, "webview-recreate-destroy-failed", &format!("{error}"));
+        pending.store(false, Ordering::SeqCst);
         app.restart();
     }
 
@@ -3028,12 +3163,19 @@ fn recover_unresponsive_panel(app: &tauri::AppHandle, sequence: u64) {
                 if let Some(position) = position { let _ = win.set_position(position); }
                 apply_window_effect(&win, &effect, dark);
                 attach_main_window_handlers(&win);
-                let result = win.show();
-                let _ = win.set_focus();
-                panel_log(&handle, "webview-recreate-complete", &format!("sequence={sequence}, result={result:?}"));
+                let result = if was_visible {
+                    let result = win.show();
+                    let _ = win.set_focus();
+                    result
+                } else {
+                    Ok(())
+                };
+                panel_log(&handle, "webview-recreate-complete", &format!("sequence={sequence}, visible={was_visible}, result={result:?}"));
+                pending.store(false, Ordering::SeqCst);
             }
             Err(error) => {
                 panel_log(&handle, "webview-recreate-failed", &format!("{error}"));
+                pending.store(false, Ordering::SeqCst);
                 handle.restart();
             }
         }
@@ -3158,9 +3300,9 @@ fn apply_window_effect(win: &tauri::WebviewWindow, effect: &str, dark: bool) {
     }
 }
 
-/// 主窗口首次创建与故障重建共用：关闭按钮改为隐藏。
-/// 与 0.18 稳定版一致，显隐只操作原生窗口，不再做尺寸抖动或干预 WebView2 控制器。
+/// 主窗口首次创建与故障重建共用：关闭按钮改为隐藏，并注册 WebView2 进程失败诊断。
 fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
+    attach_webview2_process_diagnostics(win);
     let w = win.clone();
     win.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -3172,6 +3314,7 @@ fn attach_main_window_handlers(win: &tauri::WebviewWindow) {
 
 /// 设置与台球窗口首次创建、故障重建共用：关闭改为隐藏，并使旧的无响应检测失效。
 fn attach_aux_window_handlers(win: &tauri::WebviewWindow) {
+    attach_webview2_process_diagnostics(win);
     let w = win.clone();
     win.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -3185,19 +3328,6 @@ fn attach_aux_window_handlers(win: &tauri::WebviewWindow) {
 }
 
 // ---------- 入口 ----------
-
-/// WebView2 在窗口长期隐藏或被遮挡时可能降低渲染器优先级，导致再次显示只剩空白帧。
-/// 保留用户已有的浏览器参数，只补充缺失的后台抑制开关。
-#[cfg(windows)]
-fn configure_webview2_renderer() {
-    const FLAGS: [&str; 3] = ["--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"];
-    let current = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
-    let missing = FLAGS.iter().filter(|flag| !current.split_whitespace().any(|value| value == **flag)).copied().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        let args = if current.trim().is_empty() { missing.join(" ") } else { format!("{} {}", current.trim(), missing.join(" ")) };
-        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
-    }
-}
 
 /// 可见主面板的轻量心跳：窗口长期保持可见时，渲染器也可能失效，不能只在 hide/show 时检查。
 /// 心跳事件只应答，不触发搜索重置或 DOM 重绘；隐藏 / 最小化时完全跳过。
@@ -3228,8 +3358,6 @@ fn panel_health_ready(sequence: u64) {
 }
 
 pub fn run() {
-    #[cfg(windows)]
-    configure_webview2_renderer();
     apply_proxy_env(&load_config());
     #[cfg(windows)]
     {

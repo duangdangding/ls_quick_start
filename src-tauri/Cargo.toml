@@ -1,6 +1,6 @@
 [package]
 name = "suqi"
-version = "0.19.29"
+version = "0.19.30"
 description = "速启 - 快捷启动器"
 authors = ["you"]
 edition = "2021"
@@ -37,3 +37,6 @@ encoding_rs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# with_webview 使用平台相关类型，版本需与当前 Tauri / wry 锁定版本一致。
+webview2-com = "=0.39.1"
+windows = "=0.62.2"
